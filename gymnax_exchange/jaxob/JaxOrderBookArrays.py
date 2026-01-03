@@ -1104,3 +1104,37 @@ def get_L2_state(asks, bids, n_levels,cfg:JAXLOB_Configuration):
     # combine asks and bids in joint representation
     l2_state = jnp.hstack((asks.T, bids.T)).flatten()
     return l2_state
+
+@partial(jax.jit, static_argnums=(2, 3))
+def get_vision_L2_state(asks, bids, n_levels,cfg:JAXLOB_Configuration):
+    """
+    Hàm này chỉ CHỤP ẢNH THÔ và SẮP XẾP.
+    Output: Tensor 3D shape (n_levels, 2, 2)
+        - Dim 0: n_levels (10)
+        - Dim 1: Raw Features (0: Price, 1: Volume) <--- Chưa normalize
+        - Dim 2: Channels (0: Ask, 1: Bid)
+    """
+        # unique sorts ascending --> negative values to get descending
+    bid_prices = -1 * jnp.unique(-1 * bids[:, 0], size=n_levels, fill_value=1)
+    # replace -1 with max 32 bit int in sorting asks before sorting
+    ask_prices = jnp.unique(
+        jnp.where(asks[:, 0] == -1, cfg.maxint, asks[:, 0]),
+        size=n_levels,
+        fill_value=-1
+    )
+    # replace max 32 bit int with -1 after sorting
+    ask_prices = jnp.where(ask_prices == cfg.maxint, -1, ask_prices)
+
+    # Tính volume tại các mức giá đã lấy
+    ask_vols = jax.vmap(get_volume_at_price,(None,0),0)(asks, ask_prices)
+    bid_vols = jax.vmap(get_volume_at_price,(None,0),0)(bids, bid_prices)
+    
+    # Khử âm
+    ask_vols = jnp.where(ask_vols < 0, 0, ask_vols)
+    bid_vols = jnp.where(bid_vols < 0, 0, bid_vols)
+
+    # Đóng gói thành tensor 3D
+    ask_raw = jnp.stack((ask_prices, ask_vols), axis=1)  # Shape (n_levels, 2)
+    bid_raw = jnp.stack((bid_prices, bid_vols), axis=1)  # Shape (n_levels, 2)
+    vision_l2_state = jnp.stack((ask_raw, bid_raw), axis=2)  # Shape (n_levels, 2, 2)
+    return vision_l2_state
