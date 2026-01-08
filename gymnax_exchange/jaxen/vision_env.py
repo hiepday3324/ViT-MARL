@@ -163,6 +163,8 @@ class ExecutionAgent():
             self.action_fn = self._getActionMsgs_fixedQuant_1msg
         elif self.cfg.action_space == "twap":
             self.action_fn = self._getActionMsgs_twap
+        elif self.cfg.action_space == "policy_blending":
+            self.action_fn = self._getActionMsgs_PolicyBlending
         else:
             raise ValueError("Invalid action_space specified.")
 
@@ -174,6 +176,8 @@ class ExecutionAgent():
             self.observation_fn = self._get_obs_basic
         elif self.cfg.observation_space == "simplest_case":
             self.observation_fn = self._get_obs_simplest_case
+        elif self.cfg.observation_space == "execution_policy":
+            self.observation_fn = self._get_obs_execution_policy
         else:
             raise ValueError("Invalid observation_space specified.")
 
@@ -1412,6 +1416,17 @@ class ExecutionAgent():
         #jax.debug.print("action_msgs exec: {}", action_msgs)
         return action_msgs 
 
+    def _getActionMsgs_PolicyBlending(self, action: jax.Array, world_state : WorldState, agent_state: ExecEnvState, agent_params: ExecEnvParams):
+        
+        # Lấy 3 level giá đầu tiên
+        top3_price = job.get_vision_L2_state(state.ask_raw_orders,  # Current ask orders
+                                    state.bid_raw_orders,  # Current bid orders
+                                    3,  # Number of levels
+                                    self.cfg  
+                                    )
+        ask = top3_price[:][:][0]
+        bid = top3_price[:][:][1]
+        pass
 
 
     def _get_messages(
@@ -1493,6 +1508,8 @@ class ExecutionAgent():
             return self.action_fn(action = action, world_state = world_state, agent_state = agent_state, agent_params = agent_params)
         elif self.cfg.action_space == "twap":
             return self.action_fn(action = action, world_state = world_state, agent_state = agent_state, agent_params = agent_params)
+        elif self.cfg.action_space == "policy_blending":
+            return self.action_fn(action = action, world_state = world_state, agent_state = agent_state, agent_params = agent_params)
         else:
             raise ValueError("Invalid action space specified.")    
     
@@ -1516,6 +1533,10 @@ class ExecutionAgent():
                                         agent_state=agent_state, 
                                         normalize=normalize,
                                         flatten=flatten)
+        elif self.cfg.observation_space == "execution_policy":
+            exec_obs = self.observation_fn(world_state=world_state, 
+                                        agent_state=agent_state, 
+                                        normalize=normalize)
         else:
             raise ValueError("Invalid observation_space specified.")
         
@@ -2090,7 +2111,6 @@ class ExecutionAgent():
             lambda: (world_state.best_bids[-1], world_state.best_asks[-1]),
             lambda: (world_state.best_asks[-1], world_state.best_bids[-1]),
         )
-
         # print("agent_state:", agent_state.is_sell_task)
         # print(f"quite aggr: {quote_aggr}, quote pass: {quote_pass}")
 
@@ -2234,6 +2254,141 @@ class ExecutionAgent():
             obs, _ = jax.flatten_util.ravel_pytree(obs) # Important: this can change the order of the values
         return obs
 
+    def _get_obs_execution_policy(self, agent_state: ExecEnvState, world_state: WorldState, normalize: bool) -> chex.Array:
+        raw_top3 = job.get_vision_L2_state(
+            world_state.ask_raw_orders,
+            world_state.bid_raw_orders,
+            3,
+            self.cfg
+        )
+
+        # 2. Định nghĩa hàm xử lý logic
+        def get_sell_task_obs(raw_data):
+            # Sell: Aggr = Bid (Side 1), Pass = Ask (Side 0)
+            if normalize:
+                # Lưu ý: normalize_vision_obs trả về (3, 3, 2) [Levels, Feats(Gap,Log,Cum), Sides]
+                norm_data = self.normalize_vision_obs(raw_data, world_state)
+                aggr = norm_data[:, :, 1] # Bids
+                pass_ = norm_data[:, :, 0] # Asks
+            else:
+                aggr = raw_data[:, :, 1] # Bids (Raw Price, Vol)
+                pass_ = raw_data[:, :, 0] # Asks
+            return aggr, pass_
+
+        def get_buy_task_obs(raw_data):
+            # Buy: Aggr = Ask (Side 0), Pass = Bid (Side 1)
+            if normalize:
+                norm_data = self.normalize_vision_obs(raw_data, world_state)
+                aggr = norm_data[:, :, 0] # Asks
+                pass_ = norm_data[:, :, 1] # Bids
+            else:
+                aggr = raw_data[:, :, 0] # Asks
+                pass_ = raw_data[:, :, 1] # Bids
+            return aggr, pass_
+
+        # 3. Điều hướng
+        quote_aggr, quote_pass = jax.lax.cond(
+            agent_state.is_sell_task,
+            get_sell_task_obs,
+            get_buy_task_obs,
+            raw_top3 # Truyền raw_top3 làm operand vào hàm
+        )
+
+        market_obs_aggr = quote_aggr.flatten()  # shape (9,)
+        market_obs_pass = quote_pass.flatten()  # shape (9,)
+        time = world_state.time[0] + world_state.time[1]/1e9
+        time_elapsed = time - (world_state.init_time[0] + world_state.init_time[1]/1e9)
+        obs = {
+            "is_sell_task": agent_state.is_sell_task,
+
+            "market_aggr": market_obs_aggr,  
+            "market_pass": market_obs_pass,  
+
+            "time": time,
+            "delta_time": world_state.delta_time,
+            "time_remaining": self.world_config.episode_time - time_elapsed,
+            "init_price": agent_state.init_price,
+            "current_task_size": agent_state.task_to_execute,
+            "executed_quant": agent_state.quant_executed,
+            "remaining_quant": agent_state.task_to_execute - agent_state.quant_executed,
+            "step_counter": world_state.step_counter,
+            "remaining_ratio": jnp.where(world_state.max_steps_in_episode==0, 0., 1. - world_state.step_counter / world_state.max_steps_in_episode),#17
+        }
+        # --- CẤU HÌNH NORMALIZATION MỚI ---
+        
+        # Vì dữ liệu đầu vào đã được chuẩn hóa (Gap, LogVol) từ trước
+        # Ta đặt mean=0, std=1 để giữ nguyên giá trị.
+        
+        # Lưu ý: quote_aggr có shape (3, 3) -> flatten -> (9,)
+        # Nên ta khởi tạo vector zeros/ones có độ dài tương ứng.
+        feat_len = quote_aggr.size # = 9
+        
+        means = {
+            "is_sell_task": 0,
+            
+            # KEY MỚI: Vector 0
+            "market_aggr": jnp.zeros(feat_len), 
+            "market_pass": jnp.zeros(feat_len),
+            
+            # CÁC KEY CŨ (Time, Inventory...) GIỮ NGUYÊN
+            "time": 0,
+            "delta_time": 0,
+            "time_remaining": 0,
+            "init_price": 0,
+            "current_task_size": 0,
+            "executed_quant": 0,
+            "remaining_quant": 0,
+            "step_counter": 0,
+            "remaining_ratio": 0,
+        }
+
+        stds = {
+            "is_sell_task": 1,
+            
+            # KEY MỚI: Vector 1
+            "market_aggr": jnp.ones(feat_len),
+            "market_pass": jnp.ones(feat_len),
+            
+            # CÁC KEY CŨ GIỮ NGUYÊN
+            "time": 1e5,
+            "delta_time": 10,
+            "time_remaining": self.world_config.episode_time,
+            "init_price": 1e7,
+            "current_task_size": self.cfg.task_size,
+            "executed_quant": self.cfg.task_size,
+            "remaining_quant": self.cfg.task_size,
+            "step_counter": 30,
+            "remaining_ratio": 1,
+        }
+        if normalize:
+            obs = self.normalize_obs(obs, means, stds)
+
+
+        private_feats = jnp.array([
+            obs["is_sell_task"],
+            obs["init_price"],
+            obs["current_task_size"],
+            obs["executed_quant"],
+            obs["remaining_quant"],
+            obs["step_counter"],
+            obs["remaining_ratio"],
+            obs["time"],
+            obs["delta_time"],
+            obs["time_remaining"]
+        ]) # Shape (10,)
+        
+        # 2. Gom nhóm Market State (Thông tin thị trường)
+        # market_aggr và market_pass đã là vector (9,) rồi
+        
+        # 3. Nối lại thành 1 vector duy nhất
+        obs_vector = jnp.concatenate([
+            private_feats,      # 10 features
+            obs["market_aggr"], # 9 features (Gap, LogVol, CumVol)
+            obs["market_pass"], # 9 features
+        ])
+        
+        return obs_vector
+
     def _get_obs_vision(self, world_state: WorldState, normalize: bool) -> chex.Array:
         """ Return observation from raw state trafo. """
         # Note: uses entire observation history between steps
@@ -2243,61 +2398,7 @@ class ExecutionAgent():
                                         self.cfg  
                                         )
         if normalize:
-            # --- XỬ LÝ NORMALIZATION TẠI ĐÂY ---
-            
-            # Tách Price và Vol từ Raw Tensor
-            # raw_tensor shape: (Levels, Features=2, Channels=2)
-            prices_ask = raw_tensor[:, 0, 0] # Kênh 0 là Ask
-            vols_ask   = raw_tensor[:, 1, 0]
-            
-            prices_bid = raw_tensor[:, 0, 1] # Kênh 1 là Bid
-            vols_bid   = raw_tensor[:, 1, 1]
-            
-            # Tính Mid Price (Anchor)
-            best_ask = prices_ask[0]
-            best_bid = prices_bid[0]
-            mid_price = (best_ask + best_bid) / 2.0
-            
-            # --- KÊNH ASK ---
-            valid_ask = prices_ask != -1
-            
-            # 1. Gap: (Đã đúng)
-            gap_ask = jnp.where(valid_ask, (prices_ask - mid_price) / self.cfg.tick_size, 0)
-            
-            # 2. Log Vol: Cần đảm bảo volume rác = 0 tuyệt đối
-            # Ép volume về 0 trước khi log
-            clean_vol_ask = jnp.where(valid_ask, vols_ask, 0) 
-            log_vol_ask = jnp.log1p(clean_vol_ask)
-            
-            # 3. Cum Vol: CẮT ĐUÔI (Quan trọng nhất)
-            # Tính cumsum xong phải gán những dòng rỗng về 0 ngay lập tức
-            raw_cum_ask = jnp.cumsum(clean_vol_ask)
-            cum_vol_ask = jnp.log1p(jnp.where(valid_ask, raw_cum_ask, 0)) 
-            
-            feat_ask = jnp.stack([gap_ask, log_vol_ask, cum_vol_ask], axis=1)
-            
-            # --- KÊNH BID ---
-            valid_bid = prices_bid != -1
-            
-            # 1. Gap
-            gap_bid = jnp.where(valid_bid, (mid_price - prices_bid) / self.cfg.tick_size, 0)
-            
-            # 2. Log Vol
-            clean_vol_bid = jnp.where(valid_bid, vols_bid, 0)
-            log_vol_bid = jnp.log1p(clean_vol_bid)
-            
-            # 3. Cum Vol
-            raw_cum_bid = jnp.cumsum(clean_vol_bid)
-            cum_vol_bid = jnp.log1p(jnp.where(valid_bid, raw_cum_bid, 0))
-            
-            feat_bid = jnp.stack([gap_bid, log_vol_bid, cum_vol_bid], axis=1)
-            
-            # --- FINAL STACK ---
-            # Output: (10, 3, 2) -> [Gap, Log, Cum] x [Ask, Bid]
-            vision_obs = jnp.stack([feat_ask, feat_bid], axis=-1)
-            
-            return vision_obs
-            
+            return self.normalize_vision_obs(raw_tensor, world_state)
         else:
             # Nếu không normalize, trả về raw tensor (10, 2, 2)
             return raw_tensor
@@ -2382,6 +2483,58 @@ class ExecutionAgent():
         """
         obs = jax.tree.map(lambda x, m, s: (x - m) / s, obs, means, stds)
         return obs
+    
+    def normalize_vision_obs(self, raw_tensor: jax.Array, world_state: WorldState) -> jax.Array:
+        # --- XỬ LÝ NORMALIZATION TẠI ĐÂY ---
+        # Tách Price và Vol từ Raw Tensor
+        # raw_tensor shape: (Levels, Features=2, Channels=2)
+        prices_ask = raw_tensor[:, 0, 0] # Kênh 0 là Ask
+        vols_ask   = raw_tensor[:, 1, 0]
+        
+        prices_bid = raw_tensor[:, 0, 1] # Kênh 1 là Bid
+        vols_bid   = raw_tensor[:, 1, 1]
+        
+        # Tính Mid Price (Anchor)
+        mid_price = world_state.mid_price
+        
+        # --- KÊNH ASK ---
+        valid_ask = prices_ask != -1
+        
+        # 1. Gap: (Đã đúng)
+        gap_ask = jnp.where(valid_ask, (prices_ask - mid_price) / self.cfg.tick_size, 0)
+        
+        # 2. Log Vol: Cần đảm bảo volume rác = 0 tuyệt đối
+        # Ép volume về 0 trước khi log
+        clean_vol_ask = jnp.where(valid_ask, vols_ask, 0) 
+        log_vol_ask = jnp.log1p(clean_vol_ask)
+        
+        # 3. Cum Vol: CẮT ĐUÔI (Quan trọng nhất)
+        # Tính cumsum xong phải gán những dòng rỗng về 0 ngay lập tức
+        raw_cum_ask = jnp.cumsum(clean_vol_ask)
+        cum_vol_ask = jnp.log1p(jnp.where(valid_ask, raw_cum_ask, 0)) 
+        
+        feat_ask = jnp.stack([gap_ask, log_vol_ask, cum_vol_ask], axis=1)
+        
+        # --- KÊNH BID ---
+        valid_bid = prices_bid != -1
+        
+        # 1. Gap: Khoảng cách giá đến mid price
+        gap_bid = jnp.where(valid_bid, (mid_price - prices_bid) / self.cfg.tick_size, 0)
+        
+        # 2. Log Vol: Chuẩn hóa volume tại mức giá đấy
+        clean_vol_bid = jnp.where(valid_bid, vols_bid, 0)
+        log_vol_bid = jnp.log1p(clean_vol_bid)
+        
+        # 3. Cum Vol: Tích lũy volume từ mức mid price đến mức giá đấy
+        raw_cum_bid = jnp.cumsum(clean_vol_bid)
+        cum_vol_bid = jnp.log1p(jnp.where(valid_bid, raw_cum_bid, 0))
+        
+        feat_bid = jnp.stack([gap_bid, log_vol_bid, cum_vol_bid], axis=1)
+        
+        # --- FINAL STACK ---
+        # Output: (n, 3, 2) -> [Gap, Log, Cum] x [Ask, Bid]
+        vision_obs = jnp.stack([feat_ask, feat_bid], axis=-1)
+        return vision_obs
 
     def action_space(
         self) -> spaces.Box:
@@ -2403,6 +2556,12 @@ class ExecutionAgent():
             return spaces.Discrete(self.cfg.n_actions)
         elif self.cfg.action_space=="twap":
             return spaces.Discrete(self.cfg.n_actions)
+        elif self.cfg.action_space == "policy_blending":
+            # Action là vector liên tục 3 chiều: [Aggressive Scale, Passive Scale 1, Passive Scale 2]
+            # Theo bài báo: a1 [-1, 3], a2 [0, 1], a3 [0, 1]
+            low = jnp.array([-1.0, 0.0, 0.0], dtype=jnp.float32)
+            high = jnp.array([3.0, 1.0, 1.0], dtype=jnp.float32)
+            return spaces.Box(low, high, (3,), dtype=jnp.float32)
         else:    
             raise ValueError("Invalid action_space specified.")
 
@@ -2411,18 +2570,30 @@ class ExecutionAgent():
     def observation_space(self):
         """Observation space of the environment."""
         if self.cfg.observation_space == "basic":
-            return spaces.Box(low=-10000, high=10000, shape=(3,), dtype=jnp.float32)
+            exec_space = spaces.Box(low=-10000, high=10000, shape=(3,), dtype=jnp.float32)
         elif self.cfg.observation_space == "engineered":
             if self.world_config.ep_type == "fixed_time":
-                space = spaces.Box(-10000, 10000, (15,), dtype=jnp.float32) 
+                exec_space = spaces.Box(-10000, 10000, (15,), dtype=jnp.float32) 
             elif self.world_config.ep_type == "fixed_steps":
-                space = spaces.Box(-10000, 10000, (12,), dtype=jnp.float32) 
-            return space
+                exec_space = spaces.Box(-10000, 10000, (12,), dtype=jnp.float32) 
         elif self.cfg.observation_space == "simplest_case":
-            space = spaces.Box(-10000, 10000, (3,), dtype=jnp.float32) 
-            return space
+            exec_space = spaces.Box(-10000, 10000, (3,), dtype=jnp.float32) 
+        elif self.cfg.observation_space == "execution_policy":
+            exec_space = spaces.Box(-10000, 10000, (28,), dtype=jnp.float32)
         else:
             raise ValueError("Invalid observation_space specified.")
+
+        vision_shape = spaces.Box(
+            low=-100,
+            high=100000000,
+            shape=(10, 3, 2),  # Levels, Features, Channels
+            dtype=jnp.float32,
+        )
+
+        return spaces.Dict({
+            "exec_obs": exec_space,
+            "vision_obs": vision_shape,
+        })
 
     def state_space(self, params: ExecEnvParams) -> spaces.Dict:
         """State space of the environment."""
