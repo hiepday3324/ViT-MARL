@@ -1078,7 +1078,7 @@ def get_L2_state(asks, bids, n_levels,cfg:JAXLOB_Configuration):
     the bid and ask side of the orderbook. 
         Parameters:
                 asks (Array): Ask orders in the book.
-                bids (Array): Ask orders in the book.
+                bids (Array): Bid orders in the book.
                 n_levels (int): Desired number of levels (static arg).
 
         Returns:

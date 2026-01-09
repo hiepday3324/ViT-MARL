@@ -19,7 +19,7 @@ This module provides an execution agent for multi-agent reinforcement learning
  It is particularly designed for multi-agent reinforcement learning applications 
  focusing on optimal trade execution strategies.
 
-Key Components
+Key Components 
 ExecEnvState:   Dataclass to encapsulate the current state of the execution agent, 
             including the raw order book, trades, and time information.
 ExecEnvParams:  Configuration class for execution agent-specific parameters, 
@@ -1417,16 +1417,108 @@ class ExecutionAgent():
         return action_msgs 
 
     def _getActionMsgs_PolicyBlending(self, action: jax.Array, world_state : WorldState, agent_state: ExecEnvState, agent_params: ExecEnvParams):
+        """
+        Policy Blending Action (CORRECTED VERSION):
+        Phân bổ khối lượng vào 3 mức giá Limit Order tốt nhất (Top-3 LOB Levels).
+        Tất cả đều là lệnh chờ (Passive/Maker orders), không vượt spread.
+        """
         
-        # Lấy 3 level giá đầu tiên
-        top3_price = job.get_vision_L2_state(state.ask_raw_orders,  # Current ask orders
-                                    state.bid_raw_orders,  # Current bid orders
-                                    3,  # Number of levels
-                                    self.cfg  
-                                    )
-        ask = top3_price[:][:][0]
-        bid = top3_price[:][:][1]
-        pass
+        # --- 1. LẤY GIÁ THỰC TẾ TỪ SỔ LỆNH ---
+        # shape: (3, 2, 2) -> [Levels, Features(Price, Vol), Channels(Ask, Bid)]
+        l2_state = job.get_vision_L2_state(
+            world_state.ask_raw_orders,
+            world_state.bid_raw_orders,
+            3,
+            self.cfg
+        )
+        
+        # Kênh 0: Ask, Kênh 1: Bid
+        # Lấy cột 0: Price
+        ask_prices = l2_state[:, 0, 0] # [Ask_L1, Ask_L2, Ask_L3]
+        bid_prices = l2_state[:, 0, 1] # [Bid_L1, Bid_L2, Bid_L3]
+        tick = self.world_config.tick_size
+
+        def get_buy_prices(ask_prices, bid_prices):
+            # MUA: Chỉ quan tâm bên BID (Đặt lệnh chờ mua)
+            
+            # Level 1: Best Bid (Giá mua cao nhất hiện tại) -> Khả năng khớp cao nhất trong các lệnh Limit
+            p_1 = bid_prices[0]
+            
+            # Level 2: 2nd Best Bid
+            # Fallback: Nếu L2 rỗng (-1), dùng L1 - 1 tick
+            p_2 = jnp.where(bid_prices[1] != -1, bid_prices[1], p_1 - tick)
+            
+            # Level 3: 3rd Best Bid
+            # Fallback: Nếu L3 rỗng (-1), dùng L2 - 1 tick
+            p_3 = jnp.where(bid_prices[2] != -1, bid_prices[2], p_2 - tick)
+            
+            return jnp.array([p_1, p_2, p_3], dtype=jnp.int32)
+
+        def get_sell_prices(ask_prices, bid_prices):
+            # BÁN: Chỉ quan tâm bên ASK (Đặt lệnh chờ bán)
+            
+            # Level 1: Best Ask (Giá bán thấp nhất hiện tại) -> Khả năng khớp cao nhất
+            p_1 = ask_prices[0]
+            
+            # Level 2: 2nd Best Ask
+            # Fallback: Nếu L2 rỗng (-1), dùng L1 + 1 tick
+            p_2 = jnp.where(ask_prices[1] != -1, ask_prices[1], p_1 + tick)
+            
+            # Level 3: 3rd Best Ask
+            # Fallback: Nếu L3 rỗng (-1), dùng L2 + 1 tick
+            p_3 = jnp.where(ask_prices[2] != -1, ask_prices[2], p_2 + tick)
+            
+            return jnp.array([p_1, p_2, p_3], dtype=jnp.int32)
+
+        # Chọn mức giá dựa trên loại task
+        prices = jax.lax.cond(
+            agent_state.is_sell_task,
+            get_sell_prices,
+            get_buy_prices,
+            ask_prices, bid_prices
+        )
+
+        # 2. Logic Policy Blending (Bắt chước TWAP rồi vượt qua)
+        # Tính V_twap: Khối lượng mục tiêu cho mỗi bước thời gian
+        # v_twap = Tổng khối lượng / Số bước dự kiến
+        total_steps = world_state.max_steps_in_episode
+        v_twap = agent_state.task_to_execute / total_steps
+        
+        # V_base mặc định đặt tại Level 1 
+        v_base = jnp.array([v_twap, 0.0, 0.0])
+        
+        # Công thức Dual-PPO: V_actual = V_base + (V_twap * Action) 
+        # action[0] là a1, action[1] là a2, action[2] là a3
+        target_quants_float = v_base + (v_twap * action)
+        target_quants = jnp.floor(jnp.maximum(0, target_quants_float)).astype(jnp.int32)
+
+        # 3. Kiểm soát tồn kho (Tránh ảo hàng)
+        # Tổng lệnh không được vượt quá số lượng còn lại
+        quant_left = agent_state.task_to_execute - agent_state.quant_executed
+        total_planned = jnp.sum(target_quants)
+        
+        # Nếu tổng lệnh dự kiến > còn lại, tỷ lệ lại khối lượng
+        scale = jnp.where(total_planned > quant_left, quant_left / (total_planned + 1e-6), 1.0)
+        target_quants = jnp.floor(target_quants * scale).astype(jnp.int32)
+
+        # 4. Đóng gói Action Messages cho JAX-LOB
+        n_msgs = self.cfg.num_action_messages_by_agent
+        side_val = 1 - agent_state.is_sell_task * 2
+        
+        final_quants = jnp.zeros((n_msgs,), dtype=jnp.int32).at[0:3].set(target_quants)
+        final_prices = jnp.zeros((n_msgs,), dtype=jnp.int32).at[0:3].set(prices)
+
+        # Tạo các mảng thuộc tính message (Type=1 cho Limit Order)
+        msg_types = jnp.ones((n_msgs,), dtype=jnp.int32)
+        msg_sides = jnp.full((n_msgs,), side_val, dtype=jnp.int32)
+        msg_trader_ids = jnp.full((n_msgs,), agent_params.trader_id, dtype=jnp.int32)
+        msg_order_ids = jnp.full((n_msgs,), self.world_config.placeholder_order_id, dtype=jnp.int32)
+        msg_times = jnp.resize(world_state.time + self.cfg.time_delay_obs_act, (n_msgs, 2))
+
+        action_msgs = jnp.stack([msg_types, msg_sides, final_quants, final_prices, msg_order_ids, msg_trader_ids], axis=1)
+        action_msgs = jnp.concatenate([action_msgs, msg_times], axis=1)
+
+        return action_msgs
 
 
     def _get_messages(

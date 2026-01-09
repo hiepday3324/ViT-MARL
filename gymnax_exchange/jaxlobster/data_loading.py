@@ -9,7 +9,7 @@ import numpy as np
 import torch.distributed as dist
 
 
-from constants import MESSAGE_TOKEN_DTYPE_MAP, MESSAGE_TOKEN_TYPES, TIME_COL, get_orderbook_token_types
+from .constants import MESSAGE_TOKEN_DTYPE_MAP, MESSAGE_TOKEN_TYPES, TIME_COL, get_orderbook_token_types
 
 
 def _batch(iterable: list[str], n=1) -> Generator[list[str], None, None]:
