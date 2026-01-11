@@ -1,11 +1,13 @@
 from functools import partial
 import importlib
 from os import remove
-from readline import remove_history_item
+import platform
+if platform.system() == "Linux":
+    from readline import remove_history_item
 from typing import Dict, NamedTuple, Optional, Tuple
 from unicodedata import bidirectional
 import gymnax_exchange.jaxob.JaxOrderBookArrays as job
-from gymnax_exchange.jaxob.jaxob_config import Configuration
+from gymnax_exchange.jaxob.jaxob_config import JAXLOB_Configuration as Configuration
 job = importlib.reload(job)
 import jax
 from jax import numpy as jnp
