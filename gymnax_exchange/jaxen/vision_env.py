@@ -2051,6 +2051,104 @@ class ExecutionAgent():
 
 
         return reward_scaled, reward_info
+    def _get_reward_new(self, 
+                    world_state: WorldState, 
+                    agent_state: ExecEnvState, 
+                    agent_params: ExecEnvParams, 
+                    trades: chex.Array, 
+                    bestasks: chex.Array, 
+                    bestbids: chex.Array, 
+                    time: jax.Array) -> jnp.int32:
+        # [ĐOẠN CODE NÀY THAY THẾ CHO KHỐI TÍNH VWAP VÀ REWARD CŨ]
+
+        # 1. TÍNH C_RL (DOANH THU/CHI PHÍ THỰC TẾ CỦA AGENT)
+        # Revenue = Sum(Price * Volume)
+        c_rl = (agentTrades[:, 0] // self.world_config.tick_size * jnp.abs(agentTrades[:, 1])).sum()
+
+        # 2. XÁC ĐỊNH GIÁ BENCHMARK P (MARKET ORDER PRICE)
+        # Theo Dual-Window PPO: So sánh Limit Order của Agent với Market Order của Baseline.
+        # - Sell Task: Benchmark bán ngay lập tức -> Khớp tại Best Bid.
+        # - Buy Task: Benchmark mua ngay lập tức -> Khớp tại Best Ask.
+        p_benchmark = jax.lax.cond(
+            agent_state.is_sell_task,
+            lambda: bestbids[-1, 0] // self.world_config.tick_size, 
+            lambda: bestasks[-1, 0] // self.world_config.tick_size  
+        )
+
+        # 3. TÍNH R_COMP (CẠNH TRANH - SPREAD CAPTURE)
+        # V_base: Volume mục tiêu của TWAP trong bước này
+        total_steps = world_state.max_steps_in_episode
+        v_base = agent_state.task_to_execute / total_steps
+
+        # Chi phí Benchmark giả định (nếu TWAP khớp Market Order với volume thực tế của Agent)
+        # c_base_matched = v_rl * p_benchmark
+        c_base_matched = agentQuant * p_benchmark
+
+        direction_switch = jnp.sign(agent_state.is_sell_task * 2 - 1) # Sell=1, Buy=-1
+
+        # R_comp: Lợi nhuận kiếm được từ việc đặt Limit Order so với Market Order
+        # Buy: (Cost_Market - Cost_Limit) > 0
+        # Sell: (Rev_Limit - Rev_Market) > 0
+        r_comp = direction_switch * (c_rl - c_base_matched)
+
+        # 4. TÍNH R_MIMIC (HÌNH PHẠT KHỐI LƯỢNG)
+        # Phạt nếu khối lượng khớp lệch so với kế hoạch TWAP
+        delta_v = agentQuant - v_base
+        r_mimic = -jnp.abs(delta_v)
+        r_mimic_scaled = r_mimic / (v_base + 1.0)
+
+        # 5. TỔNG HỢP REWARD
+        alpha = self.cfg.reward_lambda
+        reward = r_comp + alpha * r_mimic_scaled
+
+        # 6. CẬP NHẬT METRICS & LOGGING
+        # Drift: Sự trôi giá thị trường so với giá Arrival
+        drift = direction_switch * agentQuant * (p_benchmark - agent_state.init_price // self.world_config.tick_size)
+
+        # Rolling Means (Cập nhật các chỉ số trung bình trượt để theo dõi)
+        rollingMeanValueFunc_FLOAT = lambda average_val, new_val: (average_val * world_state.step_counter + new_val) / (world_state.step_counter + 1)
+
+        # Dùng p_benchmark để track VWAP/MidPrice trend
+        vwap_rm = rollingMeanValueFunc_FLOAT(agent_state.vwap_rm, p_benchmark)
+        price_adv_rm = rollingMeanValueFunc_FLOAT(agent_state.price_adv_rm, r_comp)
+
+        # Slippage (Trượt giá thực tế so với giá Arrival)
+        slippage_rm = rollingMeanValueFunc_FLOAT(agent_state.slippage_rm, c_rl - (agent_state.init_price // self.world_config.tick_size) * agentQuant)
+        price_drift_rm = rollingMeanValueFunc_FLOAT(agent_state.price_drift_rm, (p_benchmark - agent_state.init_price // self.world_config.tick_size))
+
+        # Tính toán thông tin phụ
+        trade_duration_step = (jnp.abs(agentTrades[:, 1]) / agent_state.task_to_execute * (agentTrades[:, -2] - world_state.init_time[0])).sum()
+        trade_duration = agent_state.trade_duration + trade_duration_step
+        quant_left = agent_state.task_to_execute - agent_state.quant_executed - agentQuant
+
+        reward_info = {
+            "reward": reward,
+            "r_comp": r_comp,
+            "r_mimic": r_mimic_scaled,
+            "agentQuant": agentQuant,
+            "targetQuant": v_base,
+            "p_benchmark": p_benchmark,
+            "revenue": c_rl,
+            "advantage": r_comp, # Advantage chính là R_comp
+            "drift": drift,
+            "quant_left": quant_left,
+            "vwap_rm": vwap_rm,
+            "price_adv_rm": price_adv_rm,
+            "slippage_rm": slippage_rm,
+            "price_drift_rm": price_drift_rm,
+            "trade_duration": trade_duration,
+            "doom_quant": doom_quant, # Biến này đã tính ở phần trên, vẫn truy cập được
+            "reward_lam1": r_comp 
+        }
+
+        reward_scaled = reward
+
+        # Giữ lại logic debug đặc biệt (nếu cần)
+        if self.cfg.reward_space == "finish_fast":
+                reward_scaled = -jnp.abs(quant_left) / 10.0
+
+        return reward_scaled, reward_info
+
 
 
     def update_state_and_get_done_and_info(self, world_state:WorldState, agent_state_old: ExecEnvState, extras) -> Tuple[ExecEnvState, Dict]:
