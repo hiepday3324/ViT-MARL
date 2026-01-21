@@ -305,7 +305,14 @@ class ExecutionAgent():
         # TODO: consider adding quantity before (in priority) to each price / level
 
         # TODO: use the agent quant identification from the separate function _get_executed_by_level instead of _get_reward
-        reward, extras = self._get_reward(state, params, trades)
+        reward, extras = self._get_reward(world_state=state,      # Dùng state của agent làm world_state (vì nó chứa đủ thông tin time, steps)
+                                        agent_state=state,      # Dùng state hiện tại
+                                        agent_params=params, 
+                                        trades=trades, 
+                                        bestasks=bestasks, 
+                                        bestbids=bestbids, 
+                                        time=time
+                                    )
         quant_executed = state.quant_executed + extras["agentQuant"]
         # CAVE: uses seconds only (not ns)
         trade_duration_step = (jnp.abs(agent_trades[:, 1]) / state.task_to_execute * (agent_trades[:, -2] - state.init_time[0])).sum()
@@ -2256,9 +2263,9 @@ class ExecutionAgent():
 
         reward_scaled = reward
 
-        # # Giữ lại logic debug đặc biệt (nếu cần)
-        # if self.cfg.reward_space == "finish_fast":
-        #         reward_scaled = -jnp.abs(quant_left) / 10.0
+        # Giữ lại logic debug đặc biệt (nếu cần)
+        if self.cfg.reward_space == "finish_fast":
+                reward_scaled = -jnp.abs(quant_left) / 10.0
 
         return reward_scaled, reward_info
 
