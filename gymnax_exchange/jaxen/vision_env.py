@@ -1436,7 +1436,7 @@ class ExecutionAgent():
             world_state.ask_raw_orders,
             world_state.bid_raw_orders,
             3,
-            self.cfg
+            self.world_config
         )
         
         # Kênh 0: Ask, Kênh 1: Bid
@@ -1444,6 +1444,10 @@ class ExecutionAgent():
         ask_prices = l2_state[:, 0, 0] # [Ask_L1, Ask_L2, Ask_L3]
         bid_prices = l2_state[:, 0, 1] # [Bid_L1, Bid_L2, Bid_L3]
         tick = self.world_config.tick_size
+
+
+        jax.debug.print("LOB: Ask Prices: {}, Bid Prices: {}/ State: Ask Prices: {}, Bid Prices: {}", ask_prices[0], bid_prices[0],world_state.best_asks[-1][0], world_state.best_bids[-1][0])
+
 
         def get_buy_prices(ask_prices, bid_prices):
             # MUA: Chỉ quan tâm bên BID (Đặt lệnh chờ mua)
@@ -1508,12 +1512,14 @@ class ExecutionAgent():
         scale = jnp.where(total_planned > quant_left, quant_left / (total_planned + 1e-6), 1.0)
         target_quants = jnp.floor(target_quants * scale).astype(jnp.int32)
 
+        jax.debug.print("Target Quants: {}", target_quants)
+        
         # 4. Đóng gói Action Messages cho JAX-LOB
         n_msgs = self.cfg.num_action_messages_by_agent
         side_val = 1 - agent_state.is_sell_task * 2
         
-        final_quants = jnp.zeros((n_msgs,), dtype=jnp.int32).at[0:3].set(target_quants)
-        final_prices = jnp.zeros((n_msgs,), dtype=jnp.int32).at[0:3].set(prices)
+        final_quants = jnp.zeros((n_msgs,), dtype=jnp.int32).at[0:3].set(target_quants.reshape(-1))
+        final_prices = jnp.zeros((n_msgs,), dtype=jnp.int32).at[0:3].set(prices.reshape(-1))
 
         # Tạo các mảng thuộc tính message (Type=1 cho Limit Order)
         msg_types = jnp.ones((n_msgs,), dtype=jnp.int32)
@@ -1641,7 +1647,6 @@ class ExecutionAgent():
         
         vision_obs = self._get_obs_vision(world_state=world_state,
                                         normalize=normalize)
-        
         return {'exec_obs': exec_obs,
                 'vision_obs': vision_obs}
 
@@ -2220,7 +2225,9 @@ class ExecutionAgent():
         # 5. TỔNG HỢP REWARD
         alpha = self.cfg.reward_lambda
         reward = r_comp + alpha * r_mimic_scaled
-
+        
+        jax.debug.print("DEBUG REWARD: Step {}, Executed Vol: {}, v_base: {}", 
+                world_state.step_counter, agentQuant, v_base)
         # 6. CẬP NHẬT METRICS & LOGGING
         # Drift: Sự trôi giá thị trường so với giá Arrival
         drift = direction_switch * agentQuant * (p_benchmark - agent_state.init_price // self.world_config.tick_size)
@@ -2569,7 +2576,7 @@ class ExecutionAgent():
             world_state.ask_raw_orders,
             world_state.bid_raw_orders,
             3,
-            self.cfg
+            self.world_config
         )
 
         # 2. Định nghĩa hàm xử lý logic
@@ -2705,7 +2712,7 @@ class ExecutionAgent():
         raw_tensor = job.get_vision_L2_state(world_state.ask_raw_orders,  # Current ask orders
                                         world_state.bid_raw_orders,  # Current bid orders
                                         10,  # Number of levels
-                                        self.cfg  
+                                        self.world_config  
                                         )
         if normalize:
             return self.normalize_vision_obs(raw_tensor, world_state)
@@ -2811,7 +2818,7 @@ class ExecutionAgent():
         valid_ask = prices_ask != -1
         
         # 1. Gap: (Đã đúng)
-        gap_ask = jnp.where(valid_ask, (prices_ask - mid_price) / self.cfg.tick_size, 0)
+        gap_ask = jnp.where(valid_ask, (prices_ask - mid_price) / self.world_config.tick_size, 0)
         
         # 2. Log Vol: Cần đảm bảo volume rác = 0 tuyệt đối
         # Ép volume về 0 trước khi log
@@ -2829,7 +2836,7 @@ class ExecutionAgent():
         valid_bid = prices_bid != -1
         
         # 1. Gap: Khoảng cách giá đến mid price
-        gap_bid = jnp.where(valid_bid, (mid_price - prices_bid) / self.cfg.tick_size, 0)
+        gap_bid = jnp.where(valid_bid, (mid_price - prices_bid) / self.world_config.tick_size, 0)
         
         # 2. Log Vol: Chuẩn hóa volume tại mức giá đấy
         clean_vol_bid = jnp.where(valid_bid, vols_bid, 0)
@@ -2937,9 +2944,8 @@ if __name__ == "__main__":
     from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig
 
     multi_agent_config = MultiAgentConfig(dict_of_agents_configs={
-                                "Execution": Execution_EnvironmentConfig(action_space="simplest_case",
-                                                            observation_space="simplest_case",
-                                                            reward_space="simplest_case"
+                                "Execution": Execution_EnvironmentConfig(action_space="policy_blending",
+                                                            observation_space="execution_policy",
                                                             )},
                                         number_of_agents_per_type=[1],)
 
@@ -2975,7 +2981,7 @@ if __name__ == "__main__":
         print(f"    Agent type {env.instance_list[i].__class__.__name__}: {obs}")
     
 
-    num_steps = 30
+    num_steps = 20
     fixed_actions = False
 
     for i in range(1, num_steps+1):
@@ -3011,7 +3017,6 @@ if __name__ == "__main__":
             print(f"    Agent type {env.instance_list[i].__class__.__name__}: {actions}")
 
         obs, state, rewards, done, info = env.step(key=key_step, state=state, actions=actions_per_type, params=env_params)
-        
         print("observations_per_type:")
         for i, obs in enumerate(obs):
             print(f"    Agent type {env.instance_list[i].__class__.__name__}: {obs}")
