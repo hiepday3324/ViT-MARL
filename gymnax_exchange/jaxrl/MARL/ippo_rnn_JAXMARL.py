@@ -72,7 +72,7 @@ class ScannedRNN(nn.Module):
         cell = nn.GRUCell(features=hidden_size)
         return cell.initialize_carry(jax.random.PRNGKey(0), (batch_size, hidden_size))
 
-
+# FIXME: APPLY VISION
 class ActorCriticRNN(nn.Module):
     action_dim: Sequence[int]
     config: Dict
@@ -114,7 +114,7 @@ class ActorCriticRNN(nn.Module):
 
         return hidden, pi, jnp.squeeze(critic, axis=-1)
 
-
+# FIXME: APPLY VISION
 class Transition(NamedTuple):
     global_done: jnp.ndarray
     done: jnp.ndarray
@@ -289,6 +289,7 @@ def make_train(config):
         def _update_step(update_runner_state,env_params,eval_env_params, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
+            # FIXME: APPLY VISION
             def _env_step(runner_state, unused):
                 train_states, env_state, last_obs, last_done,h_states, rng = runner_state
 
@@ -412,6 +413,7 @@ def make_train(config):
                 targets.append(targets_i)
 
             # UPDATE NETWORKS
+            # FIXME: APPLY VISION
             loss_infos = []
             for i, train_state in enumerate(train_states):
                 def _update_epoch(update_state, unused):
