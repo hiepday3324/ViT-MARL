@@ -2487,7 +2487,7 @@ class ExecutionAgent():
         raw_tensor = job.get_vision_L2_state(world_state.ask_raw_orders,  # Current ask orders
                                         world_state.bid_raw_orders,  # Current bid orders
                                         10,  # Number of levels
-                                        self.cfg  
+                                        self.world_config  
                                         )
         if normalize:
             return self.normalize_vision_obs(raw_tensor, world_state)
@@ -2593,7 +2593,7 @@ class ExecutionAgent():
         valid_ask = prices_ask != -1
         
         # 1. Gap: (Đã đúng)
-        gap_ask = jnp.where(valid_ask, (prices_ask - mid_price) / self.cfg.tick_size, 0)
+        gap_ask = jnp.where(valid_ask, (prices_ask - mid_price) / self.world_config.tick_size, 0)
         
         # 2. Log Vol: Cần đảm bảo volume rác = 0 tuyệt đối
         # Ép volume về 0 trước khi log
@@ -2611,7 +2611,7 @@ class ExecutionAgent():
         valid_bid = prices_bid != -1
         
         # 1. Gap: Khoảng cách giá đến mid price
-        gap_bid = jnp.where(valid_bid, (mid_price - prices_bid) / self.cfg.tick_size, 0)
+        gap_bid = jnp.where(valid_bid, (mid_price - prices_bid) / self.world_config.tick_size, 0)
         
         # 2. Log Vol: Chuẩn hóa volume tại mức giá đấy
         clean_vol_bid = jnp.where(valid_bid, vols_bid, 0)
