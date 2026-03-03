@@ -38,7 +38,8 @@ import gc
 #from jaxmarl.environments.smax import map_name_to_scenario, HeuristicEnemySMAX
 from gymnax_exchange.jaxen.marl_env import MARLEnv
 from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig,Execution_EnvironmentConfig, World_EnvironmentConfig,MarketMaking_EnvironmentConfig
-
+from gymnax_exchange.networks.gate_fusion import EMASmoothing, StableGatedCrossAttention
+from gymnax_exchange.networks.vision_agent import VisionAgent
 import wandb
 import functools
 import matplotlib.pyplot as plt
@@ -122,8 +123,8 @@ class Transition(NamedTuple):
     value: jnp.ndarray
     reward: jnp.ndarray
     log_prob: jnp.ndarray
-    obs: jnp.ndarray
-    info: jnp.ndarray
+    obs: Dict[str, jnp.ndarray]  
+    info: Dict[str, Any]
     # avail_actions: jnp.ndarray
 
 
@@ -309,8 +310,10 @@ def make_train(config):
                 for i, train_state in enumerate(train_states):
                     obs_i= last_obs[i]
                     obs_i=batchify(obs_i,config["NUM_ACTORS_PERTYPE"][i])  # Reshape to match the input shape of the network
+
+                    obs_i_batched = jax.tree.map(lambda x: x[jnp.newaxis, :], obs_i)
                     ac_in = (
-                        obs_i[jnp.newaxis, :],
+                        obs_i_batched,
                         last_done[i][jnp.newaxis, :],
                         # avail_actions,
                     )
@@ -413,7 +416,7 @@ def make_train(config):
                 targets.append(targets_i)
 
             # UPDATE NETWORKS
-            # FIXME: APPLY VISION
+            # FIXME: APPLY VISION, GATED-FUSION
             loss_infos = []
             for i, train_state in enumerate(train_states):
                 def _update_epoch(update_state, unused):
