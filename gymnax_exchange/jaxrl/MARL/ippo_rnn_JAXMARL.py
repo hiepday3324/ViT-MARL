@@ -73,7 +73,7 @@ class ScannedRNN(nn.Module):
         cell = nn.GRUCell(features=hidden_size)
         return cell.initialize_carry(jax.random.PRNGKey(0), (batch_size, hidden_size))
 
-# FIXME: APPLY VISION
+# FIXME: APPLY VISION 
 class ActorCriticRNN(nn.Module):
     action_dim: Sequence[int]
     config: Dict
@@ -82,10 +82,21 @@ class ActorCriticRNN(nn.Module):
     def __call__(self, hidden, x):
         # obs, dones, avail_actions = x
         obs, dones = x
+        obs_exec = obs['exec_obs']
+        obs_vision = obs['vision_obs']
+
+        vision_encoder = VisionAgent(config=self.config)
+        z_vision = vision_encoder(obs_vision)
+
+        ema_module = EMASmoothing(alpha = 0.5)
+        
+
+        fushion = StableGatedCrossAttention(config=self.config)
+        fused_obs = fushion(obs_exec, z_vision)
 
         embedding = nn.Dense(
             self.config["FC_DIM_SIZE"], kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0)
-        )(obs)
+        )(fused_obs)
         embedding = nn.relu(embedding)
 
         rnn_in = (embedding, dones)
