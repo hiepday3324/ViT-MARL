@@ -38,8 +38,15 @@ import os
 import jax
 import itertools
 import pandas as pd
-#from pandas.errors import SettingWithCopyWarning
+import warnings
 import numpy as np
+
+# Safe import of SettingWithCopyWarning if available
+try:
+    from pandas.errors import SettingWithCopyWarning
+except (ImportError, AttributeError):
+    # Fallback: use FutureWarning if SettingWithCopyWarning is not available
+    SettingWithCopyWarning = FutureWarning
 
 # from jax import numpy as jnp
 # import jax
