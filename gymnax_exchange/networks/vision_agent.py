@@ -74,3 +74,26 @@ def prepare_obs_vector(obs: jnp.ndarray, shape: tuple = (4, 5)) -> jnp.ndarray:
     if obs.shape[0] < size:
         obs = jnp.concatenate([obs, jnp.zeros(size - obs.shape[0])])
     return obs[:size].reshape(shape)
+def supervised_contrastive_loss(embeddings, labels, temperature=0.1):
+    """
+    Tính Supervised Contrastive Loss cho 1 batch.
+    - embeddings: Ma trận đặc trưng z_vision, shape (Batch_size, Embed_dim)
+    - labels: Nhãn Volatility (0, 1, 2), shape (Batch_size,)
+    """
+    eps = 1e-8
+    norm = jnp.linalg.norm(embeddings, axis=-1, keepdims=True)
+    embeddings = embeddings / jnp.maximum(norm, eps)
+    logits = jnp.matmul(embeddings, embeddings.T) / temperature
+    batch_size = embeddings.shape[0]
+    labels = labels.reshape(-1)
+    mask = jnp.equal(labels[:, None], labels[None, :]).astype(jnp.float32)
+    
+    self_mask = jnp.eye(batch_size, dtype=jnp.float32)
+    mask = mask - self_mask
+    logits = jnp.where(self_mask.astype(bool), -jnp.inf, logits)
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    num_positives = jnp.maximum(mask.sum(axis=1), eps)
+    log_prob_positives = jnp.sum(mask * log_probs, axis=1) / num_positives
+    loss = -log_prob_positives.mean()
+    
+    return loss

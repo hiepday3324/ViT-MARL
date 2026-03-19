@@ -39,7 +39,7 @@ import gc
 from gymnax_exchange.jaxen.marl_env import MARLEnv
 from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig,Execution_EnvironmentConfig, World_EnvironmentConfig,MarketMaking_EnvironmentConfig
 from gymnax_exchange.networks.gate_fusion import EMASmoothing, StableGatedCrossAttention
-from gymnax_exchange.networks.vision_agent import VisionAgent
+from gymnax_exchange.networks.vision_agent import VisionAgent, supervised_contrastive_loss
 import wandb
 import functools
 import matplotlib.pyplot as plt
@@ -89,10 +89,10 @@ class ActorCriticRNN(nn.Module):
         z_vision = vision_encoder(obs_vision)
 
         ema_module = EMASmoothing(alpha = 0.5)
-        
+        obs_exec = ema_module(obs_exec)
 
-        fushion = StableGatedCrossAttention(config=self.config)
-        fused_obs = fushion(obs_exec, z_vision)
+        fusion = StableGatedCrossAttention(config=self.config)
+        fused_obs = fusion(obs_exec, z_vision)
 
         embedding = nn.Dense(
             self.config["FC_DIM_SIZE"], kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0)
@@ -124,7 +124,7 @@ class ActorCriticRNN(nn.Module):
             critic
         )
 
-        return hidden, pi, jnp.squeeze(critic, axis=-1)
+        return hidden, pi, jnp.squeeze(critic, axis=-1), z_vision
 
 # FIXME: APPLY VISION
 class Transition(NamedTuple):
@@ -251,10 +251,11 @@ def make_train(config):
             network = ActorCriticRNN(env.action_spaces[i].n, config=config)
             rng, _rng = jax.random.split(rng)
             init_x = (
-                jnp.zeros(
-                    (1, config["NUM_ENVS"], env.observation_spaces[i].shape[0])
-                ), # obs
-                jnp.zeros((1, config["NUM_ENVS"])), # dones
+                {
+                    'exec_obs': jnp.zeros((1, config["NUM_ENVS"], env.observation_spaces[i].shape[0])), 
+                    'vision_obs': jnp.zeros((1, config["NUM_ENVS"], 10, 3, 2)) # Shape của LOB
+                },
+                jnp.zeros((1, config["NUM_ENVS"])) # dones
                 # jnp.zeros((1, config["NUM_ENVS"], env.action_spaces[i].n)), #     avail_actions
             )
 
@@ -317,7 +318,9 @@ def make_train(config):
                 actions=[]
                 values=[]
                 log_probs=[]
-
+                '''
+                Duyệt qua các agent trong môi trường, lấy ra hành động và trạng thái tại bước thời gian đó
+                '''
                 for i, train_state in enumerate(train_states):
                     obs_i= last_obs[i]
                     obs_i=batchify(obs_i,config["NUM_ACTORS_PERTYPE"][i])  # Reshape to match the input shape of the network
@@ -341,13 +344,17 @@ def make_train(config):
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-
+                '''
+                Cho các agent tương tác với môi trường, nhận lại obs mới, trạng thái và rewards
+                '''
                 obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0,None)
                 )(rng_step, env_state, actions,env_params)
 
                 # info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
-                
+                '''
+                Ghi lại nhật kí 
+                '''
                 done_batch=done
                 transitions=[]
                 for i,train_state in enumerate(train_states):
@@ -374,11 +381,70 @@ def make_train(config):
                     ))
                 runner_state = (train_states, env_state, obsv, done_batch['agents'], h_states, rng)
                 return runner_state, transitions
-
             initial_hstates = runner_state[-2]
-            runner_state, traj_batch = jax.lax.scan(
-                _env_step, runner_state, None, config["NUM_STEPS"]
+
+            window_size = 10
+            total_rollout_steps = config["NUM_STEPS"] + window_size
+
+            def scan_body(carry, step_idx):
+                current_runner_state, stashed_runner_state = carry
+                
+                # Tiến 1 bước
+                next_runner_state, transition = _env_step(current_runner_state, None)
+                
+                # MA THUẬT: Chụp ảnh trạng thái ở đúng vạch đích NUM_STEPS - 1 (bước 128)
+                is_step_128 = (step_idx == config["NUM_STEPS"] - 1)
+                new_stashed_state = jax.tree_util.tree_map(
+                    lambda next_s, stash_s: jnp.where(is_step_128, next_s, stash_s),
+                    next_runner_state, stashed_runner_state
+                )
+                
+                return (next_runner_state, new_stashed_state), transition
+
+            # Chạy 138 bước
+            (final_runner_state, stashed_runner_state), traj_batch_padded = jax.lax.scan(
+                scan_body, 
+                (runner_state, runner_state), 
+                jnp.arange(total_rollout_steps)
             )
+
+            # ==========================================================
+            # [PHASE 2]: TRÍCH XUẤT NHÃN VOLATILITY TỪ 10 BƯỚC TƯƠNG LAI
+            # ==========================================================
+            volatility_labels = []
+            for i in range(len(stashed_runner_state[0])): # Lặp qua train_states
+                mid_prices = traj_batch_padded[i].info["world"]["end_mid_price"]
+                
+                # Quét cửa sổ tương lai (Logic giữ nguyên, chạy thẳng trên mid_prices chuẩn)
+                def calc_future_std(t):
+                    future_window = jax.lax.dynamic_slice_in_dim(mid_prices, t + 1, window_size, axis=0)
+                    return jnp.std(future_window, axis=0)
+                
+                # Chỉ tính nhãn cho 128 bước đầu
+                timesteps = jnp.arange(config["NUM_STEPS"])
+                future_vol = jax.vmap(calc_future_std)(timesteps)
+                
+                # Gán nhãn
+                labels = jnp.where(future_vol > config.get("VOL_HIGH", 0.02), 2, 
+                         jnp.where(future_vol > config.get("VOL_LOW", 0.005), 1, 0))
+                volatility_labels.append(labels)
+
+            # ==========================================================
+            # [PHASE 3]: CƯA ĐUÔI DATA VÀ KHÔI PHỤC DÒNG THỜI GIAN
+            # ==========================================================
+            # 3.1 Cưa bỏ 10 bước padding, trả về traj_batch chuẩn 128 bước
+            traj_batch = jax.tree_util.tree_map(
+                lambda x: x[:config["NUM_STEPS"]], traj_batch_padded
+            )
+
+            # 3.2 Khôi phục bộ nhớ ở bước 128 cho vòng lặp sau
+            t_states, e_state, l_obs, l_dones, h_states, _ = stashed_runner_state
+            
+            # Chôm chìa khóa RNG từ bước 138 (final_runner_state).
+            fresh_rng = final_runner_state[-1] 
+            
+            # Gắn lại vào runner_state
+            runner_state = (t_states, e_state, l_obs, l_dones, h_states, fresh_rng)
 
             # CALCULATE ADVANTAGE
             train_states, env_state, last_obs, last_dones, hstates_new, rng = runner_state
@@ -419,7 +485,7 @@ def make_train(config):
                     last_dones[i][jnp.newaxis, :],
                     # avail_actions,
                 )
-                _, _, last_val = train_state.apply_fn(train_state.params, hstates_new[i], ac_in)
+                _, _, last_val, _ = train_state.apply_fn(train_state.params, hstates_new[i], ac_in)
                 last_val = last_val.squeeze()
 
                 advantages_i, targets_i = _calculate_gae(config["GAMMA"][i],config["GAE_LAMBDA"][i],traj_batch[i], last_val)
@@ -432,11 +498,11 @@ def make_train(config):
             for i, train_state in enumerate(train_states):
                 def _update_epoch(update_state, unused):
                     def _update_minbatch(train_state, batch_info):
-                        init_hstate, traj_batch, advantages, targets = batch_info
+                        init_hstate, traj_batch, advantages, targets, vol_labels = batch_info
 
-                        def _loss_fn(params, init_hstate, traj_batch, gae, targets):
+                        def _loss_fn(params, init_hstate, traj_batch, gae, targets, vol_labels):
                             # RERUN NETWORK
-                            _, pi, value = train_state.apply_fn(
+                            _, pi, value, z_vision = train_state.apply_fn(
                                 params,
                                 init_hstate.squeeze(),
                                 (traj_batch.obs, traj_batch.done),
@@ -470,20 +536,33 @@ def make_train(config):
                             loss_actor = loss_actor.mean()
                             entropy = pi.entropy().mean()
 
-                            # debug
-                            approx_kl = ((ratio - 1) - logratio).mean()
-                            clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
-
-                            total_loss = (
+                            # TỔNG HỢP PPO LOSS
+                            ppo_loss = (
                                 loss_actor
                                 + config["VF_COEF"][i] * value_loss
                                 - config["ENT_COEF"][i] * entropy
                             )
-                            return total_loss, (value_loss, loss_actor, entropy, ratio, approx_kl, clip_frac)
 
+                            # TÍNH SUPCON LOSS CHO VISION AGENT
+                            # Duỗi phẳng (NUM_STEPS, MINIBATCH_ACTORS) thành 1D để batch bắt cặp chéo
+                            z_flat = z_vision.reshape(-1, z_vision.shape[-1])
+                            labels_flat = vol_labels.reshape(-1)
+                            
+                            # Giả định bạn đã có hàm supervised_contrastive_loss
+                            supcon_loss = supervised_contrastive_loss(z_flat, labels_flat, temperature=0.1)
+
+                            # LOSS CUỐI CÙNG (Cộng PPO và SupCon có hệ số)
+                            alpha = config.get("SUPCON_ALPHA", 0.1)
+                            total_loss = ppo_loss + alpha * supcon_loss
+
+                            # debug
+                            approx_kl = ((ratio - 1) - logratio).mean()
+                            clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
+
+                            return total_loss, (value_loss, loss_actor, entropy, ratio, approx_kl, clip_frac, supcon_loss)
                         grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                         total_loss, grads = grad_fn(
-                            train_state.params, init_hstate, traj_batch, advantages, targets
+                            train_state.params, init_hstate, traj_batch, advantages, targets, vol_labels
                         )
                         train_state = train_state.apply_gradients(grads=grads)
                         return train_state, total_loss
@@ -493,6 +572,7 @@ def make_train(config):
                         traj_batch,
                         advantages,
                         targets,
+                        vol_labels,
                         rng,
                     ) = update_state
                     rng, _rng = jax.random.split(rng)
@@ -506,6 +586,7 @@ def make_train(config):
                         traj_batch,
                         advantages.squeeze(),
                         targets.squeeze(),
+                        vol_labels,
                     )
                     permutation = jax.random.permutation(_rng, config["NUM_ACTORS_PERTYPE"][i])
 
@@ -535,6 +616,7 @@ def make_train(config):
                         traj_batch,
                         advantages,
                         targets,
+                        vol_labels,
                         rng,
                     )
                     return update_state, total_loss
@@ -545,6 +627,7 @@ def make_train(config):
                     traj_batch[i],
                     advantages[i],
                     targets[i],
+                    volatility_labels[i],
                     rng,
                 )
                 update_state, loss_info = jax.lax.scan(
