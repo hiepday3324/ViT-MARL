@@ -331,7 +331,7 @@ def make_train(config):
                         last_done[i][jnp.newaxis, :],
                         # avail_actions,
                     )
-                    h_states[i], pi, value = train_state.apply_fn(train_state.params, h_states[i], ac_in)
+                    h_states[i], pi, value, _ = train_state.apply_fn(train_state.params, h_states[i], ac_in)
                     values.append(value)
                     action = pi.sample(seed=_rng)
                     log_probs.append(pi.log_prob(action))
@@ -690,7 +690,7 @@ def make_train(config):
                             last_done[i][jnp.newaxis, :],
                             # avail_actions,
                         )
-                        h_states[i], pi, value = train_state.apply_fn(train_state.params, h_states[i], ac_in)
+                        h_states[i], pi, value, _ = train_state.apply_fn(train_state.params, h_states[i], ac_in)
                         values.append(value)
                         action = pi.sample(seed=_rng)
                         log_probs.append(pi.log_prob(action))
