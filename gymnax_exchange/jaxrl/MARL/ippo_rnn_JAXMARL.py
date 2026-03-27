@@ -8,7 +8,6 @@ import pandas as pd
 import csv
 import wandb.sdk
 
-from docs.source import conf
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
 # os.environ["JAX_CHECK_TRACER_LEAKS"] = "true"
