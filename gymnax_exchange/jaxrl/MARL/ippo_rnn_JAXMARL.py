@@ -86,19 +86,23 @@ class ActorCriticRNN(nn.Module):
 
     @nn.compact
     def __call__(self, hidden, x):
-        # obs, dones, avail_actions = x
         obs, dones = x
-        obs_exec = obs['exec_obs']
-        obs_vision = obs['vision_obs']
+        
+        if isinstance(obs, dict):
+            obs_exec = obs['exec_obs']
+            obs_vision = obs['vision_obs']
 
-        vision_encoder = VisionAgent(config=self.config)
-        z_vision = vision_encoder(obs_vision)
+            vision_encoder = VisionAgent(embed_dim=self.config["FC_DIM_SIZE"])
+            z_vision = vision_encoder(obs_vision)
 
-        ema_module = EMASmoothing(alpha = 0.5)
-        obs_exec = ema_module(obs_exec)
+            ema_module = EMASmoothing(alpha = 0.5)
+            obs_exec = ema_module(obs_exec)
 
-        fusion = StableGatedCrossAttention(config=self.config)
-        fused_obs = fusion(obs_exec, z_vision)
+            fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
+            fused_obs = fusion(obs_exec, z_vision)
+        else:
+            fused_obs = obs
+            z_vision = jnp.zeros((1,))
 
         embedding = nn.Dense(
             self.config["FC_DIM_SIZE"], kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0)
@@ -145,12 +149,12 @@ class Transition(NamedTuple):
     # avail_actions: jnp.ndarray
 
 
-def batchify(x: jnp.ndarray, num_actors):
-    return x.reshape((num_actors, -1))
+def batchify(x, num_actors):
+    return jax.tree_util.tree_map(lambda y: y.reshape((num_actors, *y.shape[2:])), x)
 
 
-def unbatchify(x: jnp.ndarray,num_envs, num_agents):
-    return  x.reshape((num_envs, num_agents, -1))
+def unbatchify(x, num_envs, num_agents):
+    return jax.tree_util.tree_map(lambda y: y.reshape((num_envs, num_agents, *y.shape[1:])), x)
 
 
 def make_train(config):
@@ -256,11 +260,23 @@ def make_train(config):
             # print("Action space dimension for network i ",env.action_spaces[i].n)
             network = ActorCriticRNN(env.action_spaces[i].n, config=config)
             rng, _rng = jax.random.split(rng)
-            init_x = (
-                {
-                    'exec_obs': jnp.zeros((1, config["NUM_ENVS"], env.observation_spaces[i].shape[0])), 
+            if hasattr(env.observation_spaces[i], "spaces"):
+                obs_shape = env.observation_spaces[i].spaces['exec_obs'].shape[0]
+                init_obs = {
+                    'exec_obs': jnp.zeros((1, config["NUM_ENVS"], obs_shape)), 
                     'vision_obs': jnp.zeros((1, config["NUM_ENVS"], 10, 3, 2)) # Shape của LOB
-                },
+                }
+            elif isinstance(env.observation_spaces[i], dict):
+                obs_shape = env.observation_spaces[i]['exec_obs'].shape[0]
+                init_obs = {
+                    'exec_obs': jnp.zeros((1, config["NUM_ENVS"], obs_shape)), 
+                    'vision_obs': jnp.zeros((1, config["NUM_ENVS"], 10, 3, 2)) # Shape của LOB
+                }
+            else:
+                init_obs = jnp.zeros((1, config["NUM_ENVS"], env.observation_spaces[i].shape[0]))
+
+            init_x = (
+                init_obs,
                 jnp.zeros((1, config["NUM_ENVS"])) # dones
                 # jnp.zeros((1, config["NUM_ENVS"], env.action_spaces[i].n)), #     avail_actions
             )
@@ -483,11 +499,12 @@ def make_train(config):
             targets=[]
             for i, train_state in enumerate(train_states):
                 last_obs_batch = batchify(last_obs[i], config["NUM_ACTORS_PERTYPE"][i])
+                last_obs_batch_expanded = jax.tree.map(lambda x: x[jnp.newaxis, :], last_obs_batch)
                 # avail_actions = jnp.ones(
                 #     (config["NUM_ACTORS"], env.action_space(env.agents[0]).n)
                 # )
                 ac_in = (
-                    last_obs_batch[jnp.newaxis, :],
+                    last_obs_batch_expanded,
                     last_dones[i][jnp.newaxis, :],
                     # avail_actions,
                 )
@@ -550,15 +567,16 @@ def make_train(config):
                             )
 
                             # TÍNH SUPCON LOSS CHO VISION AGENT
-                            # Duỗi phẳng (NUM_STEPS, MINIBATCH_ACTORS) thành 1D để batch bắt cặp chéo
-                            z_flat = z_vision.reshape(-1, z_vision.shape[-1])
-                            labels_flat = vol_labels.reshape(-1)
-                            
-                            # Giả định bạn đã có hàm supervised_contrastive_loss
-                            supcon_loss = supervised_contrastive_loss(z_flat, labels_flat, temperature=0.1)
+                            if isinstance(traj_batch.obs, dict):
+                                z_flat = z_vision.reshape(-1, z_vision.shape[-1])
+                                labels_flat = vol_labels.reshape(-1)
+                                supcon_loss = supervised_contrastive_loss(z_flat, labels_flat, temperature=0.1)
+                                alpha = config.get("SUPCON_ALPHA", 0.1)
+                            else:
+                                supcon_loss = jnp.array(0.0)
+                                alpha = jnp.array(0.0)
 
                             # LOSS CUỐI CÙNG (Cộng PPO và SupCon có hệ số)
-                            alpha = config.get("SUPCON_ALPHA", 0.1)
                             total_loss = ppo_loss + alpha * supcon_loss
 
                             # debug
@@ -691,8 +709,9 @@ def make_train(config):
                     for i, train_state in enumerate(train_states):
                         obs_i= last_obs[i]
                         obs_i=batchify(obs_i,config["NUM_ACTORS_PERTYPE"][i])  # Reshape to match the input shape of the network
+                        obs_i_batched = jax.tree.map(lambda x: x[jnp.newaxis, :], obs_i)
                         ac_in = (
-                            obs_i[jnp.newaxis, :],
+                            obs_i_batched,
                             last_done[i][jnp.newaxis, :],
                             # avail_actions,
                         )
