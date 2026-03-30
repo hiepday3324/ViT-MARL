@@ -91,7 +91,7 @@ from jax import config
 import faulthandler
 faulthandler.enable()
 # chex.assert_gpu_available(backend=None)
-config.update('jax_platform_name', 'cpu')
+# config.update('jax_platform_name', 'cpu')
 # config.update("jax_enable_x64",True)
 config.update("jax_disable_jit", False) # use this during training
 #jax.config.update("jax_log_compiles", True) use this to see when he is recompiling

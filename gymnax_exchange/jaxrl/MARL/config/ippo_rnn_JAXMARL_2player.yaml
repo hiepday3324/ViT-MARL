@@ -30,7 +30,7 @@
 "ANNEAL_LR": [True,True]
 
 # WandB Params
-"ENTITY": "oxford-lob"
+"ENTITY": "leduchiep030304-fpt-university"
 "PROJECT": "test2"
 "WANDB_MODE" : "online"
 

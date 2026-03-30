@@ -22,8 +22,8 @@ class JAXLOB_Configuration:
     start_resolution: int = 50  # Episodes from data start every n seconds.
     # alphatradePath: str = os.path.expanduser("~")
     # dataPath: str = os.path.expanduser("~")+"/data"
-    alphatradePath: str = "F:/JaxMARL-HFT-main"  #FIXME: đã sửa lại đường dẫn dữ liệu
-    dataPath: str = "F:/JaxMARL-HFT-main/data"  #FIXME: đã sửa lại đường dẫn dữ liệu
+    alphatradePath: str = "/mnt/d/ViT-MARL-main/ViT-MARL"  #FIXME: đã sửa lại đường dẫn dữ liệu
+    dataPath: str = "/mnt/d/ViT-MARL-main/ViT-MARL/data"  #FIXME: đã sửa lại đường dẫn dữ liệu
     stock: str = "AMZN"
     timePeriod: str = "2012June_oneday" # Needs to be the appropriate directory name. "2017Jan_oneday", "2024"
 
