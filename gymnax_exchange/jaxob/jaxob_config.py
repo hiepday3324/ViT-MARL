@@ -1,8 +1,14 @@
 import gymnax_exchange.jaxob.jaxob_constants as cst
 import os
+from pathlib import Path
 from typing import OrderedDict, Tuple,  Literal,Union,List
 
 from dataclasses import dataclass,field
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_ROOT = os.environ.get("VIT_MARL_ROOT", str(_PROJECT_ROOT))
+_DEFAULT_DATA_PATH = os.environ.get("VIT_MARL_DATA_PATH", str(Path(_DEFAULT_ROOT) / "data"))
 
 
 
@@ -22,8 +28,8 @@ class JAXLOB_Configuration:
     start_resolution: int = 50  # Episodes from data start every n seconds.
     # alphatradePath: str = os.path.expanduser("~")
     # dataPath: str = os.path.expanduser("~")+"/data"
-    alphatradePath: str = "/mnt/d/ViT-MARL-main/ViT-MARL"  #FIXME: đã sửa lại đường dẫn dữ liệu
-    dataPath: str = "/mnt/d/ViT-MARL-main/ViT-MARL/data"  #FIXME: đã sửa lại đường dẫn dữ liệu
+    alphatradePath: str = _DEFAULT_ROOT
+    dataPath: str = _DEFAULT_DATA_PATH
     stock: str = "AMZN"
     timePeriod: str = "2012June_oneday" # Needs to be the appropriate directory name. "2017Jan_oneday", "2024"
 
@@ -151,6 +157,10 @@ class Execution_EnvironmentConfig():
             object.__setattr__(self, 'n_actions', 1)
             object.__setattr__(self, 'num_messages_by_agent', 4)
             object.__setattr__(self, 'num_action_messages_by_agent', 2)
+        elif self.action_space == "policy_blending":
+            object.__setattr__(self, 'n_actions', 3)
+            object.__setattr__(self, 'num_messages_by_agent', 6)
+            object.__setattr__(self, 'num_action_messages_by_agent', 3)
 
 
 

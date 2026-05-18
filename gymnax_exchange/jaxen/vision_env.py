@@ -130,6 +130,9 @@ from gymnax_exchange.jaxen.StatesandParams import MultiAgentState, WorldState
 #from gymnax_exchange.jaxen.from_JAXMARL import spaces
 import jax.tree_util as jtu
 
+ACTION_LOW = jnp.array([-1.0, 0.0, 0.0], dtype=jnp.float32)
+ACTION_HIGH = jnp.array([3.0, 1.0, 1.0], dtype=jnp.float32)
+
 
 class ExecutionAgent():
     def __init__(
@@ -201,6 +204,11 @@ class ExecutionAgent():
     def step_env(
         self, key: chex.PRNGKey, state: ExecEnvState, input_action: jax.Array, params: ExecEnvParams
     ) -> Tuple[chex.Array, ExecEnvState, float, bool, dict]:
+        raise NotImplementedError(
+            "ExecutionAgent.step_env is deprecated for the MARL path. "
+            "Use MARLEnv.step_env, which supplies world data and calls "
+            "ExecutionAgent.get_action(action, world_state, agent_state, agent_params)."
+        )
 
         data_messages = self._get_data_messages(
             params.message_data,
@@ -1496,11 +1504,13 @@ class ExecutionAgent():
         v_twap = agent_state.task_to_execute / total_steps
         
         # V_base mặc định đặt tại Level 1 
-        v_base = jnp.array([v_twap, 0.0, 0.0])
-        
         # Công thức Dual-PPO: V_actual = V_base + (V_twap * Action) 
         # action[0] là a1, action[1] là a2, action[2] là a3
-        target_quants_float = v_base + (v_twap * action)
+        target_quants_float = jnp.array([
+            v_twap * (1.0 + action[0]),
+            v_twap * action[1],
+            v_twap * action[2],
+        ])
         target_quants = jnp.floor(jnp.maximum(0, target_quants_float)).astype(jnp.int32)
 
         # 3. Kiểm soát tồn kho (Tránh ảo hàng)
@@ -2876,9 +2886,7 @@ class ExecutionAgent():
         elif self.cfg.action_space == "policy_blending":
             # Action là vector liên tục 3 chiều: [Aggressive Scale, Passive Scale 1, Passive Scale 2]
             # Theo bài báo: a1 [-1, 3], a2 [0, 1], a3 [0, 1]
-            low = jnp.array([-1.0, 0.0, 0.0], dtype=jnp.float32)
-            high = jnp.array([3.0, 1.0, 1.0], dtype=jnp.float32)
-            return spaces.Box(low, high, (3,), dtype=jnp.float32)
+            return spaces.Box(ACTION_LOW, ACTION_HIGH, (3,), dtype=jnp.float32)
         else:    
             raise ValueError("Invalid action_space specified.")
 

@@ -6,27 +6,39 @@ from typing import Dict
 
 class VisionAgent(nn.Module):
     """Encode orderbook matrices into embeddings for contrastive learning."""
+
     embed_dim: int
     hidden_size: int = 128
 
     @nn.compact
-    def __call__(self, x, *, train: bool = False):
-        """Forward pass: matrix → embedding vector."""
+    def __call__(self, x, *, train: bool = False, return_tokens: bool = False):
+        """Encode LOB observations.
+
+        Inputs are shaped ``(..., levels, features, sides)``. The default output
+        is pooled over levels; ``return_tokens=True`` preserves level tokens for
+        cross-attention.
+        """
         x = jnp.asarray(x, dtype=jnp.float32)
-        if x.ndim == 2:  # Single matrix [M, N] without batch
-            x = x[None, ...]  # Add batch dim [1, M, N] - neural nets expect [batch, features]
-        # Now x is always 3D: either [1, M, N] or [B, M, N] if already batched
-        x = x.reshape(x.shape[0], -1)  # [batch_size, M*N] - just REARRANGES data, no learning
-        x = nn.Dense(self.hidden_size)(x)  # [B, M*N] → [B, 128] - LEARNS W matrix + bias
-        # reshape vs Dense:
-        #   reshape: just reorganizes existing numbers, no parameters
-        #   Dense: multiplies by learned weight matrix W of shape [M*N, 128], adds bias
-        x = nn.relu(x)  # Nonlinearity: max(0, x). Allows network to learn complex patterns
-        return nn.Dense(self.embed_dim)(x)  # [B, 128] → [B, embed_dim] via W of shape [128, embed_dim]
+        if x.ndim == 2:
+            x = x[None, ...]
+        if x.ndim < 3:
+            raise ValueError(f"VisionAgent expects at least 3 dims, got shape {x.shape}")
+
+        level_tokens = x.reshape(*x.shape[:-3], x.shape[-3], -1)
+        level_tokens = nn.Dense(self.hidden_size, name="token_fc")(level_tokens)
+        level_tokens = nn.relu(level_tokens)
+        level_tokens = nn.Dense(self.embed_dim, name="token_embed")(level_tokens)
+
+        if return_tokens:
+            return level_tokens
+
+        return jnp.mean(level_tokens, axis=-2)
+
 
 def _l2_normalize(x: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
     norm = jnp.linalg.norm(x, axis=-1, keepdims=True)
     return x / jnp.maximum(norm, eps)
+
 
 def contrastive_loss_fn(
     params: Dict[str, jnp.ndarray],
@@ -35,7 +47,6 @@ def contrastive_loss_fn(
     *,
     temperature: float = 0.1,
 ) -> jnp.ndarray:
-
     z_a = model.apply({"params": params}, batch["obs_a"], train=True)
     z_b = model.apply({"params": params}, batch["obs_b"], train=True)
     z_a = _l2_normalize(z_a)
@@ -43,14 +54,15 @@ def contrastive_loss_fn(
 
     logits = (z_a @ z_b.T) / temperature
     labels = jnp.arange(logits.shape[0])
-    
+
     log_probs_a = jax.nn.log_softmax(logits, axis=-1)
     loss_a = -jnp.take_along_axis(log_probs_a, labels[:, None], axis=-1).squeeze(-1).mean()
-    
+
     log_probs_b = jax.nn.log_softmax(logits.T, axis=-1)
     loss_b = -jnp.take_along_axis(log_probs_b, labels[:, None], axis=-1).squeeze(-1).mean()
 
     return 0.5 * (loss_a + loss_b)
+
 
 def loss_fn(
     params: Dict[str, jnp.ndarray],
@@ -60,6 +72,7 @@ def loss_fn(
     temperature: float = 0.1,
 ) -> jnp.ndarray:
     return contrastive_loss_fn(params, model, batch, temperature=temperature)
+
 
 def prepare_raw_orderbook(world_state, n_levels: int = 10) -> jnp.ndarray:
     """Extract [2*n_levels, 8] matrix from WorldState."""
@@ -74,12 +87,10 @@ def prepare_obs_vector(obs: jnp.ndarray, shape: tuple = (4, 5)) -> jnp.ndarray:
     if obs.shape[0] < size:
         obs = jnp.concatenate([obs, jnp.zeros(size - obs.shape[0])])
     return obs[:size].reshape(shape)
+
+
 def supervised_contrastive_loss(embeddings, labels, temperature=0.1):
-    """
-    Tính Supervised Contrastive Loss cho 1 batch.
-    - embeddings: Ma trận đặc trưng z_vision, shape (Batch_size, Embed_dim)
-    - labels: Nhãn Volatility (0, 1, 2), shape (Batch_size,)
-    """
+    """Compute supervised contrastive loss for a batch of embeddings."""
     eps = 1e-8
     norm = jnp.linalg.norm(embeddings, axis=-1, keepdims=True)
     embeddings = embeddings / jnp.maximum(norm, eps)
@@ -87,13 +98,12 @@ def supervised_contrastive_loss(embeddings, labels, temperature=0.1):
     batch_size = embeddings.shape[0]
     labels = labels.reshape(-1)
     mask = jnp.equal(labels[:, None], labels[None, :]).astype(jnp.float32)
-    
+
     self_mask = jnp.eye(batch_size, dtype=jnp.float32)
     mask = mask - self_mask
     logits = jnp.where(self_mask.astype(bool), -jnp.inf, logits)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     num_positives = jnp.maximum(mask.sum(axis=1), eps)
     log_prob_positives = jnp.sum(mask * log_probs, axis=1) / num_positives
-    loss = -log_prob_positives.mean()
-    
-    return loss
+
+    return -log_prob_positives.mean()

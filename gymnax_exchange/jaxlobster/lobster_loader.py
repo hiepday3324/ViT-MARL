@@ -38,7 +38,10 @@ import os
 import jax
 import itertools
 import pandas as pd
-from pandas.errors import SettingWithCopyWarning
+try:
+    from pandas.errors import SettingWithCopyWarning
+except ImportError:
+    from pandas.errors import ChainedAssignmentError as SettingWithCopyWarning
 import numpy as np
 
 # from jax import numpy as jnp

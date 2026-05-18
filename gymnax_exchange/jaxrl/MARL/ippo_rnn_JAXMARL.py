@@ -43,6 +43,7 @@ import gc
 #from jaxmarl.wrappers.baselines import SMAXLogWrapper
 #from jaxmarl.environments.smax import map_name_to_scenario, HeuristicEnemySMAX
 from gymnax_exchange.jaxen.marl_env import MARLEnv
+from gymnax.environments import spaces
 from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig,Execution_EnvironmentConfig, World_EnvironmentConfig,MarketMaking_EnvironmentConfig
 from gymnax_exchange.networks.gate_fusion import EMASmoothing, StableGatedCrossAttention
 from gymnax_exchange.networks.vision_agent import VisionAgent, supervised_contrastive_loss
@@ -81,7 +82,7 @@ class ScannedRNN(nn.Module):
 
 # FIXME: APPLY VISION 
 class ActorCriticRNN(nn.Module):
-    action_dim: Sequence[int]
+    action_space: spaces.Space
     config: Dict
 
     @nn.compact
@@ -93,13 +94,14 @@ class ActorCriticRNN(nn.Module):
             obs_vision = obs['vision_obs']
 
             vision_encoder = VisionAgent(embed_dim=self.config["FC_DIM_SIZE"])
-            z_vision = vision_encoder(obs_vision)
+            z_tokens = vision_encoder(obs_vision, return_tokens=True)
+            z_vision = jnp.mean(z_tokens, axis=-2)
 
             ema_module = EMASmoothing(alpha = 0.5)
             obs_exec = ema_module(obs_exec)
 
             fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
-            fused_obs = fusion(obs_exec, z_vision)
+            fused_obs = fusion(obs_exec, z_tokens)
         else:
             fused_obs = obs
             z_vision = jnp.zeros((1,))
@@ -118,13 +120,34 @@ class ActorCriticRNN(nn.Module):
 
         actor_mean = nn.relu(actor_mean)
 
-        actor_mean = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0) # type: ignore
-        )(actor_mean)
-        # Avail actions are not used in the current implementation, but can be added if needed.
-        # unavail_actions = 1 - avail_actions
-        action_logits = actor_mean # - (unavail_actions * 1e10)
-        pi = distrax.Categorical(logits=action_logits)
+        if isinstance(self.action_space, spaces.Discrete):
+            action_logits = nn.Dense(
+                self.action_space.n, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+            )(actor_mean)
+            pi = distrax.Categorical(logits=action_logits)
+        elif isinstance(self.action_space, spaces.Box):
+            action_loc = nn.Dense(
+                self.action_space.shape[-1], kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+            )(actor_mean)
+            actor_logstd = self.param("log_std", nn.initializers.zeros, (self.action_space.shape[-1],))
+            base_dist = distrax.Independent(
+                distrax.Normal(action_loc, jnp.exp(actor_logstd)),
+                reinterpreted_batch_ndims=1,
+            )
+            action_low = jnp.asarray(self.action_space.low, dtype=jnp.float32)
+            action_high = jnp.asarray(self.action_space.high, dtype=jnp.float32)
+            action_shift = (action_high + action_low) / 2.0
+            action_scale = (action_high - action_low) / 2.0
+            action_bijector = distrax.Block(
+                distrax.Chain([
+                    distrax.ScalarAffine(shift=action_shift, scale=action_scale),
+                    distrax.Tanh(),
+                ]),
+                ndims=1,
+            )
+            pi = distrax.Transformed(base_dist, action_bijector)
+        else:
+            raise ValueError(f"Unknown action space type {type(self.action_space)}")
 
         critic = nn.Dense(self.config["FC_DIM_SIZE"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
             embedding
@@ -257,8 +280,8 @@ def make_train(config):
         num_agents_of_instance_list = []
         init_dones_agents = []
         for i, instance in enumerate(env.instance_list):
-            # print("Action space dimension for network i ",env.action_spaces[i].n)
-            network = ActorCriticRNN(env.action_spaces[i].n, config=config)
+            # print("Action space dimension for network i ",env.action_spaces[i])
+            network = ActorCriticRNN(env.action_spaces[i], config=config)
             rng, _rng = jax.random.split(rng)
             if hasattr(env.observation_spaces[i], "spaces"):
                 obs_shape = env.observation_spaces[i].spaces['exec_obs'].shape[0]
@@ -557,7 +580,10 @@ def make_train(config):
                             )
                             loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
                             loss_actor = loss_actor.mean()
-                            entropy = pi.entropy().mean()
+                            if isinstance(env.action_spaces[i], spaces.Box):
+                                entropy = -log_prob.mean()
+                            else:
+                                entropy = pi.entropy().mean()
 
                             # TỔNG HỢP PPO LOSS
                             ppo_loss = (
@@ -810,11 +836,15 @@ def make_train(config):
 
                     action_distribution = {}
                     actions = np.array(tr.action).flatten()
-                    unique_actions, counts = np.unique(actions, return_counts=True)
-                    tot_counts=sum(counts)
-                    # Add each action count to the dictionary with a unique key
-                    for a, c in zip(unique_actions, counts):
-                        action_distribution[f"agent_{agent_name}/action_{int(a)}"] = c/tot_counts*100
+                    if isinstance(env.action_spaces[agent_index], spaces.Discrete):
+                        unique_actions, counts = np.unique(actions, return_counts=True)
+                        tot_counts=sum(counts)
+                        # Add each action count to the dictionary with a unique key
+                        for a, c in zip(unique_actions, counts):
+                            action_distribution[f"agent_{agent_name}/action_{int(a)}"] = c/tot_counts*100
+                    else:
+                        action_distribution[f"agent_{agent_name}/action_mean"] = float(np.mean(actions))
+                        action_distribution[f"agent_{agent_name}/action_std"] = float(np.std(actions))
                     logging_dict = {
                         # TODO: Log the quantities of interest. Keep it trivial for now.
                         "env_step": (metric["update_steps"]+1)
@@ -849,11 +879,15 @@ def make_train(config):
                         agent_name = agent_type_names[agent_index]
                         action_distribution = {}
                         actions = np.array(tr.action).flatten()
-                        unique_actions, counts = np.unique(actions, return_counts=True)
-                        tot_counts=sum(counts)
-                        # Add each action count to the dictionary with a unique key
-                        for a, c in zip(unique_actions, counts):
-                            action_distribution[f"eval_agent_{agent_name}/action_{int(a)}"] = c/tot_counts*100
+                        if isinstance(env.action_spaces[agent_index], spaces.Discrete):
+                            unique_actions, counts = np.unique(actions, return_counts=True)
+                            tot_counts=sum(counts)
+                            # Add each action count to the dictionary with a unique key
+                            for a, c in zip(unique_actions, counts):
+                                action_distribution[f"eval_agent_{agent_name}/action_{int(a)}"] = c/tot_counts*100
+                        else:
+                            action_distribution[f"eval_agent_{agent_name}/action_mean"] = float(np.mean(actions))
+                            action_distribution[f"eval_agent_{agent_name}/action_std"] = float(np.std(actions))
                         logging_dict.update(action_distribution)
                         for key, value in tr.info['agent'].items():
                             if isinstance(value, (jnp.ndarray, np.ndarray)) and value.size > 0:
@@ -904,9 +938,13 @@ def make_train(config):
         
         orbax_checkpointer = oxcp.PyTreeCheckpointer()
         options = oxcp.CheckpointManagerOptions(max_to_keep=2, create=True,keep_period=config["NUM_UPDATES"]//2)
+        checkpoint_path = f'./checkpoints/MARLCheckpoints/{config["PROJECT"]}/{(run.name if run.name else run.id) if run else "GENERIC_RUN"}'
+
         checkpoint_manager = oxcp.CheckpointManager(
-             f'/home/myuser/checkpoints/MARLCheckpoints/{config["PROJECT"]}/{(run.name if run.name else run.id) if run else "GENERIC_RUN"}', orbax_checkpointer, options
-                )
+            checkpoint_path, # Dùng biến path vừa tạo
+            orbax_checkpointer, 
+            options
+        )
 
 
         
@@ -1095,9 +1133,9 @@ def main(config):
                                         "reward_space" : {"values":["spooner","buy_sell_pnl"]}, # "spooner"buy_sell_pnl
                                         "reference_price_portfolio_value":{"values":["best_bid_ask"]}, #best_bid_ask "mid"
                         }},
-                        "Execution" : {"parameters": {"reward_lambda": {"values":[0.0]},
-                                                      "fixed_quant_value": {"values":[10]}, #20 on fixed quants
-                                                      "action_space": {"values":["fixed_quants_complex"]}, #fixed_quants,fixed_quants_complex
+                        "Execution" : {"parameters": {"reward_lambda": {"values":[0.5]},
+                                                      "observation_space": {"values": ["execution_policy"]}, #20 on fixed quants
+                                                      "action_space": {"values":["policy_blending"]}, #fixed_quants,fixed_quants_complex
                                                       "task_size": {"values":[600]},
                                                       "doom_price_penalty": {"values":[0.1]},
                         }},
