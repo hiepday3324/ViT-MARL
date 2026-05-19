@@ -38,7 +38,7 @@ import os
 import jax
 import itertools
 import pandas as pd
-from pandas.errors import SettingWithCopyWarning
+# from pandas.errors import SettingWithCopyWarning
 import numpy as np
 
 # from jax import numpy as jnp
@@ -184,7 +184,7 @@ class LoadLOBSTER():
         #Turn delete into cancel orders
         message_day.loc[message_day['type'] == 3, 'type'] = 2
         #Add trader_id field (copy of order_id)
-        warnings.filterwarnings('ignore', category=SettingWithCopyWarning)
+        # warnings.filterwarnings('ignore', category=SettingWithCopyWarning)
         message_day['trader_id'] = message_day['order_id']
         orderbook_day.iloc[valid_index,:].reset_index(inplace=True, drop=True)
         return message_day,orderbook_day
@@ -652,7 +652,7 @@ class LoadLOBSTER_resample():
         #Turn delete into cancel orders
         message_day.loc[message_day['type'] == 3, 'type'] = 2
         #Add trader_id field (copy of order_id)
-        warnings.filterwarnings('ignore', category=SettingWithCopyWarning)
+        # warnings.filterwarnings('ignore', category=SettingWithCopyWarning)
         message_day['trader_id'] = message_day['order_id']
         orderbook_day.iloc[valid_index,:].reset_index(inplace=True, drop=True)
         return message_day,orderbook_day
@@ -676,7 +676,7 @@ class LoadLOBSTER_resample():
         orderbook_day.reset_index(inplace=True, drop=True)
         
         # Suppress pandas warnings
-        warnings.filterwarnings('ignore', category=SettingWithCopyWarning)
+        # warnings.filterwarnings('ignore', category=SettingWithCopyWarning)
         
         return message_day, orderbook_day
 
