@@ -4,6 +4,7 @@ Based on PureJaxRL Implementation of PPO
 
 import os
 import sys
+import copy
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "../../../"))
@@ -176,8 +177,22 @@ def batchify(x, num_actors):
     return jax.tree_util.tree_map(lambda y: y.reshape((num_actors, *y.shape[2:])), x)
 
 
+def batchify_action(x, num_actors):
+    def _batchify_action(y):
+        if y.shape[0] == num_actors:
+            return y
+        return y.reshape((num_actors, *y.shape[2:]))
+
+    return jax.tree_util.tree_map(_batchify_action, x)
+
+
 def unbatchify(x, num_envs, num_agents):
-    return jax.tree_util.tree_map(lambda y: y.reshape((num_envs, num_agents, *y.shape[1:])), x)
+    def _unbatchify(y):
+        if y.ndim >= 2 and y.shape[0] == 1:
+            y = jnp.squeeze(y, axis=0)
+        return y.reshape((num_envs, num_agents, *y.shape[1:]))
+
+    return jax.tree_util.tree_map(_unbatchify, x)
 
 
 def make_train(config):
@@ -405,7 +420,7 @@ def make_train(config):
                 for i,train_state in enumerate(train_states):
                     done_batch['agents'][i] = batchify(done["agents"][i],config["NUM_ACTORS_PERTYPE"][i]).squeeze()
                     obs_batch = batchify(obsv[i],config["NUM_ACTORS_PERTYPE"][i])
-                    action_batch = batchify(actions[i],config["NUM_ACTORS_PERTYPE"][i])
+                    action_batch = batchify_action(actions[i],config["NUM_ACTORS_PERTYPE"][i])
                     value = values[i]
                     log_prob = log_probs[i]
 
@@ -769,7 +784,7 @@ def make_train(config):
                     for i, train_state in enumerate(train_states):
                         done_batch['agents'][i] = batchify(done["agents"][i],config["NUM_ACTORS_PERTYPE"][i]).squeeze()
                         obs_batch = batchify(obsv[i],config["NUM_ACTORS_PERTYPE"][i])
-                        action_batch = batchify(actions[i],config["NUM_ACTORS_PERTYPE"][i])
+                        action_batch = batchify_action(actions[i],config["NUM_ACTORS_PERTYPE"][i])
                         value = values[i]
                         log_prob = log_probs[i]
 
@@ -937,8 +952,11 @@ def make_train(config):
         jitted_update_step = jax.jit(_update_step)
         
         orbax_checkpointer = oxcp.PyTreeCheckpointer()
-        options = oxcp.CheckpointManagerOptions(max_to_keep=2, create=True,keep_period=config["NUM_UPDATES"]//2)
-        checkpoint_path = f'./checkpoints/MARLCheckpoints/{config["PROJECT"]}/{(run.name if run.name else run.id) if run else "GENERIC_RUN"}'
+        keep_period = max(1, config["NUM_UPDATES"] // 2)
+        options = oxcp.CheckpointManagerOptions(max_to_keep=2, create=True, keep_period=keep_period)
+        checkpoint_path = os.path.abspath(
+            f'./checkpoints/MARLCheckpoints/{config["PROJECT"]}/{(run.name if run.name else run.id) if run else "GENERIC_RUN"}'
+        )
 
         checkpoint_manager = oxcp.CheckpointManager(
             checkpoint_path, # Dùng biến path vừa tạo
@@ -1009,15 +1027,20 @@ def main(config):
     def sweep_fun():
         print(f"WANDB CONFIG PRIOR {wandb.config}")
 
-
         run=wandb.init(
             entity=config["ENTITY"], # type: ignore
             project=config["PROJECT"], # type: ignore
             tags=["IPPO", "RNN"], # type: ignore
-            config=config, # type: ignore
             mode=config["WANDB_MODE"], # type: ignore
             allow_val_change=True,
         )
+
+        sweep_overrides = OmegaConf.to_container(OmegaConf.create(dict(wandb.config)), resolve=True)
+        active_config = OmegaConf.to_container(
+            OmegaConf.merge(OmegaConf.create(copy.deepcopy(config)), OmegaConf.create(sweep_overrides)),
+            resolve=True,
+        )
+        run.config.update(active_config, allow_val_change=True)
 
         
         # params_file_name = f'params_file_{wandb.run.name}_{datetime.datetime.now().strftime("%m-%d_%H-%M")}'
@@ -1027,34 +1050,34 @@ def main(config):
         # +++++ Single GPU +++++
         
 
-        rng = jax.random.PRNGKey(wandb.config["SEED"])
+        rng = jax.random.PRNGKey(active_config["SEED"])
 
-        print("wandb.config", wandb.config)
+        print("wandb.config", active_config)
 
         
         # print("+++++++++++ Training turned off whilst debugging wandb ++++++++++++")
         
 
 
-        if config["Timing"]:
+        if active_config["Timing"]:
             #print("Start compilation")
             #train_jit = jax.jit(make_train(wandb.config)).lower(rng).compile()
             print("Start training")
             start_time = time.time()
 
 
-        train_fun = make_train(wandb.config)
+        train_fun = make_train(active_config)
         out = train_fun(rng,run)
         # train_state = out['runner_state'][0] # runner_state.train_state
         # params = train_state.params
 
-        if config["Timing"]:
+        if active_config["Timing"]:
             end_time = time.time()
             elapsed = end_time - start_time
-            total_steps = config["TOTAL_TIMESTEPS"]
-            agents_per_type = config["NUM_AGENTS_PER_TYPE"]
-            num_data_msgs = config.get("n_data_msg_per_step", None)
-            num_envs = config["NUM_ENVS"]
+            total_steps = active_config["TOTAL_TIMESTEPS"]
+            agents_per_type = active_config["NUM_AGENTS_PER_TYPE"]
+            num_data_msgs = active_config.get("n_data_msg_per_step", None)
+            num_envs = active_config["NUM_ENVS"]
 
             # Print results
             print(f"Total steps: {total_steps}")
@@ -1078,17 +1101,6 @@ def main(config):
             # Append if file exists, else write header
             with open(csv_path, "w", newline="") as f:
                 df.to_csv(f, index=False)
-        else:
-            print("Start compilation")
-            train_jit = jax.jit(make_train(wandb.config))
-            print("Start training")
-            out = train_jit(rng)
-
-        
-
-
-
-
         # # Save the params to a file using flax.serialization.to_bytes
         # with open(params_file_name, 'wb') as f:
         #     f.write(flax.serialization.to_bytes(params))
