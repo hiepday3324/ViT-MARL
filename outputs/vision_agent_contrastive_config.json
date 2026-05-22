@@ -1,0 +1,52 @@
+{
+  "data_path": "vision_obs_all.npy",
+  "input_shape": [
+    10,
+    3,
+    2
+  ],
+  "n_snapshots": 130,
+  "epochs": 100,
+  "batch_size": 64,
+  "temperature": 0.1,
+  "embed_dim": 64,
+  "learning_rate": 0.0003,
+  "weight_decay": 0.0001,
+  "jitter_std": 0.03,
+  "level_keep_prob": 0.9,
+  "feature_keep_prob": 0.9,
+  "feature_mean": [
+    [
+      [
+        20.65846061706543,
+        21.25692367553711
+      ],
+      [
+        4.5212931632995605,
+        4.560116291046143
+      ],
+      [
+        6.256946563720703,
+        6.288089275360107
+      ]
+    ]
+  ],
+  "feature_std": [
+    [
+      [
+        28.178895950317383,
+        24.298524856567383
+      ],
+      [
+        1.1835778951644897,
+        1.1679335832595825
+      ],
+      [
+        1.1113686561584473,
+        1.1815714836120605
+      ]
+    ]
+  ],
+  "jax_platforms": "cpu",
+  "paper_stage": "Vision Agent InfoNCE pretraining"
+}

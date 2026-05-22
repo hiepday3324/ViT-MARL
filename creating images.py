@@ -31,7 +31,9 @@ asks = job.init_orderside(cfg.nOrders)
 bids = job.init_orderside(cfg.nOrders)
 trades = (jnp.ones((cfg.nTrades, 8)) * -1).astype(jnp.int32)
 
-asks, bids, trades = job.scan_through_entire_array(
+jitted_scan_through_entire_array = jax.jit(job.scan_through_entire_array, static_argnums=(0,))
+
+asks, bids, trades = jitted_scan_through_entire_array(
     cfg, key, init_orders, (asks, bids, trades)
 )
 
@@ -39,7 +41,7 @@ asks, bids, trades = job.scan_through_entire_array(
 start_idx = starts[0]
 batch_messages = msgs[start_idx:start_idx+100]  # First 100 messages
 
-asks, bids, trades = job.scan_through_entire_array(
+asks, bids, trades = jitted_scan_through_entire_array(
     cfg, key, batch_messages, (asks, bids, trades)
 )
 
@@ -137,9 +139,14 @@ for i in range(n_windows):
     bids_i = job.init_orderside(cfg.nOrders)
     trades_i = (jnp.ones((cfg.nTrades, 8)) * -1).astype(jnp.int32)
 
-    asks_i, bids_i, trades_i = job.scan_through_entire_array(
+    asks_i, bids_i, trades_i = jitted_scan_through_entire_array(
         cfg, subkey, init_orders_i, (asks_i, bids_i, trades_i)
     )
+
+    # ÉP TRẢ VỀ MẢNG NÀY ĐỂ JAX GIẢI PHÓNG HÀNG ĐỢI XLA (Mấu chốt)
+    asks_i = asks_i.block_until_ready()
+    bids_i = bids_i.block_until_ready()
+    trades_i = trades_i.block_until_ready()
 
     # Optionally process messages in this window
     if process_window_msgs:
@@ -161,7 +168,7 @@ for i in range(n_windows):
             else:
                 window_msgs = raw_slice
                 
-            asks_i, bids_i, trades_i = job.scan_through_entire_array(
+            asks_i, bids_i, trades_i = jitted_scan_through_entire_array(
                 cfg, subkey, window_msgs, (asks_i, bids_i, trades_i)
             )
 
