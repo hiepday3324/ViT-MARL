@@ -167,7 +167,7 @@ class Execution_EnvironmentConfig():
 
 @dataclass(frozen=True)
 class World_EnvironmentConfig(JAXLOB_Configuration):
-    n_data_msg_per_step: int = 1
+    n_data_msg_per_step: int = 100
     window_selector = -1 # -1 means random window
     ep_type :str = "fixed_steps" # fixed_steps, fixed_time
     episode_time: int = 50 # counted by seconds, 1800s=0.5h or steps

@@ -10,6 +10,7 @@ project_root = os.path.abspath(os.path.join(current_dir, ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 from gymnax_exchange.networks.gate_fusion import EMASmoothing, StableGatedCrossAttention
+from gymnax_exchange.networks.reliability_head import LevelWiseReliabilityHead
 from gymnax_exchange.networks.vision_agent import VisionAgent, supervised_contrastive_loss
 
 
@@ -40,6 +41,43 @@ class VisionPipelineShapeTest(unittest.TestCase):
         fusion_params = fusion.init(rng, smoothed, tokens)
         fused = fusion.apply(fusion_params, smoothed, tokens)
         self.assertEqual(fused.shape, (time_steps, batch_size, embed_dim // 2))
+
+        reliability = LevelWiseReliabilityHead(hidden_dim=64)
+        h_prev = jnp.ones((batch_size, embed_dim), dtype=jnp.float32)
+        tick_shift = jnp.ones((time_steps, batch_size, 1), dtype=jnp.float32)
+        reliability_params = reliability.init(
+            rng,
+            z_tokens=tokens,
+            obs_exec=exec_obs,
+            h_prev=h_prev,
+            tick_shift=tick_shift,
+        )
+        reliability_scores, filtered_tokens = reliability.apply(
+            reliability_params,
+            z_tokens=tokens,
+            obs_exec=exec_obs,
+            h_prev=h_prev,
+            tick_shift=tick_shift,
+        )
+        self.assertEqual(reliability_scores.shape, (time_steps, batch_size, 10, 1))
+        self.assertEqual(filtered_tokens.shape, tokens.shape)
+        self.assertTrue(bool(jnp.all(reliability_scores >= 0.0)))
+        self.assertTrue(bool(jnp.all(reliability_scores <= 1.0)))
+
+        filtered_fused = fusion.apply(fusion_params, smoothed, filtered_tokens)
+        self.assertEqual(filtered_fused.shape, (time_steps, batch_size, embed_dim // 2))
+
+        single_scores, single_filtered = reliability.apply(
+            reliability_params,
+            z_tokens=tokens[0],
+            obs_exec=exec_obs[0],
+            h_prev=h_prev,
+            tick_shift=tick_shift[0],
+        )
+        self.assertEqual(single_scores.shape, (batch_size, 10, 1))
+        self.assertEqual(single_filtered.shape, tokens[0].shape)
+        single_fused = fusion.apply(fusion_params, smoothed[0], single_filtered)
+        self.assertEqual(single_fused.shape, (batch_size, embed_dim // 2))
 
         labels = jnp.zeros((time_steps, batch_size), dtype=jnp.int32)
         loss = supervised_contrastive_loss(pooled.reshape(-1, embed_dim), labels.reshape(-1))

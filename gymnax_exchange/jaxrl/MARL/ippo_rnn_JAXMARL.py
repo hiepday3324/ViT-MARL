@@ -47,6 +47,7 @@ from gymnax_exchange.jaxen.marl_env import MARLEnv
 from gymnax.environments import spaces
 from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig,Execution_EnvironmentConfig, World_EnvironmentConfig,MarketMaking_EnvironmentConfig
 from gymnax_exchange.networks.gate_fusion import EMASmoothing, StableGatedCrossAttention
+from gymnax_exchange.networks.reliability_head import LevelWiseReliabilityHead
 from gymnax_exchange.networks.vision_agent import VisionAgent, supervised_contrastive_loss
 import wandb
 import functools
@@ -81,6 +82,44 @@ class ScannedRNN(nn.Module):
         cell = nn.GRUCell(features=hidden_size)
         return cell.initialize_carry(jax.random.PRNGKey(0), (batch_size, hidden_size))
 
+
+class ReliabilityFusionRNN(nn.Module):
+    config: Dict
+
+    @functools.partial(
+        nn.scan,
+        variable_broadcast="params",
+        in_axes=0,
+        out_axes=0,
+        split_rngs={"params": False},
+    )
+    @nn.compact
+    def __call__(self, carry, x):
+        obs_exec_t, obs_exec_smoothed_t, z_tokens_t, done_t, tick_shift_t = x
+        rnn_state = jnp.where(done_t[:, jnp.newaxis], jnp.zeros_like(carry), carry)
+
+        reliability = LevelWiseReliabilityHead(
+            hidden_dim=self.config.get("reliability_hidden_dim", self.config["FC_DIM_SIZE"])
+        )
+        _, filtered_tokens_t = reliability(
+            z_tokens=z_tokens_t,
+            obs_exec=obs_exec_t,
+            h_prev=rnn_state,
+            tick_shift=tick_shift_t,
+        )
+
+        fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
+        fused_t = fusion(obs_exec_smoothed_t, filtered_tokens_t)
+        embedding_t = nn.Dense(
+            self.config["FC_DIM_SIZE"],
+            kernel_init=orthogonal(jnp.sqrt(2)),
+            bias_init=constant(0.0),
+        )(fused_t)
+        embedding_t = nn.relu(embedding_t)
+
+        new_rnn_state, y_t = nn.GRUCell(features=self.config["FC_DIM_SIZE"])(rnn_state, embedding_t)
+        return new_rnn_state, y_t
+
 # FIXME: APPLY VISION 
 class ActorCriticRNN(nn.Module):
     action_space: spaces.Space
@@ -99,22 +138,41 @@ class ActorCriticRNN(nn.Module):
             z_vision = jnp.mean(z_tokens, axis=-2)
 
             ema_module = EMASmoothing(alpha = 0.5)
-            obs_exec = ema_module(obs_exec)
+            obs_exec_smoothed = ema_module(obs_exec)
 
-            fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
-            fused_obs = fusion(obs_exec, z_tokens)
+            use_reliability_head = self.config.get("use_reliability_head", False)
+            if use_reliability_head:
+                use_tick_shift = self.config.get("use_tick_shift", False)
+                tick_shift = obs.get("tick_shift", None) if use_tick_shift else None
+                if tick_shift is None:
+                    tick_shift = jnp.zeros((*obs_exec.shape[:2], 1), dtype=obs_exec.dtype)
+
+                hidden, embedding = ReliabilityFusionRNN(config=self.config)(
+                    hidden,
+                    (obs_exec, obs_exec_smoothed, z_tokens, dones, tick_shift),
+                )
+            else:
+                fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
+                fused_obs = fusion(obs_exec_smoothed, z_tokens)
+                embedding = nn.Dense(
+                    self.config["FC_DIM_SIZE"], kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0)
+                )(fused_obs)
+                embedding = nn.relu(embedding)
+
+                rnn_in = (embedding, dones)
+
+                hidden, embedding = ScannedRNN()(hidden, rnn_in)
         else:
             fused_obs = obs
             z_vision = jnp.zeros((1,))
+            embedding = nn.Dense(
+                self.config["FC_DIM_SIZE"], kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0)
+            )(fused_obs)
+            embedding = nn.relu(embedding)
 
-        embedding = nn.Dense(
-            self.config["FC_DIM_SIZE"], kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0)
-        )(fused_obs)
-        embedding = nn.relu(embedding)
+            rnn_in = (embedding, dones)
 
-        rnn_in = (embedding, dones)
-
-        hidden, embedding = ScannedRNN()(hidden, rnn_in)
+            hidden, embedding = ScannedRNN()(hidden, rnn_in)
         actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
             embedding
         )
@@ -302,13 +360,15 @@ def make_train(config):
                 obs_shape = env.observation_spaces[i].spaces['exec_obs'].shape[0]
                 init_obs = {
                     'exec_obs': jnp.zeros((1, config["NUM_ENVS"], obs_shape)), 
-                    'vision_obs': jnp.zeros((1, config["NUM_ENVS"], 10, 3, 2)) # Shape của LOB
+                    'vision_obs': jnp.zeros((1, config["NUM_ENVS"], 10, 3, 2)), # Shape của LOB
+                    'tick_shift': jnp.zeros((1, config["NUM_ENVS"], 1)),
                 }
             elif isinstance(env.observation_spaces[i], dict):
                 obs_shape = env.observation_spaces[i]['exec_obs'].shape[0]
                 init_obs = {
                     'exec_obs': jnp.zeros((1, config["NUM_ENVS"], obs_shape)), 
-                    'vision_obs': jnp.zeros((1, config["NUM_ENVS"], 10, 3, 2)) # Shape của LOB
+                    'vision_obs': jnp.zeros((1, config["NUM_ENVS"], 10, 3, 2)), # Shape của LOB
+                    'tick_shift': jnp.zeros((1, config["NUM_ENVS"], 1)),
                 }
             else:
                 init_obs = jnp.zeros((1, config["NUM_ENVS"], env.observation_spaces[i].shape[0]))

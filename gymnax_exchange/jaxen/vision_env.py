@@ -1454,7 +1454,7 @@ class ExecutionAgent():
         tick = self.world_config.tick_size
 
 
-        jax.debug.print("LOB: Ask Prices: {}, Bid Prices: {}/ State: Ask Prices: {}, Bid Prices: {}", ask_prices[0], bid_prices[0],world_state.best_asks[-1][0], world_state.best_bids[-1][0])
+        # jax.debug.print("LOB: Ask Prices: {}, Bid Prices: {}/ State: Ask Prices: {}, Bid Prices: {}", ask_prices[0], bid_prices[0],world_state.best_asks[-1][0], world_state.best_bids[-1][0])
 
 
         def get_buy_prices(ask_prices, bid_prices):
@@ -1522,7 +1522,7 @@ class ExecutionAgent():
         scale = jnp.where(total_planned > quant_left, quant_left / (total_planned + 1e-6), 1.0)
         target_quants = jnp.floor(target_quants * scale).astype(jnp.int32)
 
-        jax.debug.print("Target Quants: {}", target_quants)
+        # jax.debug.print("Target Quants: {}", target_quants)
         
         # 4. Đóng gói Action Messages cho JAX-LOB
         n_msgs = self.cfg.num_action_messages_by_agent
@@ -1657,8 +1657,17 @@ class ExecutionAgent():
         
         vision_obs = self._get_obs_vision(world_state=world_state,
                                         normalize=normalize)
+        tick_shift = self._compute_tick_shift(world_state.mid_price, old_mid_price)
         return {'exec_obs': exec_obs,
-                'vision_obs': vision_obs}
+                'vision_obs': vision_obs,
+                'tick_shift': tick_shift}
+
+    def _compute_tick_shift(self, anchor_price: jax.Array, previous_anchor_price: jax.Array) -> jax.Array:
+        """Return anchor frame shift in ticks between the current and previous obs."""
+        return jnp.asarray(
+            (anchor_price - previous_anchor_price) / self.world_config.tick_size,
+            dtype=jnp.float32,
+        ).reshape(1)
 
 
 
@@ -2236,8 +2245,7 @@ class ExecutionAgent():
         alpha = self.cfg.reward_lambda
         reward = r_comp + alpha * r_mimic_scaled
         
-        jax.debug.print("DEBUG REWARD: Step {}, Executed Vol: {}, v_base: {}", 
-                world_state.step_counter, agentQuant, v_base)
+        # jax.debug.print("DEBUG REWARD: Step {}, Executed Vol: {}, v_base: {}", world_state.step_counter, agentQuant, v_base)
         # 6. CẬP NHẬT METRICS & LOGGING
         # Drift: Sự trôi giá thị trường so với giá Arrival
         drift = direction_switch * agentQuant * (p_benchmark - agent_state.init_price // self.world_config.tick_size)
@@ -2914,10 +2922,17 @@ class ExecutionAgent():
             shape=(10, 3, 2),  # Levels, Features, Channels
             dtype=jnp.float32,
         )
+        tick_shift_shape = spaces.Box(
+            low=-1000000,
+            high=1000000,
+            shape=(1,),
+            dtype=jnp.float32,
+        )
 
         return spaces.Dict({
             "exec_obs": exec_space,
             "vision_obs": vision_shape,
+            "tick_shift": tick_shift_shape,
         })
 
     def state_space(self, params: ExecEnvParams) -> spaces.Dict:
