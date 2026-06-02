@@ -101,7 +101,7 @@ class ReliabilityFusionRNN(nn.Module):
         reliability = LevelWiseReliabilityHead(
             hidden_dim=self.config.get("reliability_hidden_dim", self.config["FC_DIM_SIZE"])
         )
-        _, filtered_tokens_t = reliability(
+        reliability_scores_t, filtered_tokens_t = reliability(
             z_tokens=z_tokens_t,
             obs_exec=obs_exec_t,
             h_prev=rnn_state,
@@ -118,7 +118,7 @@ class ReliabilityFusionRNN(nn.Module):
         embedding_t = nn.relu(embedding_t)
 
         new_rnn_state, y_t = nn.GRUCell(features=self.config["FC_DIM_SIZE"])(rnn_state, embedding_t)
-        return new_rnn_state, y_t
+        return new_rnn_state, (y_t, reliability_scores_t)
 
 # FIXME: APPLY VISION 
 class ActorCriticRNN(nn.Module):
@@ -147,10 +147,11 @@ class ActorCriticRNN(nn.Module):
                 if tick_shift is None:
                     tick_shift = jnp.zeros((*obs_exec.shape[:2], 1), dtype=obs_exec.dtype)
 
-                hidden, embedding = ReliabilityFusionRNN(config=self.config)(
+                hidden, (embedding, reliability_scores) = ReliabilityFusionRNN(config=self.config)(
                     hidden,
                     (obs_exec, obs_exec_smoothed, z_tokens, dones, tick_shift),
                 )
+                aux_info = {"reliability_scores": reliability_scores}
             else:
                 fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
                 fused_obs = fusion(obs_exec_smoothed, z_tokens)
@@ -162,6 +163,9 @@ class ActorCriticRNN(nn.Module):
                 rnn_in = (embedding, dones)
 
                 hidden, embedding = ScannedRNN()(hidden, rnn_in)
+                aux_info = {
+                    "reliability_scores": jnp.zeros((*z_tokens.shape[:-1], 1), dtype=z_tokens.dtype)
+                }
         else:
             fused_obs = obs
             z_vision = jnp.zeros((1,))
@@ -173,6 +177,9 @@ class ActorCriticRNN(nn.Module):
             rnn_in = (embedding, dones)
 
             hidden, embedding = ScannedRNN()(hidden, rnn_in)
+            aux_info = {
+                "reliability_scores": jnp.zeros((*embedding.shape[:-1], 1, 1), dtype=embedding.dtype)
+            }
         actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
             embedding
         )
@@ -216,7 +223,7 @@ class ActorCriticRNN(nn.Module):
             critic
         )
 
-        return hidden, pi, jnp.squeeze(critic, axis=-1), z_vision
+        return hidden, pi, jnp.squeeze(critic, axis=-1), z_vision, aux_info
 
 # FIXME: APPLY VISION
 class Transition(NamedTuple):
@@ -251,6 +258,88 @@ def unbatchify(x, num_envs, num_agents):
         return y.reshape((num_envs, num_agents, *y.shape[1:]))
 
     return jax.tree_util.tree_map(_unbatchify, x)
+
+
+def masked_bce_loss(reliability_scores, labels, mask, eps=1e-8):
+    if reliability_scores.ndim == labels.ndim + 1:
+        reliability_scores = jnp.squeeze(reliability_scores, axis=-1)
+
+    r = jnp.clip(reliability_scores, eps, 1.0 - eps)
+    y = labels.astype(jnp.float32)
+    m = mask.astype(jnp.float32)
+
+    bce = -(y * jnp.log(r) + (1.0 - y) * jnp.log(1.0 - r))
+    return jnp.sum(bce * m) / jnp.maximum(jnp.sum(m), eps)
+
+
+def build_liquidity_survival_targets(
+    vision_obs,
+    mid_prices,
+    *,
+    tick_size,
+    survival_delta_steps,
+    survival_min_volume,
+    survival_ratio,
+    num_steps,
+):
+    """Build level-wise survival labels from current and future LOB vision frames."""
+    vision_obs = jnp.asarray(vision_obs, dtype=jnp.float32)
+    mid_prices = jnp.asarray(mid_prices, dtype=jnp.float32)
+
+    if mid_prices.ndim == 1:
+        mid_prices = mid_prices[:, None]
+    if mid_prices.shape[1] != vision_obs.shape[1]:
+        if vision_obs.shape[1] % mid_prices.shape[1] != 0:
+            raise ValueError(
+                "Cannot broadcast world mid_prices to actor vision observations: "
+                f"mid_prices batch={mid_prices.shape[1]}, vision batch={vision_obs.shape[1]}."
+            )
+        repeat_factor = vision_obs.shape[1] // mid_prices.shape[1]
+        mid_prices = jnp.repeat(mid_prices, repeat_factor, axis=1)
+
+    current_obs = vision_obs[:num_steps]
+    future_obs = vision_obs[survival_delta_steps:survival_delta_steps + num_steps]
+    current_mid = mid_prices[:num_steps, :, None]
+    future_mid = mid_prices[survival_delta_steps:survival_delta_steps + num_steps, :, None]
+
+    ask_gap = current_obs[..., 0, 0]
+    bid_gap = current_obs[..., 0, 1]
+    ask_volume = jnp.expm1(current_obs[..., 1, 0])
+    bid_volume = jnp.expm1(current_obs[..., 1, 1])
+
+    future_ask_gap = future_obs[..., 0, 0]
+    future_bid_gap = future_obs[..., 0, 1]
+    future_ask_volume = jnp.expm1(future_obs[..., 1, 0])
+    future_bid_volume = jnp.expm1(future_obs[..., 1, 1])
+
+    tick_size = jnp.asarray(tick_size, dtype=jnp.float32)
+    ask_key = jnp.rint((current_mid + ask_gap * tick_size) / tick_size)
+    bid_key = jnp.rint((current_mid - bid_gap * tick_size) / tick_size)
+    future_ask_key = jnp.rint((future_mid + future_ask_gap * tick_size) / tick_size)
+    future_bid_key = jnp.rint((future_mid - future_bid_gap * tick_size) / tick_size)
+
+    ask_mask = ask_volume >= survival_min_volume
+    bid_mask = bid_volume >= survival_min_volume
+    ask_matches = future_ask_key[..., None, :] == ask_key[..., :, None]
+    bid_matches = future_bid_key[..., None, :] == bid_key[..., :, None]
+    matched_future_ask_volume = jnp.max(
+        jnp.where(ask_matches, future_ask_volume[..., None, :], 0.0),
+        axis=-1,
+    )
+    matched_future_bid_volume = jnp.max(
+        jnp.where(bid_matches, future_bid_volume[..., None, :], 0.0),
+        axis=-1,
+    )
+    ask_label = matched_future_ask_volume >= survival_ratio * ask_volume
+    bid_label = matched_future_bid_volume >= survival_ratio * bid_volume
+
+    level_mask = ask_mask | bid_mask
+    level_label = jnp.maximum(
+        ask_label.astype(jnp.float32) * ask_mask.astype(jnp.float32),
+        bid_label.astype(jnp.float32) * bid_mask.astype(jnp.float32),
+    )
+
+    return level_label.astype(jnp.float32), level_mask.astype(jnp.float32)
 
 
 def make_train(config):
@@ -451,7 +540,7 @@ def make_train(config):
                         last_done[i][jnp.newaxis, :],
                         # avail_actions,
                     )
-                    h_states[i], pi, value, _ = train_state.apply_fn(train_state.params, h_states[i], ac_in)
+                    h_states[i], pi, value, _, _ = train_state.apply_fn(train_state.params, h_states[i], ac_in)
                     values.append(value)
                     action = pi.sample(seed=_rng)
                     log_probs.append(pi.log_prob(action))
@@ -504,6 +593,12 @@ def make_train(config):
             initial_hstates = runner_state[-2]
 
             window_size = 10
+            survival_delta_steps = int(config.get("survival_delta_steps", window_size))
+            if config.get("use_survival_loss", False) and survival_delta_steps > window_size:
+                raise ValueError(
+                    "survival_delta_steps must be <= rollout window_size. "
+                    f"Got survival_delta_steps={survival_delta_steps}, window_size={window_size}."
+                )
             total_rollout_steps = config["NUM_STEPS"] + window_size
 
             def scan_body(carry, step_idx):
@@ -532,6 +627,19 @@ def make_train(config):
             # [PHASE 2]: TRÍCH XUẤT NHÃN VOLATILITY TỪ 10 BƯỚC TƯƠNG LAI
             # ==========================================================
             volatility_labels = []
+            survival_labels = []
+            survival_masks = []
+            if not hasattr(env.multi_agent_config.world_config, "tick_size"):
+                raise ValueError(
+                    "Cannot build liquidity survival labels: "
+                    "env.multi_agent_config.world_config.tick_size is required."
+                )
+            tick_size = env.multi_agent_config.world_config.tick_size
+            if tick_size is None:
+                raise ValueError(
+                    "Cannot build liquidity survival labels: "
+                    "env.multi_agent_config.world_config.tick_size is None."
+                )
             for i in range(len(stashed_runner_state[0])): # Lặp qua train_states
                 mid_prices = traj_batch_padded[i].info["world"]["end_mid_price"]
                 
@@ -548,6 +656,23 @@ def make_train(config):
                 labels = jnp.where(future_vol > config.get("VOL_HIGH", 0.02), 2, 
                          jnp.where(future_vol > config.get("VOL_LOW", 0.005), 1, 0))
                 volatility_labels.append(labels)
+
+                if isinstance(traj_batch_padded[i].obs, dict) and "vision_obs" in traj_batch_padded[i].obs:
+                    surv_label, surv_mask = build_liquidity_survival_targets(
+                        traj_batch_padded[i].obs["vision_obs"],
+                        mid_prices,
+                        tick_size=tick_size,
+                        survival_delta_steps=survival_delta_steps,
+                        survival_min_volume=config.get("survival_min_volume", 1.0),
+                        survival_ratio=config.get("survival_ratio", 0.5),
+                        num_steps=config["NUM_STEPS"],
+                    )
+                else:
+                    reward_shape = traj_batch_padded[i].reward.shape
+                    surv_label = jnp.zeros((config["NUM_STEPS"], reward_shape[1], 10), dtype=jnp.float32)
+                    surv_mask = jnp.zeros_like(surv_label)
+                survival_labels.append(surv_label)
+                survival_masks.append(surv_mask)
 
             # ==========================================================
             # [PHASE 3]: CƯA ĐUÔI DATA VÀ KHÔI PHỤC DÒNG THỜI GIAN
@@ -606,7 +731,7 @@ def make_train(config):
                     last_dones[i][jnp.newaxis, :],
                     # avail_actions,
                 )
-                _, _, last_val, _ = train_state.apply_fn(train_state.params, hstates_new[i], ac_in)
+                _, _, last_val, _, _ = train_state.apply_fn(train_state.params, hstates_new[i], ac_in)
                 last_val = last_val.squeeze()
 
                 advantages_i, targets_i = _calculate_gae(config["GAMMA"][i],config["GAE_LAMBDA"][i],traj_batch[i], last_val)
@@ -619,11 +744,11 @@ def make_train(config):
             for i, train_state in enumerate(train_states):
                 def _update_epoch(update_state, unused):
                     def _update_minbatch(train_state, batch_info):
-                        init_hstate, traj_batch, advantages, targets, vol_labels = batch_info
+                        init_hstate, traj_batch, advantages, targets, vol_labels, surv_labels, surv_mask = batch_info
 
-                        def _loss_fn(params, init_hstate, traj_batch, gae, targets, vol_labels):
+                        def _loss_fn(params, init_hstate, traj_batch, gae, targets, vol_labels, surv_labels, surv_mask):
                             # RERUN NETWORK
-                            _, pi, value, z_vision = train_state.apply_fn(
+                            _, pi, value, z_vision, aux_info = train_state.apply_fn(
                                 params,
                                 init_hstate.squeeze(),
                                 (traj_batch.obs, traj_batch.done),
@@ -678,16 +803,52 @@ def make_train(config):
                                 alpha = jnp.array(0.0)
 
                             # LOSS CUỐI CÙNG (Cộng PPO và SupCon có hệ số)
-                            total_loss = ppo_loss + alpha * supcon_loss
+                            if (
+                                config.get("use_survival_loss", False)
+                                and config.get("use_reliability_head", False)
+                                and isinstance(traj_batch.obs, dict)
+                            ):
+                                reliability_scores = aux_info["reliability_scores"]
+                                survival_loss = masked_bce_loss(reliability_scores, surv_labels, surv_mask)
+                                lambda_surv = config.get("lambda_surv", 0.0)
+                                survival_mask_ratio = jnp.mean(surv_mask.astype(jnp.float32))
+                                reliability_mean = jnp.mean(reliability_scores)
+                            else:
+                                survival_loss = jnp.array(0.0)
+                                lambda_surv = jnp.array(0.0)
+                                survival_mask_ratio = jnp.array(0.0)
+                                reliability_mean = jnp.array(0.0)
+
+                            weighted_survival_loss = lambda_surv * survival_loss
+                            total_loss = ppo_loss + alpha * supcon_loss + weighted_survival_loss
 
                             # debug
                             approx_kl = ((ratio - 1) - logratio).mean()
                             clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
 
-                            return total_loss, (value_loss, loss_actor, entropy, ratio, approx_kl, clip_frac, supcon_loss)
+                            return total_loss, (
+                                value_loss,
+                                loss_actor,
+                                entropy,
+                                ratio,
+                                approx_kl,
+                                clip_frac,
+                                supcon_loss,
+                                survival_loss,
+                                weighted_survival_loss,
+                                survival_mask_ratio,
+                                reliability_mean,
+                            )
                         grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                         total_loss, grads = grad_fn(
-                            train_state.params, init_hstate, traj_batch, advantages, targets, vol_labels
+                            train_state.params,
+                            init_hstate,
+                            traj_batch,
+                            advantages,
+                            targets,
+                            vol_labels,
+                            surv_labels,
+                            surv_mask,
                         )
                         train_state = train_state.apply_gradients(grads=grads)
                         return train_state, total_loss
@@ -698,6 +859,8 @@ def make_train(config):
                         advantages,
                         targets,
                         vol_labels,
+                        surv_labels,
+                        surv_mask,
                         rng,
                     ) = update_state
                     rng, _rng = jax.random.split(rng)
@@ -712,6 +875,8 @@ def make_train(config):
                         advantages.squeeze(),
                         targets.squeeze(),
                         vol_labels,
+                        surv_labels,
+                        surv_mask,
                     )
                     permutation = jax.random.permutation(_rng, config["NUM_ACTORS_PERTYPE"][i])
 
@@ -742,6 +907,8 @@ def make_train(config):
                         advantages,
                         targets,
                         vol_labels,
+                        surv_labels,
+                        surv_mask,
                         rng,
                     )
                     return update_state, total_loss
@@ -753,6 +920,8 @@ def make_train(config):
                     advantages[i],
                     targets[i],
                     volatility_labels[i],
+                    survival_labels[i],
+                    survival_masks[i],
                     rng,
                 )
                 update_state, loss_info = jax.lax.scan(
@@ -782,6 +951,10 @@ def make_train(config):
                     "ratio_0": ratio_0,
                     "approx_kl": loss_info[1][4],
                     "clip_frac": loss_info[1][5],
+                    "survival_loss": loss_info[1][7],
+                    "weighted_survival_loss": loss_info[1][8],
+                    "survival_mask_ratio": loss_info[1][9],
+                    "reliability_mean": loss_info[1][10],
                     "weighted_entropy_loss": loss_info[1][2] * config["ENT_COEF"][i],
                     "weighted_value_loss": loss_info[1][0] * config["VF_COEF"][i],
                 })
@@ -816,7 +989,7 @@ def make_train(config):
                             last_done[i][jnp.newaxis, :],
                             # avail_actions,
                         )
-                        h_states[i], pi, value, _ = train_state.apply_fn(train_state.params, h_states[i], ac_in)
+                        h_states[i], pi, value, _, _ = train_state.apply_fn(train_state.params, h_states[i], ac_in)
                         values.append(value)
                         action = pi.sample(seed=_rng)
                         log_probs.append(pi.log_prob(action))
