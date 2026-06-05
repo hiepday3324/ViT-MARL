@@ -38,8 +38,8 @@
 "ANNEAL_LR": [True,True]
 
 # WandB Params
-"ENTITY": "oxford-lob"
-"PROJECT": "PMAP_SPEED" #"DEBUG"
+"ENTITY": "leduchiep030304-fpt-university"
+"PROJECT": "test2"
 "WANDB_MODE" : "online"
 
 # High-Level Params

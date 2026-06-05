@@ -4,6 +4,19 @@ Based on PureJaxRL Implementation of PPO
 
 import os
 import sys
+# =====================================================================
+# THÊM KHỐI NÀY VÀO ĐẦU FILE (DƯỚI IMPORT OS, SYS)
+# =====================================================================
+if "JAX_COORDINATOR" in os.environ:
+    import jax
+    jax.distributed.initialize(
+        coordinator_address=os.environ["JAX_COORDINATOR"],
+        num_processes=int(os.environ["JAX_NUM_PROCESSES"]),
+        process_id=int(os.environ["JAX_PROCESS_ID"]),
+        initialization_timeout=600,
+    )
+    print(f"--- [Host {jax.process_index()}] Khởi tạo Cluster thành công! Total devices: {jax.device_count()} ---", flush=True)
+# =====================================================================
 import copy
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -518,7 +531,8 @@ def make_train(config):
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
+        host_env_rng = jax.random.fold_in(_rng, jax.process_index())
+        reset_rng = jax.random.split(host_env_rng, config["NUM_ENVS"])
         env_params=env.default_params
         if config["CALC_EVAL"]:
             eval_env_params=eval_env.default_params # type: ignore
@@ -1214,7 +1228,8 @@ def make_train(config):
             return (runner_state, update_steps), metrics
 
         rng, _rng = jax.random.split(rng)
-        device_rng = jax.random.split(_rng, num_devices)
+        host_device_rng = jax.random.fold_in(_rng, jax.process_index())
+        device_rng = jax.random.split(host_device_rng, num_devices)
         runner_state = (
             train_states,
             env_state,
@@ -1457,16 +1472,34 @@ def seperate_main(config):
     final_config=OmegaConf.merge(config,env_config)
     config = OmegaConf.to_container(final_config)
 
+    # =====================================================================
+    # BỐC CONFIG TỪ HÀM SWEEP CHO VÀO ĐÂY ĐỂ VÁ LỖI KEYERROR
+    # =====================================================================
+    config["AGENT_CONFIGS"] = {
+        "MarketMaking": {
+            "inv_penalty": "quadratic", 
+            "skew_multiplier": 10,
+            "action_space": "fixed_quants",
+            "reward_space": "spooner",
+            "reference_price_portfolio_value": "best_bid_ask"
+        },
+        "Execution": {
+            "reward_lambda": 0.5,
+            "observation_space": "execution_policy",
+            "action_space": "policy_blending",
+            "task_size": 600,
+            "doom_price_penalty": 0.1
+        }
+    }
+    # =====================================================================
+
     # jax.profiler.start_trace("/tmp/profile-data")
 
-    
     rng = jax.random.PRNGKey(0)
 
     train_fun = make_train(config)
     # print("+++++++++++ Training turned off whilst debugging wandb ++++++++++++")
     out = train_fun(rng)
-
-
 
     # out=jax.block_until_ready(out)  # Ensure the computation is complete before proceeding
     # (dummy * dummy).block_until_ready()
@@ -1474,4 +1507,4 @@ def seperate_main(config):
 
 
 if __name__ == "__main__":
-    main()
+    seperate_main()
