@@ -5,29 +5,72 @@ from typing import Dict
 
 
 class VisionAgent(nn.Module):
-    """Encode orderbook matrices into embeddings for contrastive learning."""
+    """Encode orderbook matrices into level-centered contextual tokens."""
 
     embed_dim: int
     hidden_size: int = 128
+    context_alpha_init: float = 0.1
+    learnable_alpha: bool = True
 
     @nn.compact
     def __call__(self, x, *, train: bool = False, return_tokens: bool = False):
         """Encode LOB observations.
 
-        Inputs are shaped ``(..., levels, features, sides)``. The default output
-        is pooled over levels; ``return_tokens=True`` preserves level tokens for
-        cross-attention.
+        Inputs are shaped ``(..., levels, features, sides)``. The returned
+        tokens are level-centered contextual tokens: token ``k`` still maps to
+        LOB level ``k``, but includes local context from neighboring levels.
+        The default output is pooled over levels; ``return_tokens=True``
+        preserves per-level tokens for cross-attention and reliability heads.
         """
+        del train
         x = jnp.asarray(x, dtype=jnp.float32)
         if x.ndim == 2:
             x = x[None, ...]
         if x.ndim < 3:
             raise ValueError(f"VisionAgent expects at least 3 dims, got shape {x.shape}")
 
-        level_tokens = x.reshape(*x.shape[:-3], x.shape[-3], -1)
-        level_tokens = nn.Dense(self.hidden_size, name="token_fc")(level_tokens)
-        level_tokens = nn.relu(level_tokens)
-        level_tokens = nn.Dense(self.embed_dim, name="token_embed")(level_tokens)
+        raw_levels = x.reshape(*x.shape[:-3], x.shape[-3], -1)
+        self_tokens = nn.Dense(self.hidden_size, name="self_fc")(raw_levels)
+        self_tokens = nn.relu(self_tokens)
+        self_tokens = nn.Dense(self.embed_dim, name="self_embed")(self_tokens)
+
+        context = nn.Conv(
+            features=self.hidden_size,
+            kernel_size=(3, 2),
+            padding="SAME",
+            name="context_conv_1",
+        )(x)
+        context = nn.relu(context)
+        context = nn.LayerNorm(name="context_norm_1")(context)
+        context = nn.Conv(
+            features=self.hidden_size,
+            kernel_size=(3, 2),
+            padding="SAME",
+            name="context_conv_2",
+        )(context)
+        context = nn.relu(context)
+        context = nn.LayerNorm(name="context_norm_2")(context)
+        context = jnp.mean(context, axis=-2)
+        context_tokens = nn.Dense(self.hidden_size, name="context_fc")(context)
+        context_tokens = nn.relu(context_tokens)
+        context_tokens = nn.Dense(self.embed_dim, name="context_embed")(context_tokens)
+
+        alpha_init = min(max(float(self.context_alpha_init), 1e-4), 1.0 - 1e-4)
+        if self.learnable_alpha:
+            alpha_logit_init = jnp.log(alpha_init / (1.0 - alpha_init))
+            alpha_logit = self.param(
+                "context_alpha_logit",
+                lambda key, shape, dtype=jnp.float32: jnp.full(
+                    shape, alpha_logit_init, dtype=dtype
+                ),
+                (),
+            )
+            alpha = jax.nn.sigmoid(alpha_logit)
+        else:
+            alpha = jnp.asarray(alpha_init, dtype=self_tokens.dtype)
+
+        level_tokens = self_tokens + alpha * context_tokens
+        level_tokens = nn.LayerNorm(name="token_norm")(level_tokens)
 
         if return_tokens:
             return level_tokens

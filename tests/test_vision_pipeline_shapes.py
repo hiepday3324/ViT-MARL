@@ -31,6 +31,7 @@ class VisionPipelineShapeTest(unittest.TestCase):
 
         self.assertEqual(tokens.shape, (time_steps, batch_size, 10, embed_dim))
         self.assertEqual(pooled.shape, (time_steps, batch_size, embed_dim))
+        self.assertTrue(bool(jnp.allclose(pooled, jnp.mean(tokens, axis=-2), atol=1e-5)))
 
         ema = EMASmoothing(alpha=0.5)
         ema_params = ema.init(rng, exec_obs)
