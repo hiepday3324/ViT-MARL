@@ -1,2 +1,8 @@
 *.pyc
 /gymnax_exchange/__pycache__
+/wandb
+/outputs
+/data
+/checkpoints
+pre_reset_states/ResetState_window_resolution_50_eptype_fixed_steps_depth_10_stock_AMZN_windowidx_-1_nMsgPerStep_100_episode_time_50_TimePeriod_2012June_oneday.pkl
+saved_npz/lobster_AMZN_2012June_oneday_10_fixed_steps_50_50_100_34200_57600.npz
