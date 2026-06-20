@@ -1,8 +1,14 @@
 import gymnax_exchange.jaxob.jaxob_constants as cst
 import os
+from pathlib import Path
 from typing import OrderedDict, Tuple,  Literal,Union,List
 
 from dataclasses import dataclass,field
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_ROOT = os.environ.get("VIT_MARL_ROOT", str(_PROJECT_ROOT))
+_DEFAULT_DATA_PATH = os.environ.get("VIT_MARL_DATA_PATH", str(Path(_DEFAULT_ROOT) / "data"))
 
 
 
@@ -22,8 +28,8 @@ class JAXLOB_Configuration:
     start_resolution: int = 50  # Episodes from data start every n seconds.
     # alphatradePath: str = os.path.expanduser("~")
     # dataPath: str = os.path.expanduser("~")+"/data"
-    alphatradePath: str = "F:/JaxMARL-HFT-main"  #FIXME: đã sửa lại đường dẫn dữ liệu
-    dataPath: str = "F:/JaxMARL-HFT-main/data"  #FIXME: đã sửa lại đường dẫn dữ liệu
+    alphatradePath: str = _DEFAULT_ROOT
+    dataPath: str = _DEFAULT_DATA_PATH
     stock: str = "AMZN"
     timePeriod: str = "2012June_oneday" # Needs to be the appropriate directory name. "2017Jan_oneday", "2024"
 
@@ -114,7 +120,7 @@ class Execution_EnvironmentConfig():
     fixed_quant_value:int=10
     num_messages_by_agent:int=8 # will be set automatically in the post init function
     num_action_messages_by_agent:int=4 # will be set automatically in the post init function
-    reward_lambda:float= 0.0
+    reward_lambda:float= 0.5
     time_delay_obs_act:int=0
     debug_mode:bool=False
     normalize:bool=True
@@ -151,13 +157,17 @@ class Execution_EnvironmentConfig():
             object.__setattr__(self, 'n_actions', 1)
             object.__setattr__(self, 'num_messages_by_agent', 4)
             object.__setattr__(self, 'num_action_messages_by_agent', 2)
+        elif self.action_space == "policy_blending":
+            object.__setattr__(self, 'n_actions', 3)
+            object.__setattr__(self, 'num_messages_by_agent', 6)
+            object.__setattr__(self, 'num_action_messages_by_agent', 3)
 
 
 
 
 @dataclass(frozen=True)
 class World_EnvironmentConfig(JAXLOB_Configuration):
-    n_data_msg_per_step: int = 1
+    n_data_msg_per_step: int = 100
     window_selector = -1 # -1 means random window
     ep_type :str = "fixed_steps" # fixed_steps, fixed_time
     episode_time: int = 50 # counted by seconds, 1800s=0.5h or steps

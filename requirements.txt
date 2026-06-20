@@ -1,0 +1,35 @@
+# JAX
+jax[cuda12]
+optax
+flax
+chex
+dm-tree
+ml-dtypes
+
+# Core
+numpy
+pandas
+matplotlib
+
+# RL
+gymnax
+distrax
+
+# Config
+hydra-core
+PyYAML
+
+# Checkpoints
+orbax-checkpoint==0.11.18
+
+# Logging
+wandb
+tqdm
+
+# Utilities
+cloudpickle
+absl-py
+packaging
+typing-extensions
+setuptools
+wheel

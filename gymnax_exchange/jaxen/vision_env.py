@@ -130,6 +130,9 @@ from gymnax_exchange.jaxen.StatesandParams import MultiAgentState, WorldState
 #from gymnax_exchange.jaxen.from_JAXMARL import spaces
 import jax.tree_util as jtu
 
+ACTION_LOW = jnp.array([-1.0, 0.0, 0.0], dtype=jnp.float32)
+ACTION_HIGH = jnp.array([3.0, 1.0, 1.0], dtype=jnp.float32)
+
 
 class ExecutionAgent():
     def __init__(
@@ -201,6 +204,11 @@ class ExecutionAgent():
     def step_env(
         self, key: chex.PRNGKey, state: ExecEnvState, input_action: jax.Array, params: ExecEnvParams
     ) -> Tuple[chex.Array, ExecEnvState, float, bool, dict]:
+        raise NotImplementedError(
+            "ExecutionAgent.step_env is deprecated for the MARL path. "
+            "Use MARLEnv.step_env, which supplies world data and calls "
+            "ExecutionAgent.get_action(action, world_state, agent_state, agent_params)."
+        )
 
         data_messages = self._get_data_messages(
             params.message_data,
@@ -305,7 +313,14 @@ class ExecutionAgent():
         # TODO: consider adding quantity before (in priority) to each price / level
 
         # TODO: use the agent quant identification from the separate function _get_executed_by_level instead of _get_reward
-        reward, extras = self._get_reward(state, params, trades)
+        reward, extras = self._get_reward(world_state=state,      # Dùng state của agent làm world_state (vì nó chứa đủ thông tin time, steps)
+                                        agent_state=state,      # Dùng state hiện tại
+                                        agent_params=params, 
+                                        trades=trades, 
+                                        bestasks=bestasks, 
+                                        bestbids=bestbids, 
+                                        time=time
+                                    )
         quant_executed = state.quant_executed + extras["agentQuant"]
         # CAVE: uses seconds only (not ns)
         trade_duration_step = (jnp.abs(agent_trades[:, 1]) / state.task_to_execute * (agent_trades[:, -2] - state.init_time[0])).sum()
@@ -1429,7 +1444,7 @@ class ExecutionAgent():
             world_state.ask_raw_orders,
             world_state.bid_raw_orders,
             3,
-            self.cfg
+            self.world_config
         )
         
         # Kênh 0: Ask, Kênh 1: Bid
@@ -1437,6 +1452,10 @@ class ExecutionAgent():
         ask_prices = l2_state[:, 0, 0] # [Ask_L1, Ask_L2, Ask_L3]
         bid_prices = l2_state[:, 0, 1] # [Bid_L1, Bid_L2, Bid_L3]
         tick = self.world_config.tick_size
+
+
+        # jax.debug.print("LOB: Ask Prices: {}, Bid Prices: {}/ State: Ask Prices: {}, Bid Prices: {}", ask_prices[0], bid_prices[0],world_state.best_asks[-1][0], world_state.best_bids[-1][0])
+
 
         def get_buy_prices(ask_prices, bid_prices):
             # MUA: Chỉ quan tâm bên BID (Đặt lệnh chờ mua)
@@ -1485,11 +1504,13 @@ class ExecutionAgent():
         v_twap = agent_state.task_to_execute / total_steps
         
         # V_base mặc định đặt tại Level 1 
-        v_base = jnp.array([v_twap, 0.0, 0.0])
-        
         # Công thức Dual-PPO: V_actual = V_base + (V_twap * Action) 
         # action[0] là a1, action[1] là a2, action[2] là a3
-        target_quants_float = v_base + (v_twap * action)
+        target_quants_float = jnp.array([
+            v_twap * (1.0 + action[0]),
+            v_twap * action[1],
+            v_twap * action[2],
+        ])
         target_quants = jnp.floor(jnp.maximum(0, target_quants_float)).astype(jnp.int32)
 
         # 3. Kiểm soát tồn kho (Tránh ảo hàng)
@@ -1501,12 +1522,14 @@ class ExecutionAgent():
         scale = jnp.where(total_planned > quant_left, quant_left / (total_planned + 1e-6), 1.0)
         target_quants = jnp.floor(target_quants * scale).astype(jnp.int32)
 
+        # jax.debug.print("Target Quants: {}", target_quants)
+        
         # 4. Đóng gói Action Messages cho JAX-LOB
         n_msgs = self.cfg.num_action_messages_by_agent
         side_val = 1 - agent_state.is_sell_task * 2
         
-        final_quants = jnp.zeros((n_msgs,), dtype=jnp.int32).at[0:3].set(target_quants)
-        final_prices = jnp.zeros((n_msgs,), dtype=jnp.int32).at[0:3].set(prices)
+        final_quants = jnp.zeros((n_msgs,), dtype=jnp.int32).at[0:3].set(target_quants.reshape(-1))
+        final_prices = jnp.zeros((n_msgs,), dtype=jnp.int32).at[0:3].set(prices.reshape(-1))
 
         # Tạo các mảng thuộc tính message (Type=1 cho Limit Order)
         msg_types = jnp.ones((n_msgs,), dtype=jnp.int32)
@@ -1634,9 +1657,17 @@ class ExecutionAgent():
         
         vision_obs = self._get_obs_vision(world_state=world_state,
                                         normalize=normalize)
-        
+        tick_shift = self._compute_tick_shift(world_state.mid_price, old_mid_price)
         return {'exec_obs': exec_obs,
-                'vision_obs': vision_obs}
+                'vision_obs': vision_obs,
+                'tick_shift': tick_shift}
+
+    def _compute_tick_shift(self, anchor_price: jax.Array, previous_anchor_price: jax.Array) -> jax.Array:
+        """Return anchor frame shift in ticks between the current and previous obs."""
+        return jnp.asarray(
+            (anchor_price - previous_anchor_price) / self.world_config.tick_size,
+            dtype=jnp.float32,
+        ).reshape(1)
 
 
 
@@ -1814,6 +1845,240 @@ class ExecutionAgent():
 
         return (asks, bids, trades), (bestask, bestbid), id_counter, time, mkt_exec_quant, doom_quant
 
+    # def _get_reward(self, 
+    #                 world_state: WorldState, 
+    #                 agent_state: ExecEnvState, 
+    #                 agent_params: ExecEnvParams, 
+    #                 trades: chex.Array, 
+    #                 bestasks: chex.Array, 
+    #                 bestbids: chex.Array, 
+    #                 time: jax.Array) -> jnp.int32:
+
+    #     #########################################################################################
+    #     # Add artificial trade if episode is done
+    #     # Important: this artificial trade is not saved, its just used to calculate the reward
+    #     #########################################################################################
+
+    #     agent_trades_before_unwind = job.get_agent_trades(trades, agent_params.trader_id)
+    #     quant_executed_this_step = jnp.abs(agent_trades_before_unwind[:,1].sum()) # QUants can be negative, therefore take absolute value
+    #     quant_left = agent_state.task_to_execute - (agent_state.quant_executed + quant_executed_this_step)
+
+    #     #jax.debug.print(f"quant_left: {quant_left}")
+
+    #     # print("trader id: ", agent_params.trader_id)
+    #     # print("trades before unwind: ", agent_trades_before_unwind)
+    #     #jax.debug.print(f"quant_executed_this_step: {quant_executed_this_step}")
+    #     # print(f"agent_state.task_to_execute: {agent_state.task_to_execute}")
+    #     # print(f"quant_left: {quant_left}")
+
+    #     #-----check if ep over-----#
+    #     if self.world_config.ep_type == 'fixed_time':
+    #         remainingTime = self.world_config.episode_time - jnp.array((time - world_state.init_time)[0], dtype=jnp.int32)
+    #         ep_is_over = remainingTime <= self.world_config.last_step_seconds   # 5 seconds
+    #         #jax.debug.print("ep_is_over fixed time: {}", ep_is_over)
+    #         #jax.debug.print("remainingTime: {}", remainingTime)
+    #         #jax.debug.print("world_state.init_time: {}", world_state.init_time)
+    #         #jax.debug.print("time: {}", time)
+    #     else:
+    #         ep_is_over = world_state.max_steps_in_episode - world_state.step_counter - 1 <= 1
+    #         #jax.debug.print("ep_is_over: {}", ep_is_over)
+    #         #jax.debug.print("world_state.max_steps_in_episode: {}", world_state.max_steps_in_episode)
+    #         #jax.debug.print("world_state.step_counter: {}", world_state.step_counter)
+    #     averageMidprice = ((bestbids[:, 0] + bestasks[:, 0]) / 2).mean() // self.world_config.tick_size * self.world_config.tick_size
+    #     #jax.debug.print("mid_price:{}",mid_price)
+
+
+    #     #jax.debug.print(f"bestbid 0: {bestbids[-1,0]}")
+    #     #jax.debug.print(f"bestask 0: {bestasks[-1,0]}")
+    #     # print(bestasks[-10,0])
+
+    #     penalty = self.cfg.doom_price_penalty
+
+    #     doom_price = jax.lax.cond(
+    #         agent_state.is_sell_task,
+    #         lambda: (((bestbids[-1,0]) * (1-penalty))// self.world_config.tick_size * self.world_config.tick_size).astype(jnp.int32),
+    #         lambda: (((bestasks[-1,0]) * (1+penalty))// self.world_config.tick_size * self.world_config.tick_size).astype(jnp.int32),
+    #     )
+
+    #     #jax.debug.print("doom_price: {}", doom_price)
+
+    #     def place_midprice_trade(trades, price, quant, time):
+    #         '''Place a doom trade at a trade at mid price to close out our mm agent at the end of the episode.'''
+            
+    #         # print("price shape: {}", price.shape)
+    #         # print("quant shape: {}", quant.shape)
+    #         # print("time shape: {}", time.shape)
+    #         # print("trader id shape: {}", agent_params.trader_id.shape)
+    #         #jax.debug.print("quant_left: {}", jnp.abs(quant_left))
+            
+            
+    #         mid_trade = job.create_trade(
+    #             price, quant, self.world_config.artificial_order_id_end_episode,  self.world_config.placeholder_order_id, *time, self.world_config.artificial_trader_id_end_episode, agent_params.trader_id)
+    #         trades = job.add_trade(trades, mid_trade)
+    #         #jax.debug.print("called?")
+    #         return trades
+        
+    #     #Get side to place trade. +ve quant means we (aggresive) sold.
+    #     side_sign=(agent_state.is_sell_task*2-1) # 1 if sell, -1 if buy
+        
+    #     # Add artificial trade to trades object if episode is over and we still have remaining quantity
+    #     trades = jax.lax.cond(
+    #         ep_is_over & (jnp.abs(quant_left) > 0),  # Check if episode is over and we still have remaining quantity
+    #         place_midprice_trade,  # Place a midprice trade
+    #         lambda trades, b, c, d: trades,  # If not, return the existing trades
+    #         trades, doom_price, side_sign*jnp.abs(quant_left), time  # Inv +ve means incoming is sell so standing buy.
+    #     )
+    #     #Return traded amounts
+    #     doom_quant = ep_is_over * quant_left
+
+    #     #jax.debug.print("trades exec env: {}", trades)
+
+    #     #################################
+    #     # Get reward
+    #     #################################
+
+    #     # ========== get reward and revenue ==========
+    #     # Gather the 'trades' that are nonempty, make the rest 0
+    #     executed = jnp.where((trades[:, 0] >= 0)[:, jnp.newaxis], trades, 0)
+    #     # Mask to keep only the trades where the RL agent is involved, apply mask.
+    #     # mask2 = ((job.INITID < executed[:, 2]) & (executed[:, 2] < 0)) | ((job.INITID < executed[:, 3]) & (executed[:, 3] < 0))
+    #     mask2 = (agent_params.trader_id == executed[:, 6])  | (agent_params.trader_id == executed[:, 7]) #Mask to find trader ID
+    #     agentTrades = jnp.where(mask2[:, jnp.newaxis], executed, 0)
+    #     otherTrades = jnp.where(mask2[:, jnp.newaxis], 0, executed)
+    #     # jax.debug.print('agentTrades\n {}', agentTrades[:30])
+    #     agentQuant = jnp.abs(agentTrades[:,1]).sum() # new_execution quants
+
+
+    #     def check_final_quant(ep_is_over,quant_left,doom_quant,doom_price,trades,agentTrades,otherTrades):
+    #         if ep_is_over and quant_left!=0:
+    #             print("DOOM TRADE HAPPENED")
+    #             print(doom_quant,doom_price)
+    #             print("The trades post doom are.")
+    #             print(trades)
+    #             print("The agent trades post doom are.")
+    #             print(agentTrades)
+    #             print("The other trades post doom are.")
+    #             print(otherTrades)
+
+    #     # jax.debug.callback(check_final_quant,ep_is_over,quant_left,doom_quant,doom_price,trades,agentTrades,otherTrades)
+        
+    #     #jax.debug.print("agentTrades:{}",agentTrades)
+
+    #     # ---------- used for vwap, revenue ----------
+    #     # vwapFunc = lambda tr: jnp.nan_to_num(
+    #     #     (tr[:,0] // self.world_config.tick_size * tr[:,1]).sum() / (tr[:,1]).sum(),
+    #     #     state.init_price  # if no trades happened, use init price
+    #     # ) # caution: this value can be zero (executed[:,1]).sum()
+    #     # only use other traders' trades for value weighted price
+    #     # vwap = vwapFunc(otherTrades) # average_price of all other trades
+
+    #     other_exec_quants = jnp.abs(otherTrades[:, 1]).sum()
+    #     vwap = jax.lax.cond(
+    #         other_exec_quants == 0,
+    #         lambda: agent_state.init_price / self.world_config.tick_size,
+    #         lambda: (otherTrades[:, 0] // self.world_config.tick_size * jnp.abs(otherTrades[:, 1])).sum() / other_exec_quants
+    #     )
+        
+    #     #jax.debug.print("vwap: {} ", vwap) 
+
+    #     revenue = (agentTrades[:,0] // self.world_config.tick_size * jnp.abs(agentTrades[:,1])).sum()
+        
+    #     # ---------- used for slippage, price_drift, and RM(rolling mean) ----------
+    #     rollingMeanValueFunc_FLOAT = lambda average_val,new_val:(average_val*world_state.step_counter+new_val)/(world_state.step_counter+1)
+    #     vwap_rm = rollingMeanValueFunc_FLOAT(agent_state.vwap_rm,vwap) # (state.market_rap*state.step_counter+executedAveragePrice)/(state.step_counter+1)
+    #     price_adv_rm = rollingMeanValueFunc_FLOAT(agent_state.price_adv_rm,revenue/(agentQuant+0.001) - vwap) # slippage=revenue/agentQuant-vwap, where revenue/agentQuant means agentPrice 
+    #     slippage_rm = rollingMeanValueFunc_FLOAT(agent_state.slippage_rm,revenue - agent_state.init_price//self.world_config.tick_size*agentQuant)
+    #     price_drift_rm = rollingMeanValueFunc_FLOAT(agent_state.price_drift_rm,(vwap - agent_state.init_price//self.world_config.tick_size)) #price_drift = (vwap - state.init_price//self.world_config.tick_size)
+        
+    #     # ---------- used for advantage and drift ----------
+    #     # switch sign for buy task
+    #     direction_switch = jnp.sign(agent_state.is_sell_task * 2 - 1)
+    #     advantage = direction_switch * (revenue - vwap * agentQuant) # advantage_vwap
+
+    #     #jax.debug.print("init price: {}", agent_state.init_price)
+    #     #jax.debug.print("advantage: {}", advantage)
+    #     #jax.debug.print("vwap: {}", vwap)
+    #    # jax.debug.print("exec quant left: {}", quant_left)
+
+
+    #     drift = direction_switch * agentQuant * (vwap - agent_state.init_price//self.world_config.tick_size)
+        
+    #     # ---------- compute the final reward ----------
+    #     # rewardValue = revenue 
+    #     # rewardValue =  advantage
+    #     # rewardValue1 = advantage + params.reward_lambda * drift
+    #     # rewardValue1 = advantage + 1.0 * drift
+    #     # rewardValue2 = revenue - (state.init_price // self.world_config.tick_size) * agentQuant
+    #     # rewardValue = rewardValue1 - rewardValue2
+    #     # rewardValue = revenue - vwap_rm * agentQuant # advantage_vwap_rm
+
+    #     # rewardValue = revenue - (state.init_price // self.world_config.tick_size) * agentQuant
+    #     reward = advantage + self.cfg.reward_lambda * drift
+    #     reward_lam1 = direction_switch * (
+    #         revenue - (agent_state.init_price // self.world_config.tick_size) * agentQuant
+    #     )
+        
+    #     #jax.debug.print("reward exec: {}", reward)
+
+    #     # Add other extras
+
+    #     trade_duration_step = (jnp.abs(agentTrades[:, 1]) / agent_state.task_to_execute * (agentTrades[:, -2] - world_state.init_time[0])).sum()
+    #     trade_duration = agent_state.trade_duration + trade_duration_step
+    #     quant_left = agent_state.task_to_execute - agent_state.quant_executed - agentQuant
+
+    #     reward_info={
+    #     "reward":reward,
+    #     "agentQuant": agentQuant,
+    #     "revenue": revenue,
+    #     "reward_lam1":reward_lam1 ,  # pure revenue is not informative if direction is random (-> flip and normalise)
+    #     "slippage_rm": slippage_rm,
+    #     "price_adv_rm": price_adv_rm,
+    #     "price_drift_rm": price_drift_rm,
+    #     "vwap_rm": vwap_rm,
+    #     "advantage": advantage,
+    #     "drift": drift,
+    #     "doom_quant": doom_quant,
+    #     "quant_left": quant_left,
+    #     "trade_duration": trade_duration,
+    #     }
+    #     reward_scaled = reward
+
+
+    #     if self.cfg.reward_space == "finish_fast":
+    #         reward = -jnp.abs(quant_left) #/ agent_state.task_to_execute
+    #         #jax.debug.print("reward:{}",reward)
+    #         #jax.debug.print("agentQuant:{}",agentQuant)
+    #         reward_scaled = reward / 10
+
+
+    #     if self.cfg.reward_space == "simplest_case":
+    #         entry_price=agent_state.init_price
+    #         price_slip=agentTrades[:,0]-jnp.ones_like(agentTrades[:,0])*entry_price #Trade price - 1st price.
+    #         price_slip=jnp.where(agent_state.is_sell_task,price_slip,-price_slip)
+    #         reward=jnp.dot(price_slip,jnp.abs(agentTrades[:,1]))
+
+    #         # jax.debug.print("entry_price: {}", entry_price)
+    #         # jax.debug.print("agentTrades[:,0]: {}", agentTrades[:,0])
+    #         # jax.debug.print("price_slip: {}", price_slip)
+    #         # jax.debug.print("agentTrades[:,1]: {}", agentTrades[:,1])
+    #         # jax.debug.print("Reward: {}", reward)
+
+    #         reward_scaled=reward/self.cfg.task_size
+    #         # jax.debug.print("dot(price_slip, agentTrades[:,1]): {}", jnp.dot(price_slip, agentTrades[:,1]))
+
+    #         # price_slip=jax.lax.cond(
+    #         #     agent_state.is_sell_task,
+    #         #     ,
+    #         #     agentTrades[:,0]-jnp.ones_like(agentTrades[:,0]*entry_price)  
+    #         # )
+        
+    #     # jax.debug.print('reward: {}. reward_lam1: {}. is_sell_task {}. advantage {} drift {} vwap {} init_price {}', 
+    #     #                 reward, reward_lam1, state.is_sell_task, advantage, drift, vwap, state.init_price)
+        
+    #     # ---------- normalize the reward ----------
+    #     # reward /= 10_000
+    #     # reward /= params.avg_twap_list[state.window_index]
+    #     return reward_scaled, reward_info
     def _get_reward(self, 
                     world_state: WorldState, 
                     agent_state: ExecEnvState, 
@@ -1822,7 +2087,6 @@ class ExecutionAgent():
                     bestasks: chex.Array, 
                     bestbids: chex.Array, 
                     time: jax.Array) -> jnp.int32:
-
         #########################################################################################
         # Add artificial trade if episode is done
         # Important: this artificial trade is not saved, its just used to calculate the reward
@@ -1941,116 +2205,95 @@ class ExecutionAgent():
         # only use other traders' trades for value weighted price
         # vwap = vwapFunc(otherTrades) # average_price of all other trades
 
-        other_exec_quants = jnp.abs(otherTrades[:, 1]).sum()
-        vwap = jax.lax.cond(
-            other_exec_quants == 0,
-            lambda: agent_state.init_price / self.world_config.tick_size,
-            lambda: (otherTrades[:, 0] // self.world_config.tick_size * jnp.abs(otherTrades[:, 1])).sum() / other_exec_quants
+        # 1. TÍNH C_RL (DOANH THU/CHI PHÍ THỰC TẾ CỦA AGENT)
+        # Revenue = Sum(Price * Volume)
+        c_rl = (agentTrades[:, 0] // self.world_config.tick_size * jnp.abs(agentTrades[:, 1])).sum()
+
+        # 2. XÁC ĐỊNH GIÁ BENCHMARK P (MARKET ORDER PRICE)
+        # Theo Dual-Window PPO: So sánh Limit Order của Agent với Market Order của Baseline.
+        # - Sell Task: Benchmark bán ngay lập tức -> Khớp tại Best Bid.
+        # - Buy Task: Benchmark mua ngay lập tức -> Khớp tại Best Ask.
+        p_benchmark = jax.lax.cond(
+            agent_state.is_sell_task,
+            lambda: bestbids[-1, 0] // self.world_config.tick_size, 
+            lambda: bestasks[-1, 0] // self.world_config.tick_size  
         )
+
+        # 3. TÍNH R_COMP (CẠNH TRANH - SPREAD CAPTURE)
+        # V_base: Volume mục tiêu của TWAP trong bước này
+        total_steps = world_state.max_steps_in_episode
+        v_base = agent_state.task_to_execute / total_steps
+
+        # Chi phí Benchmark giả định (nếu TWAP khớp Market Order với volume thực tế của Agent)
+        # c_base_matched = v_rl * p_benchmark
+        c_base_matched = agentQuant * p_benchmark
+
+        direction_switch = jnp.sign(agent_state.is_sell_task * 2 - 1) # Sell=1, Buy=-1
+
+        # R_comp: Lợi nhuận kiếm được từ việc đặt Limit Order so với Market Order
+        # Buy: (Cost_Market - Cost_Limit) > 0
+        # Sell: (Rev_Limit - Rev_Market) > 0
+        r_comp = direction_switch * (c_rl - c_base_matched)
+
+        # 4. TÍNH R_MIMIC (HÌNH PHẠT KHỐI LƯỢNG)
+        # Phạt nếu khối lượng khớp lệch so với kế hoạch TWAP
+        delta_v = agentQuant - v_base
+        r_mimic = -jnp.abs(delta_v)
+        r_mimic_scaled = r_mimic / (v_base + 1.0)
+
+        # 5. TỔNG HỢP REWARD
+        alpha = self.cfg.reward_lambda
+        reward = r_comp + alpha * r_mimic_scaled
         
-        #jax.debug.print("vwap: {} ", vwap) 
+        # jax.debug.print("DEBUG REWARD: Step {}, Executed Vol: {}, v_base: {}", world_state.step_counter, agentQuant, v_base)
+        # 6. CẬP NHẬT METRICS & LOGGING
+        # Drift: Sự trôi giá thị trường so với giá Arrival
+        drift = direction_switch * agentQuant * (p_benchmark - agent_state.init_price // self.world_config.tick_size)
 
-        revenue = (agentTrades[:,0] // self.world_config.tick_size * jnp.abs(agentTrades[:,1])).sum()
-        
-        # ---------- used for slippage, price_drift, and RM(rolling mean) ----------
-        rollingMeanValueFunc_FLOAT = lambda average_val,new_val:(average_val*world_state.step_counter+new_val)/(world_state.step_counter+1)
-        vwap_rm = rollingMeanValueFunc_FLOAT(agent_state.vwap_rm,vwap) # (state.market_rap*state.step_counter+executedAveragePrice)/(state.step_counter+1)
-        price_adv_rm = rollingMeanValueFunc_FLOAT(agent_state.price_adv_rm,revenue/(agentQuant+0.001) - vwap) # slippage=revenue/agentQuant-vwap, where revenue/agentQuant means agentPrice 
-        slippage_rm = rollingMeanValueFunc_FLOAT(agent_state.slippage_rm,revenue - agent_state.init_price//self.world_config.tick_size*agentQuant)
-        price_drift_rm = rollingMeanValueFunc_FLOAT(agent_state.price_drift_rm,(vwap - agent_state.init_price//self.world_config.tick_size)) #price_drift = (vwap - state.init_price//self.world_config.tick_size)
-        
-        # ---------- used for advantage and drift ----------
-        # switch sign for buy task
-        direction_switch = jnp.sign(agent_state.is_sell_task * 2 - 1)
-        advantage = direction_switch * (revenue - vwap * agentQuant) # advantage_vwap
+        # Rolling Means (Cập nhật các chỉ số trung bình trượt để theo dõi)
+        rollingMeanValueFunc_FLOAT = lambda average_val, new_val: (average_val * world_state.step_counter + new_val) / (world_state.step_counter + 1)
 
-        #jax.debug.print("init price: {}", agent_state.init_price)
-        #jax.debug.print("advantage: {}", advantage)
-        #jax.debug.print("vwap: {}", vwap)
-       # jax.debug.print("exec quant left: {}", quant_left)
+        # Dùng p_benchmark để track VWAP/MidPrice trend
+        vwap_rm = rollingMeanValueFunc_FLOAT(agent_state.vwap_rm, p_benchmark)
+        price_adv_rm = rollingMeanValueFunc_FLOAT(agent_state.price_adv_rm, r_comp)
 
+        # Slippage (Trượt giá thực tế so với giá Arrival)
+        slippage_rm = rollingMeanValueFunc_FLOAT(agent_state.slippage_rm, c_rl - (agent_state.init_price // self.world_config.tick_size) * agentQuant)
+        price_drift_rm = rollingMeanValueFunc_FLOAT(agent_state.price_drift_rm, (p_benchmark - agent_state.init_price // self.world_config.tick_size))
 
-        drift = direction_switch * agentQuant * (vwap - agent_state.init_price//self.world_config.tick_size)
-        
-        # ---------- compute the final reward ----------
-        # rewardValue = revenue 
-        # rewardValue =  advantage
-        # rewardValue1 = advantage + params.reward_lambda * drift
-        # rewardValue1 = advantage + 1.0 * drift
-        # rewardValue2 = revenue - (state.init_price // self.world_config.tick_size) * agentQuant
-        # rewardValue = rewardValue1 - rewardValue2
-        # rewardValue = revenue - vwap_rm * agentQuant # advantage_vwap_rm
-
-        # rewardValue = revenue - (state.init_price // self.world_config.tick_size) * agentQuant
-        reward = advantage + self.cfg.reward_lambda * drift
-        reward_lam1 = direction_switch * (
-            revenue - (agent_state.init_price // self.world_config.tick_size) * agentQuant
-        )
-        
-        #jax.debug.print("reward exec: {}", reward)
-
-        # Add other extras
-
+        # Tính toán thông tin phụ
         trade_duration_step = (jnp.abs(agentTrades[:, 1]) / agent_state.task_to_execute * (agentTrades[:, -2] - world_state.init_time[0])).sum()
         trade_duration = agent_state.trade_duration + trade_duration_step
         quant_left = agent_state.task_to_execute - agent_state.quant_executed - agentQuant
 
-        reward_info={
-        "reward":reward,
-        "agentQuant": agentQuant,
-        "revenue": revenue,
-        "reward_lam1":reward_lam1 ,  # pure revenue is not informative if direction is random (-> flip and normalise)
-        "slippage_rm": slippage_rm,
-        "price_adv_rm": price_adv_rm,
-        "price_drift_rm": price_drift_rm,
-        "vwap_rm": vwap_rm,
-        "advantage": advantage,
-        "drift": drift,
-        "doom_quant": doom_quant,
-        "quant_left": quant_left,
-        "trade_duration": trade_duration,
+        reward_info = {
+            "reward": reward,
+            "r_comp": r_comp,
+            "r_mimic": r_mimic_scaled,
+            "agentQuant": agentQuant,
+            "targetQuant": v_base,
+            "p_benchmark": p_benchmark,
+            "revenue": c_rl,
+            "advantage": r_comp, # Advantage chính là R_comp
+            "drift": drift,
+            "quant_left": quant_left,
+            "vwap_rm": vwap_rm,
+            "price_adv_rm": price_adv_rm,
+            "slippage_rm": slippage_rm,
+            "price_drift_rm": price_drift_rm,
+            "trade_duration": trade_duration,
+            "doom_quant": doom_quant, # Biến này đã tính ở phần trên, vẫn truy cập được
+            "reward_lam1": r_comp 
         }
+
         reward_scaled = reward
 
-
+        # Giữ lại logic debug đặc biệt (nếu cần)
         if self.cfg.reward_space == "finish_fast":
-            reward = -jnp.abs(quant_left) #/ agent_state.task_to_execute
-            #jax.debug.print("reward:{}",reward)
-            #jax.debug.print("agentQuant:{}",agentQuant)
-            reward_scaled = reward / 10
-
-
-        if self.cfg.reward_space == "simplest_case":
-            entry_price=agent_state.init_price
-            price_slip=agentTrades[:,0]-jnp.ones_like(agentTrades[:,0])*entry_price #Trade price - 1st price.
-            price_slip=jnp.where(agent_state.is_sell_task,price_slip,-price_slip)
-            reward=jnp.dot(price_slip,jnp.abs(agentTrades[:,1]))
-
-            # jax.debug.print("entry_price: {}", entry_price)
-            # jax.debug.print("agentTrades[:,0]: {}", agentTrades[:,0])
-            # jax.debug.print("price_slip: {}", price_slip)
-            # jax.debug.print("agentTrades[:,1]: {}", agentTrades[:,1])
-            # jax.debug.print("Reward: {}", reward)
-
-            reward_scaled=reward/self.cfg.task_size
-            # jax.debug.print("dot(price_slip, agentTrades[:,1]): {}", jnp.dot(price_slip, agentTrades[:,1]))
-
-            # price_slip=jax.lax.cond(
-            #     agent_state.is_sell_task,
-            #     ,
-            #     agentTrades[:,0]-jnp.ones_like(agentTrades[:,0]*entry_price)  
-            # )
-        
-        # jax.debug.print('reward: {}. reward_lam1: {}. is_sell_task {}. advantage {} drift {} vwap {} init_price {}', 
-        #                 reward, reward_lam1, state.is_sell_task, advantage, drift, vwap, state.init_price)
-        
-        # ---------- normalize the reward ----------
-        # reward /= 10_000
-        # reward /= params.avg_twap_list[state.window_index]
-
-
+                reward_scaled = -jnp.abs(quant_left) / 10.0
 
         return reward_scaled, reward_info
+
 
 
     def update_state_and_get_done_and_info(self, world_state:WorldState, agent_state_old: ExecEnvState, extras) -> Tuple[ExecEnvState, Dict]:
@@ -2351,7 +2594,7 @@ class ExecutionAgent():
             world_state.ask_raw_orders,
             world_state.bid_raw_orders,
             3,
-            self.cfg
+            self.world_config
         )
 
         # 2. Định nghĩa hàm xử lý logic
@@ -2651,9 +2894,7 @@ class ExecutionAgent():
         elif self.cfg.action_space == "policy_blending":
             # Action là vector liên tục 3 chiều: [Aggressive Scale, Passive Scale 1, Passive Scale 2]
             # Theo bài báo: a1 [-1, 3], a2 [0, 1], a3 [0, 1]
-            low = jnp.array([-1.0, 0.0, 0.0], dtype=jnp.float32)
-            high = jnp.array([3.0, 1.0, 1.0], dtype=jnp.float32)
-            return spaces.Box(low, high, (3,), dtype=jnp.float32)
+            return spaces.Box(ACTION_LOW, ACTION_HIGH, (3,), dtype=jnp.float32)
         else:    
             raise ValueError("Invalid action_space specified.")
 
@@ -2681,10 +2922,17 @@ class ExecutionAgent():
             shape=(10, 3, 2),  # Levels, Features, Channels
             dtype=jnp.float32,
         )
+        tick_shift_shape = spaces.Box(
+            low=-1000000,
+            high=1000000,
+            shape=(1,),
+            dtype=jnp.float32,
+        )
 
         return spaces.Dict({
             "exec_obs": exec_space,
             "vision_obs": vision_shape,
+            "tick_shift": tick_shift_shape,
         })
 
     def state_space(self, params: ExecEnvParams) -> spaces.Dict:
@@ -2719,9 +2967,8 @@ if __name__ == "__main__":
     from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig
 
     multi_agent_config = MultiAgentConfig(dict_of_agents_configs={
-                                "Execution": Execution_EnvironmentConfig(action_space="simplest_case",
-                                                            observation_space="simplest_case",
-                                                            reward_space="simplest_case"
+                                "Execution": Execution_EnvironmentConfig(action_space="policy_blending",
+                                                            observation_space="execution_policy",
                                                             )},
                                         number_of_agents_per_type=[1],)
 
@@ -2757,7 +3004,7 @@ if __name__ == "__main__":
         print(f"    Agent type {env.instance_list[i].__class__.__name__}: {obs}")
     
 
-    num_steps = 30
+    num_steps = 20
     fixed_actions = False
 
     for i in range(1, num_steps+1):
@@ -2793,7 +3040,6 @@ if __name__ == "__main__":
             print(f"    Agent type {env.instance_list[i].__class__.__name__}: {actions}")
 
         obs, state, rewards, done, info = env.step(key=key_step, state=state, actions=actions_per_type, params=env_params)
-        
         print("observations_per_type:")
         for i, obs in enumerate(obs):
             print(f"    Agent type {env.instance_list[i].__class__.__name__}: {obs}")

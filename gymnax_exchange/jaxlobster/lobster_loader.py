@@ -38,15 +38,11 @@ import os
 import jax
 import itertools
 import pandas as pd
-import warnings
-import numpy as np
-
-# Safe import of SettingWithCopyWarning if available
 try:
     from pandas.errors import SettingWithCopyWarning
-except (ImportError, AttributeError):
-    # Fallback: use FutureWarning if SettingWithCopyWarning is not available
-    SettingWithCopyWarning = FutureWarning
+except ImportError:
+    from pandas.errors import ChainedAssignmentError as SettingWithCopyWarning
+import numpy as np
 
 # from jax import numpy as jnp
 # import jax

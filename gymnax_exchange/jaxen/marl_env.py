@@ -60,7 +60,8 @@ jax.config.update("jax_log_compiles", False)
 jax.config.update("jax_enable_x64", False)
 
 from gymnax_exchange.jaxen.mm_env import MarketMakingAgent
-from gymnax_exchange.jaxen.exec_env import ExecutionAgent
+# from gymnax_exchange.jaxen.exec_env import ExecutionAgent
+from gymnax_exchange.jaxen.vision_env import ExecutionAgent
 from gymnax_exchange.jaxen.base_env import BaseLOBEnv
 from gymnax_exchange.jaxen.from_JAXMARL.multi_agent_env import MultiAgentEnv
 #from gymnax_exchange.jaxen.from_JAXMARL.spaces import Box, MultiDiscrete, Discrete
@@ -652,10 +653,11 @@ class MARLEnv(MultiAgentEnv):
             #jax.debug.print("__all__ done: {}", dones)
             mask = jnp.logical_and(dones_temp, jnp.logical_not(dones["__all__"])) #only set obs to 0 if agent is done but overall env is not
             #jax.debug.print("mask: {}", mask)
-            obs = jnp.where(
-                mask[..., None],  # expand dims for broadcasting
-                jnp.zeros_like(obs),
-                obs)
+            def apply_mask_to_obs(obs):
+                expands = (1,) * (obs.ndim - mask.ndim)  # create tuple for broadcasting
+                mask_expanded = jnp.reshape(mask, mask.shape + expands)
+                return jnp.where( mask_expanded, jnp.zeros_like(obs), obs)
+            obs = jax.tree_util.tree_map(apply_mask_to_obs, obs)
             #jax.debug.print("obs after: {}", obs)
             agent_obs_list.append(obs)
 

@@ -7,6 +7,14 @@
 "NUM_STEPS": 256
 "GRU_HIDDEN_DIM": 128
 "FC_DIM_SIZE": 128
+"use_reliability_head": False
+"use_tick_shift": True
+"reliability_hidden_dim": 128
+"use_survival_loss": False
+"lambda_surv": 0.0
+"survival_delta_steps": 10
+"survival_min_volume": 1.0
+"survival_ratio": 0.5
 "TOTAL_TIMESTEPS": 5e7
 "UPDATE_EPOCHS": 4
 "NUM_MINIBATCHES": 16

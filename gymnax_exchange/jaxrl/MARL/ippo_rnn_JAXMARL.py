@@ -3,12 +3,19 @@ Based on PureJaxRL Implementation of PPO
 """
 
 import os
+import sys
+import copy
 
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, "../../../"))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+    
 import pandas as pd
 import csv
 import wandb.sdk
 
-from docs.source import conf
+
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
 # os.environ["JAX_CHECK_TRACER_LEAKS"] = "true"
@@ -37,13 +44,16 @@ import gc
 #from jaxmarl.wrappers.baselines import SMAXLogWrapper
 #from jaxmarl.environments.smax import map_name_to_scenario, HeuristicEnemySMAX
 from gymnax_exchange.jaxen.marl_env import MARLEnv
+from gymnax.environments import spaces
 from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig,Execution_EnvironmentConfig, World_EnvironmentConfig,MarketMaking_EnvironmentConfig
-
+from gymnax_exchange.networks.gate_fusion import EMASmoothing, StableGatedCrossAttention
+from gymnax_exchange.networks.reliability_head import LevelWiseReliabilityHead
+from gymnax_exchange.networks.vision_agent import VisionAgent, supervised_contrastive_loss
 import wandb
 import functools
 import matplotlib.pyplot as plt
 
-import sys
+
 
 class ScannedRNN(nn.Module):
     @functools.partial(
@@ -73,36 +83,137 @@ class ScannedRNN(nn.Module):
         return cell.initialize_carry(jax.random.PRNGKey(0), (batch_size, hidden_size))
 
 
+class ReliabilityFusionRNN(nn.Module):
+    config: Dict
+
+    @functools.partial(
+        nn.scan,
+        variable_broadcast="params",
+        in_axes=0,
+        out_axes=0,
+        split_rngs={"params": False},
+    )
+    @nn.compact
+    def __call__(self, carry, x):
+        obs_exec_t, obs_exec_smoothed_t, z_tokens_t, done_t, tick_shift_t = x
+        rnn_state = jnp.where(done_t[:, jnp.newaxis], jnp.zeros_like(carry), carry)
+
+        reliability = LevelWiseReliabilityHead(
+            hidden_dim=self.config.get("reliability_hidden_dim", self.config["FC_DIM_SIZE"])
+        )
+        reliability_scores_t, filtered_tokens_t = reliability(
+            z_tokens=z_tokens_t,
+            obs_exec=obs_exec_t,
+            h_prev=rnn_state,
+            tick_shift=tick_shift_t,
+        )
+
+        fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
+        fused_t = fusion(obs_exec_smoothed_t, filtered_tokens_t)
+        embedding_t = nn.Dense(
+            self.config["FC_DIM_SIZE"],
+            kernel_init=orthogonal(jnp.sqrt(2)),
+            bias_init=constant(0.0),
+        )(fused_t)
+        embedding_t = nn.relu(embedding_t)
+
+        new_rnn_state, y_t = nn.GRUCell(features=self.config["FC_DIM_SIZE"])(rnn_state, embedding_t)
+        return new_rnn_state, (y_t, reliability_scores_t)
+
+# FIXME: APPLY VISION 
 class ActorCriticRNN(nn.Module):
-    action_dim: Sequence[int]
+    action_space: spaces.Space
     config: Dict
 
     @nn.compact
     def __call__(self, hidden, x):
-        # obs, dones, avail_actions = x
         obs, dones = x
+        
+        if isinstance(obs, dict):
+            obs_exec = obs['exec_obs']
+            obs_vision = obs['vision_obs']
 
-        embedding = nn.Dense(
-            self.config["FC_DIM_SIZE"], kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0)
-        )(obs)
-        embedding = nn.relu(embedding)
+            vision_encoder = VisionAgent(embed_dim=self.config["FC_DIM_SIZE"])
+            z_tokens = vision_encoder(obs_vision, return_tokens=True)
+            z_vision = jnp.mean(z_tokens, axis=-2)
 
-        rnn_in = (embedding, dones)
+            ema_module = EMASmoothing(alpha = 0.5)
+            obs_exec_smoothed = ema_module(obs_exec)
 
-        hidden, embedding = ScannedRNN()(hidden, rnn_in)
+            use_reliability_head = self.config.get("use_reliability_head", False)
+            if use_reliability_head:
+                use_tick_shift = self.config.get("use_tick_shift", False)
+                tick_shift = obs.get("tick_shift", None) if use_tick_shift else None
+                if tick_shift is None:
+                    tick_shift = jnp.zeros((*obs_exec.shape[:2], 1), dtype=obs_exec.dtype)
+
+                hidden, (embedding, reliability_scores) = ReliabilityFusionRNN(config=self.config)(
+                    hidden,
+                    (obs_exec, obs_exec_smoothed, z_tokens, dones, tick_shift),
+                )
+                aux_info = {"reliability_scores": reliability_scores}
+            else:
+                fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
+                fused_obs = fusion(obs_exec_smoothed, z_tokens)
+                embedding = nn.Dense(
+                    self.config["FC_DIM_SIZE"], kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0)
+                )(fused_obs)
+                embedding = nn.relu(embedding)
+
+                rnn_in = (embedding, dones)
+
+                hidden, embedding = ScannedRNN()(hidden, rnn_in)
+                aux_info = {
+                    "reliability_scores": jnp.zeros((*z_tokens.shape[:-1], 1), dtype=z_tokens.dtype)
+                }
+        else:
+            fused_obs = obs
+            z_vision = jnp.zeros((1,))
+            embedding = nn.Dense(
+                self.config["FC_DIM_SIZE"], kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0)
+            )(fused_obs)
+            embedding = nn.relu(embedding)
+
+            rnn_in = (embedding, dones)
+
+            hidden, embedding = ScannedRNN()(hidden, rnn_in)
+            aux_info = {
+                "reliability_scores": jnp.zeros((*embedding.shape[:-1], 1, 1), dtype=embedding.dtype)
+            }
         actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
             embedding
         )
 
         actor_mean = nn.relu(actor_mean)
 
-        actor_mean = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0) # type: ignore
-        )(actor_mean)
-        # Avail actions are not used in the current implementation, but can be added if needed.
-        # unavail_actions = 1 - avail_actions
-        action_logits = actor_mean # - (unavail_actions * 1e10)
-        pi = distrax.Categorical(logits=action_logits)
+        if isinstance(self.action_space, spaces.Discrete):
+            action_logits = nn.Dense(
+                self.action_space.n, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+            )(actor_mean)
+            pi = distrax.Categorical(logits=action_logits)
+        elif isinstance(self.action_space, spaces.Box):
+            action_loc = nn.Dense(
+                self.action_space.shape[-1], kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+            )(actor_mean)
+            actor_logstd = self.param("log_std", nn.initializers.zeros, (self.action_space.shape[-1],))
+            base_dist = distrax.Independent(
+                distrax.Normal(action_loc, jnp.exp(actor_logstd)),
+                reinterpreted_batch_ndims=1,
+            )
+            action_low = jnp.asarray(self.action_space.low, dtype=jnp.float32)
+            action_high = jnp.asarray(self.action_space.high, dtype=jnp.float32)
+            action_shift = (action_high + action_low) / 2.0
+            action_scale = (action_high - action_low) / 2.0
+            action_bijector = distrax.Block(
+                distrax.Chain([
+                    distrax.ScalarAffine(shift=action_shift, scale=action_scale),
+                    distrax.Tanh(),
+                ]),
+                ndims=1,
+            )
+            pi = distrax.Transformed(base_dist, action_bijector)
+        else:
+            raise ValueError(f"Unknown action space type {type(self.action_space)}")
 
         critic = nn.Dense(self.config["FC_DIM_SIZE"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
             embedding
@@ -112,9 +223,9 @@ class ActorCriticRNN(nn.Module):
             critic
         )
 
-        return hidden, pi, jnp.squeeze(critic, axis=-1)
+        return hidden, pi, jnp.squeeze(critic, axis=-1), z_vision, aux_info
 
-
+# FIXME: APPLY VISION
 class Transition(NamedTuple):
     global_done: jnp.ndarray
     done: jnp.ndarray
@@ -122,17 +233,113 @@ class Transition(NamedTuple):
     value: jnp.ndarray
     reward: jnp.ndarray
     log_prob: jnp.ndarray
-    obs: jnp.ndarray
-    info: jnp.ndarray
+    obs: Dict[str, jnp.ndarray]  
+    info: Dict[str, Any]
     # avail_actions: jnp.ndarray
 
 
-def batchify(x: jnp.ndarray, num_actors):
-    return x.reshape((num_actors, -1))
+def batchify(x, num_actors):
+    return jax.tree_util.tree_map(lambda y: y.reshape((num_actors, *y.shape[2:])), x)
 
 
-def unbatchify(x: jnp.ndarray,num_envs, num_agents):
-    return  x.reshape((num_envs, num_agents, -1))
+def batchify_action(x, num_actors):
+    def _batchify_action(y):
+        if y.shape[0] == num_actors:
+            return y
+        return y.reshape((num_actors, *y.shape[2:]))
+
+    return jax.tree_util.tree_map(_batchify_action, x)
+
+
+def unbatchify(x, num_envs, num_agents):
+    def _unbatchify(y):
+        if y.ndim >= 2 and y.shape[0] == 1:
+            y = jnp.squeeze(y, axis=0)
+        return y.reshape((num_envs, num_agents, *y.shape[1:]))
+
+    return jax.tree_util.tree_map(_unbatchify, x)
+
+
+def masked_bce_loss(reliability_scores, labels, mask, eps=1e-8):
+    if reliability_scores.ndim == labels.ndim + 1:
+        reliability_scores = jnp.squeeze(reliability_scores, axis=-1)
+
+    r = jnp.clip(reliability_scores, eps, 1.0 - eps)
+    y = labels.astype(jnp.float32)
+    m = mask.astype(jnp.float32)
+
+    bce = -(y * jnp.log(r) + (1.0 - y) * jnp.log(1.0 - r))
+    return jnp.sum(bce * m) / jnp.maximum(jnp.sum(m), eps)
+
+
+def build_liquidity_survival_targets(
+    vision_obs,
+    mid_prices,
+    *,
+    tick_size,
+    survival_delta_steps,
+    survival_min_volume,
+    survival_ratio,
+    num_steps,
+):
+    """Build level-wise survival labels from current and future LOB vision frames."""
+    vision_obs = jnp.asarray(vision_obs, dtype=jnp.float32)
+    mid_prices = jnp.asarray(mid_prices, dtype=jnp.float32)
+
+    if mid_prices.ndim == 1:
+        mid_prices = mid_prices[:, None]
+    if mid_prices.shape[1] != vision_obs.shape[1]:
+        if vision_obs.shape[1] % mid_prices.shape[1] != 0:
+            raise ValueError(
+                "Cannot broadcast world mid_prices to actor vision observations: "
+                f"mid_prices batch={mid_prices.shape[1]}, vision batch={vision_obs.shape[1]}."
+            )
+        repeat_factor = vision_obs.shape[1] // mid_prices.shape[1]
+        mid_prices = jnp.repeat(mid_prices, repeat_factor, axis=1)
+
+    current_obs = vision_obs[:num_steps]
+    future_obs = vision_obs[survival_delta_steps:survival_delta_steps + num_steps]
+    current_mid = mid_prices[:num_steps, :, None]
+    future_mid = mid_prices[survival_delta_steps:survival_delta_steps + num_steps, :, None]
+
+    ask_gap = current_obs[..., 0, 0]
+    bid_gap = current_obs[..., 0, 1]
+    ask_volume = jnp.expm1(current_obs[..., 1, 0])
+    bid_volume = jnp.expm1(current_obs[..., 1, 1])
+
+    future_ask_gap = future_obs[..., 0, 0]
+    future_bid_gap = future_obs[..., 0, 1]
+    future_ask_volume = jnp.expm1(future_obs[..., 1, 0])
+    future_bid_volume = jnp.expm1(future_obs[..., 1, 1])
+
+    tick_size = jnp.asarray(tick_size, dtype=jnp.float32)
+    ask_key = jnp.rint((current_mid + ask_gap * tick_size) / tick_size)
+    bid_key = jnp.rint((current_mid - bid_gap * tick_size) / tick_size)
+    future_ask_key = jnp.rint((future_mid + future_ask_gap * tick_size) / tick_size)
+    future_bid_key = jnp.rint((future_mid - future_bid_gap * tick_size) / tick_size)
+
+    ask_mask = ask_volume >= survival_min_volume
+    bid_mask = bid_volume >= survival_min_volume
+    ask_matches = future_ask_key[..., None, :] == ask_key[..., :, None]
+    bid_matches = future_bid_key[..., None, :] == bid_key[..., :, None]
+    matched_future_ask_volume = jnp.max(
+        jnp.where(ask_matches, future_ask_volume[..., None, :], 0.0),
+        axis=-1,
+    )
+    matched_future_bid_volume = jnp.max(
+        jnp.where(bid_matches, future_bid_volume[..., None, :], 0.0),
+        axis=-1,
+    )
+    ask_label = matched_future_ask_volume >= survival_ratio * ask_volume
+    bid_label = matched_future_bid_volume >= survival_ratio * bid_volume
+
+    level_mask = ask_mask | bid_mask
+    level_label = jnp.maximum(
+        ask_label.astype(jnp.float32) * ask_mask.astype(jnp.float32),
+        bid_label.astype(jnp.float32) * bid_mask.astype(jnp.float32),
+    )
+
+    return level_label.astype(jnp.float32), level_mask.astype(jnp.float32)
 
 
 def make_train(config):
@@ -235,14 +442,29 @@ def make_train(config):
         num_agents_of_instance_list = []
         init_dones_agents = []
         for i, instance in enumerate(env.instance_list):
-            # print("Action space dimension for network i ",env.action_spaces[i].n)
-            network = ActorCriticRNN(env.action_spaces[i].n, config=config)
+            # print("Action space dimension for network i ",env.action_spaces[i])
+            network = ActorCriticRNN(env.action_spaces[i], config=config)
             rng, _rng = jax.random.split(rng)
+            if hasattr(env.observation_spaces[i], "spaces"):
+                obs_shape = env.observation_spaces[i].spaces['exec_obs'].shape[0]
+                init_obs = {
+                    'exec_obs': jnp.zeros((1, config["NUM_ENVS"], obs_shape)), 
+                    'vision_obs': jnp.zeros((1, config["NUM_ENVS"], 10, 3, 2)), # Shape của LOB
+                    'tick_shift': jnp.zeros((1, config["NUM_ENVS"], 1)),
+                }
+            elif isinstance(env.observation_spaces[i], dict):
+                obs_shape = env.observation_spaces[i]['exec_obs'].shape[0]
+                init_obs = {
+                    'exec_obs': jnp.zeros((1, config["NUM_ENVS"], obs_shape)), 
+                    'vision_obs': jnp.zeros((1, config["NUM_ENVS"], 10, 3, 2)), # Shape của LOB
+                    'tick_shift': jnp.zeros((1, config["NUM_ENVS"], 1)),
+                }
+            else:
+                init_obs = jnp.zeros((1, config["NUM_ENVS"], env.observation_spaces[i].shape[0]))
+
             init_x = (
-                jnp.zeros(
-                    (1, config["NUM_ENVS"], env.observation_spaces[i].shape[0])
-                ), # obs
-                jnp.zeros((1, config["NUM_ENVS"])), # dones
+                init_obs,
+                jnp.zeros((1, config["NUM_ENVS"])) # dones
                 # jnp.zeros((1, config["NUM_ENVS"], env.action_spaces[i].n)), #     avail_actions
             )
 
@@ -289,6 +511,7 @@ def make_train(config):
         def _update_step(update_runner_state,env_params,eval_env_params, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
+            # FIXME: APPLY VISION
             def _env_step(runner_state, unused):
                 train_states, env_state, last_obs, last_done,h_states, rng = runner_state
 
@@ -304,16 +527,20 @@ def make_train(config):
                 actions=[]
                 values=[]
                 log_probs=[]
-
+                '''
+                Duyệt qua các agent trong môi trường, lấy ra hành động và trạng thái tại bước thời gian đó
+                '''
                 for i, train_state in enumerate(train_states):
                     obs_i= last_obs[i]
                     obs_i=batchify(obs_i,config["NUM_ACTORS_PERTYPE"][i])  # Reshape to match the input shape of the network
+
+                    obs_i_batched = jax.tree.map(lambda x: x[jnp.newaxis, :], obs_i)
                     ac_in = (
-                        obs_i[jnp.newaxis, :],
+                        obs_i_batched,
                         last_done[i][jnp.newaxis, :],
                         # avail_actions,
                     )
-                    h_states[i], pi, value = train_state.apply_fn(train_state.params, h_states[i], ac_in)
+                    h_states[i], pi, value, _, _ = train_state.apply_fn(train_state.params, h_states[i], ac_in)
                     values.append(value)
                     action = pi.sample(seed=_rng)
                     log_probs.append(pi.log_prob(action))
@@ -326,19 +553,23 @@ def make_train(config):
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-
+                '''
+                Cho các agent tương tác với môi trường, nhận lại obs mới, trạng thái và rewards
+                '''
                 obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0,None)
                 )(rng_step, env_state, actions,env_params)
 
                 # info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
-                
+                '''
+                Ghi lại nhật kí 
+                '''
                 done_batch=done
                 transitions=[]
                 for i,train_state in enumerate(train_states):
                     done_batch['agents'][i] = batchify(done["agents"][i],config["NUM_ACTORS_PERTYPE"][i]).squeeze()
                     obs_batch = batchify(obsv[i],config["NUM_ACTORS_PERTYPE"][i])
-                    action_batch = batchify(actions[i],config["NUM_ACTORS_PERTYPE"][i])
+                    action_batch = batchify_action(actions[i],config["NUM_ACTORS_PERTYPE"][i])
                     value = values[i]
                     log_prob = log_probs[i]
 
@@ -359,11 +590,106 @@ def make_train(config):
                     ))
                 runner_state = (train_states, env_state, obsv, done_batch['agents'], h_states, rng)
                 return runner_state, transitions
-
             initial_hstates = runner_state[-2]
-            runner_state, traj_batch = jax.lax.scan(
-                _env_step, runner_state, None, config["NUM_STEPS"]
+
+            window_size = 10
+            survival_delta_steps = int(config.get("survival_delta_steps", window_size))
+            if config.get("use_survival_loss", False) and survival_delta_steps > window_size:
+                raise ValueError(
+                    "survival_delta_steps must be <= rollout window_size. "
+                    f"Got survival_delta_steps={survival_delta_steps}, window_size={window_size}."
+                )
+            total_rollout_steps = config["NUM_STEPS"] + window_size
+
+            def scan_body(carry, step_idx):
+                current_runner_state, stashed_runner_state = carry
+                
+                # Tiến 1 bước
+                next_runner_state, transition = _env_step(current_runner_state, None)
+                
+                # MA THUẬT: Chụp ảnh trạng thái ở đúng vạch đích NUM_STEPS - 1 (bước 128)
+                is_step_128 = (step_idx == config["NUM_STEPS"] - 1)
+                new_stashed_state = jax.tree_util.tree_map(
+                    lambda next_s, stash_s: jnp.where(is_step_128, next_s, stash_s),
+                    next_runner_state, stashed_runner_state
+                )
+                
+                return (next_runner_state, new_stashed_state), transition
+
+            # Chạy 138 bước
+            (final_runner_state, stashed_runner_state), traj_batch_padded = jax.lax.scan(
+                scan_body, 
+                (runner_state, runner_state), 
+                jnp.arange(total_rollout_steps)
             )
+
+            # ==========================================================
+            # [PHASE 2]: TRÍCH XUẤT NHÃN VOLATILITY TỪ 10 BƯỚC TƯƠNG LAI
+            # ==========================================================
+            volatility_labels = []
+            survival_labels = []
+            survival_masks = []
+            if not hasattr(env.multi_agent_config.world_config, "tick_size"):
+                raise ValueError(
+                    "Cannot build liquidity survival labels: "
+                    "env.multi_agent_config.world_config.tick_size is required."
+                )
+            tick_size = env.multi_agent_config.world_config.tick_size
+            if tick_size is None:
+                raise ValueError(
+                    "Cannot build liquidity survival labels: "
+                    "env.multi_agent_config.world_config.tick_size is None."
+                )
+            for i in range(len(stashed_runner_state[0])): # Lặp qua train_states
+                mid_prices = traj_batch_padded[i].info["world"]["end_mid_price"]
+                
+                # Quét cửa sổ tương lai (Logic giữ nguyên, chạy thẳng trên mid_prices chuẩn)
+                def calc_future_std(t):
+                    future_window = jax.lax.dynamic_slice_in_dim(mid_prices, t + 1, window_size, axis=0)
+                    return jnp.std(future_window, axis=0)
+                
+                # Chỉ tính nhãn cho 128 bước đầu
+                timesteps = jnp.arange(config["NUM_STEPS"])
+                future_vol = jax.vmap(calc_future_std)(timesteps)
+                
+                # Gán nhãn
+                labels = jnp.where(future_vol > config.get("VOL_HIGH", 0.02), 2, 
+                         jnp.where(future_vol > config.get("VOL_LOW", 0.005), 1, 0))
+                volatility_labels.append(labels)
+
+                if isinstance(traj_batch_padded[i].obs, dict) and "vision_obs" in traj_batch_padded[i].obs:
+                    surv_label, surv_mask = build_liquidity_survival_targets(
+                        traj_batch_padded[i].obs["vision_obs"],
+                        mid_prices,
+                        tick_size=tick_size,
+                        survival_delta_steps=survival_delta_steps,
+                        survival_min_volume=config.get("survival_min_volume", 1.0),
+                        survival_ratio=config.get("survival_ratio", 0.5),
+                        num_steps=config["NUM_STEPS"],
+                    )
+                else:
+                    reward_shape = traj_batch_padded[i].reward.shape
+                    surv_label = jnp.zeros((config["NUM_STEPS"], reward_shape[1], 10), dtype=jnp.float32)
+                    surv_mask = jnp.zeros_like(surv_label)
+                survival_labels.append(surv_label)
+                survival_masks.append(surv_mask)
+
+            # ==========================================================
+            # [PHASE 3]: CƯA ĐUÔI DATA VÀ KHÔI PHỤC DÒNG THỜI GIAN
+            # ==========================================================
+            # 3.1 Cưa bỏ 10 bước padding, trả về traj_batch chuẩn 128 bước
+            traj_batch = jax.tree_util.tree_map(
+                lambda x: x[:config["NUM_STEPS"]], traj_batch_padded
+            )
+
+            # 3.2 Khôi phục bộ nhớ ở bước 128 cho vòng lặp sau
+            t_states, e_state, l_obs, l_dones, h_states, _ = stashed_runner_state
+            
+            # Chôm chìa khóa RNG từ bước 138 (final_runner_state).
+            fresh_rng = final_runner_state[-1] 
+            
+            # Gắn lại vào runner_state
+            runner_state = (t_states, e_state, l_obs, l_dones, h_states, fresh_rng)
 
             # CALCULATE ADVANTAGE
             train_states, env_state, last_obs, last_dones, hstates_new, rng = runner_state
@@ -396,15 +722,16 @@ def make_train(config):
             targets=[]
             for i, train_state in enumerate(train_states):
                 last_obs_batch = batchify(last_obs[i], config["NUM_ACTORS_PERTYPE"][i])
+                last_obs_batch_expanded = jax.tree.map(lambda x: x[jnp.newaxis, :], last_obs_batch)
                 # avail_actions = jnp.ones(
                 #     (config["NUM_ACTORS"], env.action_space(env.agents[0]).n)
                 # )
                 ac_in = (
-                    last_obs_batch[jnp.newaxis, :],
+                    last_obs_batch_expanded,
                     last_dones[i][jnp.newaxis, :],
                     # avail_actions,
                 )
-                _, _, last_val = train_state.apply_fn(train_state.params, hstates_new[i], ac_in)
+                _, _, last_val, _, _ = train_state.apply_fn(train_state.params, hstates_new[i], ac_in)
                 last_val = last_val.squeeze()
 
                 advantages_i, targets_i = _calculate_gae(config["GAMMA"][i],config["GAE_LAMBDA"][i],traj_batch[i], last_val)
@@ -412,15 +739,16 @@ def make_train(config):
                 targets.append(targets_i)
 
             # UPDATE NETWORKS
+            # FIXME: APPLY VISION, GATED-FUSION
             loss_infos = []
             for i, train_state in enumerate(train_states):
                 def _update_epoch(update_state, unused):
                     def _update_minbatch(train_state, batch_info):
-                        init_hstate, traj_batch, advantages, targets = batch_info
+                        init_hstate, traj_batch, advantages, targets, vol_labels, surv_labels, surv_mask = batch_info
 
-                        def _loss_fn(params, init_hstate, traj_batch, gae, targets):
+                        def _loss_fn(params, init_hstate, traj_batch, gae, targets, vol_labels, surv_labels, surv_mask):
                             # RERUN NETWORK
-                            _, pi, value = train_state.apply_fn(
+                            _, pi, value, z_vision, aux_info = train_state.apply_fn(
                                 params,
                                 init_hstate.squeeze(),
                                 (traj_batch.obs, traj_batch.done),
@@ -452,22 +780,75 @@ def make_train(config):
                             )
                             loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
                             loss_actor = loss_actor.mean()
-                            entropy = pi.entropy().mean()
+                            if isinstance(env.action_spaces[i], spaces.Box):
+                                entropy = -log_prob.mean()
+                            else:
+                                entropy = pi.entropy().mean()
+
+                            # TỔNG HỢP PPO LOSS
+                            ppo_loss = (
+                                loss_actor
+                                + config["VF_COEF"][i] * value_loss
+                                - config["ENT_COEF"][i] * entropy
+                            )
+
+                            # TÍNH SUPCON LOSS CHO VISION AGENT
+                            if isinstance(traj_batch.obs, dict):
+                                z_flat = z_vision.reshape(-1, z_vision.shape[-1])
+                                labels_flat = vol_labels.reshape(-1)
+                                supcon_loss = supervised_contrastive_loss(z_flat, labels_flat, temperature=0.1)
+                                alpha = config.get("SUPCON_ALPHA", 0.1)
+                            else:
+                                supcon_loss = jnp.array(0.0)
+                                alpha = jnp.array(0.0)
+
+                            # LOSS CUỐI CÙNG (Cộng PPO và SupCon có hệ số)
+                            if (
+                                config.get("use_survival_loss", False)
+                                and config.get("use_reliability_head", False)
+                                and isinstance(traj_batch.obs, dict)
+                            ):
+                                reliability_scores = aux_info["reliability_scores"]
+                                survival_loss = masked_bce_loss(reliability_scores, surv_labels, surv_mask)
+                                lambda_surv = config.get("lambda_surv", 0.0)
+                                survival_mask_ratio = jnp.mean(surv_mask.astype(jnp.float32))
+                                reliability_mean = jnp.mean(reliability_scores)
+                            else:
+                                survival_loss = jnp.array(0.0)
+                                lambda_surv = jnp.array(0.0)
+                                survival_mask_ratio = jnp.array(0.0)
+                                reliability_mean = jnp.array(0.0)
+
+                            weighted_survival_loss = lambda_surv * survival_loss
+                            total_loss = ppo_loss + alpha * supcon_loss + weighted_survival_loss
 
                             # debug
                             approx_kl = ((ratio - 1) - logratio).mean()
                             clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
 
-                            total_loss = (
-                                loss_actor
-                                + config["VF_COEF"][i] * value_loss
-                                - config["ENT_COEF"][i] * entropy
+                            return total_loss, (
+                                value_loss,
+                                loss_actor,
+                                entropy,
+                                ratio,
+                                approx_kl,
+                                clip_frac,
+                                supcon_loss,
+                                survival_loss,
+                                weighted_survival_loss,
+                                survival_mask_ratio,
+                                reliability_mean,
                             )
-                            return total_loss, (value_loss, loss_actor, entropy, ratio, approx_kl, clip_frac)
-
                         grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                         total_loss, grads = grad_fn(
-                            train_state.params, init_hstate, traj_batch, advantages, targets
+                            train_state.params,
+                            init_hstate,
+                            traj_batch,
+                            advantages,
+                            targets,
+                            vol_labels,
+                            surv_labels,
+                            surv_mask,
                         )
                         train_state = train_state.apply_gradients(grads=grads)
                         return train_state, total_loss
@@ -477,6 +858,9 @@ def make_train(config):
                         traj_batch,
                         advantages,
                         targets,
+                        vol_labels,
+                        surv_labels,
+                        surv_mask,
                         rng,
                     ) = update_state
                     rng, _rng = jax.random.split(rng)
@@ -490,6 +874,9 @@ def make_train(config):
                         traj_batch,
                         advantages.squeeze(),
                         targets.squeeze(),
+                        vol_labels,
+                        surv_labels,
+                        surv_mask,
                     )
                     permutation = jax.random.permutation(_rng, config["NUM_ACTORS_PERTYPE"][i])
 
@@ -519,6 +906,9 @@ def make_train(config):
                         traj_batch,
                         advantages,
                         targets,
+                        vol_labels,
+                        surv_labels,
+                        surv_mask,
                         rng,
                     )
                     return update_state, total_loss
@@ -529,6 +919,9 @@ def make_train(config):
                     traj_batch[i],
                     advantages[i],
                     targets[i],
+                    volatility_labels[i],
+                    survival_labels[i],
+                    survival_masks[i],
                     rng,
                 )
                 update_state, loss_info = jax.lax.scan(
@@ -558,6 +951,10 @@ def make_train(config):
                     "ratio_0": ratio_0,
                     "approx_kl": loss_info[1][4],
                     "clip_frac": loss_info[1][5],
+                    "survival_loss": loss_info[1][7],
+                    "weighted_survival_loss": loss_info[1][8],
+                    "survival_mask_ratio": loss_info[1][9],
+                    "reliability_mean": loss_info[1][10],
                     "weighted_entropy_loss": loss_info[1][2] * config["ENT_COEF"][i],
                     "weighted_value_loss": loss_info[1][0] * config["VF_COEF"][i],
                 })
@@ -586,12 +983,13 @@ def make_train(config):
                     for i, train_state in enumerate(train_states):
                         obs_i= last_obs[i]
                         obs_i=batchify(obs_i,config["NUM_ACTORS_PERTYPE"][i])  # Reshape to match the input shape of the network
+                        obs_i_batched = jax.tree.map(lambda x: x[jnp.newaxis, :], obs_i)
                         ac_in = (
-                            obs_i[jnp.newaxis, :],
+                            obs_i_batched,
                             last_done[i][jnp.newaxis, :],
                             # avail_actions,
                         )
-                        h_states[i], pi, value = train_state.apply_fn(train_state.params, h_states[i], ac_in)
+                        h_states[i], pi, value, _, _ = train_state.apply_fn(train_state.params, h_states[i], ac_in)
                         values.append(value)
                         action = pi.sample(seed=_rng)
                         log_probs.append(pi.log_prob(action))
@@ -619,7 +1017,7 @@ def make_train(config):
                     for i, train_state in enumerate(train_states):
                         done_batch['agents'][i] = batchify(done["agents"][i],config["NUM_ACTORS_PERTYPE"][i]).squeeze()
                         obs_batch = batchify(obsv[i],config["NUM_ACTORS_PERTYPE"][i])
-                        action_batch = batchify(actions[i],config["NUM_ACTORS_PERTYPE"][i])
+                        action_batch = batchify_action(actions[i],config["NUM_ACTORS_PERTYPE"][i])
                         value = values[i]
                         log_prob = log_probs[i]
 
@@ -686,11 +1084,15 @@ def make_train(config):
 
                     action_distribution = {}
                     actions = np.array(tr.action).flatten()
-                    unique_actions, counts = np.unique(actions, return_counts=True)
-                    tot_counts=sum(counts)
-                    # Add each action count to the dictionary with a unique key
-                    for a, c in zip(unique_actions, counts):
-                        action_distribution[f"agent_{agent_name}/action_{int(a)}"] = c/tot_counts*100
+                    if isinstance(env.action_spaces[agent_index], spaces.Discrete):
+                        unique_actions, counts = np.unique(actions, return_counts=True)
+                        tot_counts=sum(counts)
+                        # Add each action count to the dictionary with a unique key
+                        for a, c in zip(unique_actions, counts):
+                            action_distribution[f"agent_{agent_name}/action_{int(a)}"] = c/tot_counts*100
+                    else:
+                        action_distribution[f"agent_{agent_name}/action_mean"] = float(np.mean(actions))
+                        action_distribution[f"agent_{agent_name}/action_std"] = float(np.std(actions))
                     logging_dict = {
                         # TODO: Log the quantities of interest. Keep it trivial for now.
                         "env_step": (metric["update_steps"]+1)
@@ -725,11 +1127,15 @@ def make_train(config):
                         agent_name = agent_type_names[agent_index]
                         action_distribution = {}
                         actions = np.array(tr.action).flatten()
-                        unique_actions, counts = np.unique(actions, return_counts=True)
-                        tot_counts=sum(counts)
-                        # Add each action count to the dictionary with a unique key
-                        for a, c in zip(unique_actions, counts):
-                            action_distribution[f"eval_agent_{agent_name}/action_{int(a)}"] = c/tot_counts*100
+                        if isinstance(env.action_spaces[agent_index], spaces.Discrete):
+                            unique_actions, counts = np.unique(actions, return_counts=True)
+                            tot_counts=sum(counts)
+                            # Add each action count to the dictionary with a unique key
+                            for a, c in zip(unique_actions, counts):
+                                action_distribution[f"eval_agent_{agent_name}/action_{int(a)}"] = c/tot_counts*100
+                        else:
+                            action_distribution[f"eval_agent_{agent_name}/action_mean"] = float(np.mean(actions))
+                            action_distribution[f"eval_agent_{agent_name}/action_std"] = float(np.std(actions))
                         logging_dict.update(action_distribution)
                         for key, value in tr.info['agent'].items():
                             if isinstance(value, (jnp.ndarray, np.ndarray)) and value.size > 0:
@@ -779,10 +1185,17 @@ def make_train(config):
         jitted_update_step = jax.jit(_update_step)
         
         orbax_checkpointer = oxcp.PyTreeCheckpointer()
-        options = oxcp.CheckpointManagerOptions(max_to_keep=2, create=True,keep_period=config["NUM_UPDATES"]//2)
+        keep_period = max(1, config["NUM_UPDATES"] // 2)
+        options = oxcp.CheckpointManagerOptions(max_to_keep=2, create=True, keep_period=keep_period)
+        checkpoint_path = os.path.abspath(
+            f'./checkpoints/MARLCheckpoints/{config["PROJECT"]}/{(run.name if run.name else run.id) if run else "GENERIC_RUN"}'
+        )
+
         checkpoint_manager = oxcp.CheckpointManager(
-             f'/home/myuser/checkpoints/MARLCheckpoints/{config["PROJECT"]}/{(run.name if run.name else run.id) if run else "GENERIC_RUN"}', orbax_checkpointer, options
-                )
+            checkpoint_path, # Dùng biến path vừa tạo
+            orbax_checkpointer, 
+            options
+        )
 
 
         
@@ -847,15 +1260,20 @@ def main(config):
     def sweep_fun():
         print(f"WANDB CONFIG PRIOR {wandb.config}")
 
-
         run=wandb.init(
             entity=config["ENTITY"], # type: ignore
             project=config["PROJECT"], # type: ignore
             tags=["IPPO", "RNN"], # type: ignore
-            config=config, # type: ignore
             mode=config["WANDB_MODE"], # type: ignore
             allow_val_change=True,
         )
+
+        sweep_overrides = OmegaConf.to_container(OmegaConf.create(dict(wandb.config)), resolve=True)
+        active_config = OmegaConf.to_container(
+            OmegaConf.merge(OmegaConf.create(copy.deepcopy(config)), OmegaConf.create(sweep_overrides)),
+            resolve=True,
+        )
+        run.config.update(active_config, allow_val_change=True)
 
         
         # params_file_name = f'params_file_{wandb.run.name}_{datetime.datetime.now().strftime("%m-%d_%H-%M")}'
@@ -865,34 +1283,34 @@ def main(config):
         # +++++ Single GPU +++++
         
 
-        rng = jax.random.PRNGKey(wandb.config["SEED"])
+        rng = jax.random.PRNGKey(active_config["SEED"])
 
-        print("wandb.config", wandb.config)
+        print("wandb.config", active_config)
 
         
         # print("+++++++++++ Training turned off whilst debugging wandb ++++++++++++")
         
 
 
-        if config["Timing"]:
+        if active_config["Timing"]:
             #print("Start compilation")
             #train_jit = jax.jit(make_train(wandb.config)).lower(rng).compile()
             print("Start training")
             start_time = time.time()
 
 
-        train_fun = make_train(wandb.config)
+        train_fun = make_train(active_config)
         out = train_fun(rng,run)
         # train_state = out['runner_state'][0] # runner_state.train_state
         # params = train_state.params
 
-        if config["Timing"]:
+        if active_config["Timing"]:
             end_time = time.time()
             elapsed = end_time - start_time
-            total_steps = config["TOTAL_TIMESTEPS"]
-            agents_per_type = config["NUM_AGENTS_PER_TYPE"]
-            num_data_msgs = config.get("n_data_msg_per_step", None)
-            num_envs = config["NUM_ENVS"]
+            total_steps = active_config["TOTAL_TIMESTEPS"]
+            agents_per_type = active_config["NUM_AGENTS_PER_TYPE"]
+            num_data_msgs = active_config.get("n_data_msg_per_step", None)
+            num_envs = active_config["NUM_ENVS"]
 
             # Print results
             print(f"Total steps: {total_steps}")
@@ -916,17 +1334,6 @@ def main(config):
             # Append if file exists, else write header
             with open(csv_path, "w", newline="") as f:
                 df.to_csv(f, index=False)
-        else:
-            print("Start compilation")
-            train_jit = jax.jit(make_train(wandb.config))
-            print("Start training")
-            out = train_jit(rng)
-
-        
-
-
-
-
         # # Save the params to a file using flax.serialization.to_bytes
         # with open(params_file_name, 'wb') as f:
         #     f.write(flax.serialization.to_bytes(params))
@@ -971,9 +1378,9 @@ def main(config):
                                         "reward_space" : {"values":["spooner","buy_sell_pnl"]}, # "spooner"buy_sell_pnl
                                         "reference_price_portfolio_value":{"values":["best_bid_ask"]}, #best_bid_ask "mid"
                         }},
-                        "Execution" : {"parameters": {"reward_lambda": {"values":[0.0]},
-                                                      "fixed_quant_value": {"values":[10]}, #20 on fixed quants
-                                                      "action_space": {"values":["fixed_quants_complex"]}, #fixed_quants,fixed_quants_complex
+                        "Execution" : {"parameters": {"reward_lambda": {"values":[0.5]},
+                                                      "observation_space": {"values": ["execution_policy"]}, #20 on fixed quants
+                                                      "action_space": {"values":["policy_blending"]}, #fixed_quants,fixed_quants_complex
                                                       "task_size": {"values":[600]},
                                                       "doom_price_penalty": {"values":[0.1]},
                         }},
