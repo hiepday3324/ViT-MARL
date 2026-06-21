@@ -1,0 +1,22 @@
+{
+  "data_source": "main_env_rollout",
+  "ep_type": "fixed_steps",
+  "episode_time": 50,
+  "start_resolution": 50,
+  "n_data_msg_per_step": 100,
+  "observation_space": "execution_policy",
+  "action_space": "policy_blending",
+  "n_levels": 10,
+  "feature_shape": [
+    10,
+    3,
+    2
+  ],
+  "dataset_standardization": false,
+  "normalization": "lob_feature_pipeline_only",
+  "pretrain_data_matches_ppo": true,
+  "action_collection_mode": "random_legal",
+  "rollout_num_envs": 128,
+  "rollout_num_steps": 50,
+  "seed": 0
+}

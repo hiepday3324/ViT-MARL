@@ -14,3 +14,6 @@
 *.pyc
 gymnax_exchange/jaxob/__pycache__/jaxob_config.cpython-311.pyc
 /wandb
+/outputs
+*.pyc
+gymnax_exchange/jaxen/__pycache__/mm_env.cpython-311.pyc
