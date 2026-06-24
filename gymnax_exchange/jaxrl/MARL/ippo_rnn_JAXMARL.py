@@ -354,6 +354,12 @@ def make_train(config):
             agent_type: config_dict[agent_type](**{k.lower(): v for k, v in agent_cfg.items()})
             for agent_type, agent_cfg in config["AGENT_CONFIGS"].items()
         }
+    elif "dict_of_agents_configs" in config:
+        agent_configs = {
+            agent_type: config_dict[agent_type](**agent_cfg)
+            for agent_type, agent_cfg in config["dict_of_agents_configs"].items()
+            if agent_type in config_dict
+        }
     print("agent_configs:", agent_configs)
     
 
@@ -1112,6 +1118,48 @@ def make_train(config):
                                 # Get agent short_name from config
                                 logging_dict[f"agent_{agent_name}/{key}_mean"] = float(np.mean(flat_value))
                                 logging_dict[f"agent_{agent_name}/{key}_std"] = float(np.std(flat_value))
+
+                    if agent_name == "EXE":
+                        agent_info = tr.info['agent']
+                        rewards = np.array(tr.reward).reshape(-1)
+
+                        def _flat_info(key, default=0.0):
+                            if key in agent_info:
+                                return np.array(agent_info[key]).reshape(-1)
+                            return np.full(rewards.shape, default, dtype=np.float32)
+
+                        def _masked_mean(values, mask):
+                            return float(np.mean(values[mask])) if np.any(mask) else float("nan")
+
+                        def _fmt(values):
+                            return "[" + ",".join(f"{float(v):.4g}" for v in np.array(values).reshape(-1)) + "]"
+
+                        doom_quant = _flat_info("doom_quant")
+                        quant_left = _flat_info("quant_left")
+                        agent_quant = _flat_info("agentQuant", np.nan)
+                        is_sell_task = _flat_info("is_sell_task").astype(bool)
+                        action_values = np.array(tr.action)
+                        if isinstance(env.action_spaces[agent_index], spaces.Discrete):
+                            action_2d = action_values.reshape(-1, 1)
+                        else:
+                            action_2d = action_values.reshape(-1, action_values.shape[-1])
+
+                        print(
+                            "EXE_DIAG "
+                            f"update={int(metric['update_steps'])} "
+                            f"avg_reward={float(np.array(metric['avg_reward'][agent_index])):.6g} "
+                            f"doom_count={int(np.sum(doom_quant > 0))} "
+                            f"doom_quant_mean={float(np.mean(doom_quant)):.6g} "
+                            f"doom_quant_max={float(np.max(doom_quant)):.6g} "
+                            f"quant_left_mean={float(np.mean(quant_left)):.6g} "
+                            f"quant_left_max={float(np.max(quant_left)):.6g} "
+                            f"agentQuant_mean={float(np.nanmean(agent_quant)):.6g} "
+                            f"buy_reward={_masked_mean(rewards, ~is_sell_task):.6g} "
+                            f"sell_reward={_masked_mean(rewards, is_sell_task):.6g} "
+                            f"action_mean={_fmt(np.mean(action_2d, axis=0))} "
+                            f"action_min={_fmt(np.min(action_2d, axis=0))} "
+                            f"action_max={_fmt(np.max(action_2d, axis=0))}"
+                        )
                     
                     # Process world info if available
                     if 'world' in tr.info and tr.info['world']:
@@ -1351,6 +1399,16 @@ def main(config):
         jax.clear_caches()
         jax.local_devices()  # This can help trigger cleanup of device buffers
         run.finish()
+
+    if config["WANDB_MODE"] == "disabled":
+        print("WANDB_MODE=disabled: running single-run without wandb.sweep()/wandb.agent().")
+        rng = jax.random.PRNGKey(config["SEED"])
+        train_fun = make_train(config)
+        out = train_fun(rng, None)
+        del out
+        gc.collect()
+        jax.clear_caches()
+        return
 
     # NOTE: Sweep Parameters will override the config file, but cannot be used to override any environment params currently. 
     # This latter option will require some careful thought on how best to implement - due to to variable number of agent types.

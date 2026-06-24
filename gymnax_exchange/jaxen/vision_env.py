@@ -2337,6 +2337,7 @@ class ExecutionAgent():
             # "quant_executed": agent_state.quant_executed,
             # "task_to_execute": agent_state.task_to_execute,
             "quant_left": new_quant_left,
+            "agentQuant": extras["agentQuant"],
             # "average_price": average_price,
             "done": done,
             "revenue_direction_normalised": extras["reward_lam1"],  # pure revenue is not informative if direction is random (-> flip and normalise)
