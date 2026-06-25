@@ -112,7 +112,8 @@ class ReliabilityFusionRNN(nn.Module):
         rnn_state = jnp.where(done_t[:, jnp.newaxis], jnp.zeros_like(carry), carry)
 
         reliability = LevelWiseReliabilityHead(
-            hidden_dim=self.config.get("reliability_hidden_dim", self.config["FC_DIM_SIZE"])
+            hidden_dim=self.config.get("reliability_hidden_dim", self.config["FC_DIM_SIZE"]),
+            gate_epsilon=self.config.get("reliability_gate_epsilon", 0.1),
         )
         reliability_scores_t, filtered_tokens_t = reliability(
             z_tokens=z_tokens_t,
@@ -148,7 +149,7 @@ class ActorCriticRNN(nn.Module):
 
             vision_encoder = VisionAgent(embed_dim=self.config["FC_DIM_SIZE"])
             z_tokens = vision_encoder(obs_vision, return_tokens=True)
-            z_vision = jnp.mean(z_tokens, axis=-2)
+            z_vision = jnp.mean(z_tokens, axis=(-3, -2))
 
             ema_module = EMASmoothing(alpha = 0.5)
             obs_exec_smoothed = ema_module(obs_exec)
@@ -295,7 +296,12 @@ def build_liquidity_survival_targets(
     survival_ratio,
     num_steps,
 ):
-    """Build level-wise survival labels from current and future LOB vision frames."""
+    """Build side-aware liquidity survival labels from LOB vision frames.
+
+    The returned labels and masks are shaped ``(time, batch, levels, sides)``.
+    Side 0 is Ask and side 1 is Bid; Ask/Bid are preserved as separate
+    reliability targets.
+    """
     vision_obs = jnp.asarray(vision_obs, dtype=jnp.float32)
     mid_prices = jnp.asarray(mid_prices, dtype=jnp.float32)
 
@@ -346,13 +352,10 @@ def build_liquidity_survival_targets(
     ask_label = matched_future_ask_volume >= survival_ratio * ask_volume
     bid_label = matched_future_bid_volume >= survival_ratio * bid_volume
 
-    level_mask = ask_mask | bid_mask
-    level_label = jnp.maximum(
-        ask_label.astype(jnp.float32) * ask_mask.astype(jnp.float32),
-        bid_label.astype(jnp.float32) * bid_mask.astype(jnp.float32),
-    )
+    side_mask = jnp.stack([ask_mask, bid_mask], axis=-1)
+    side_label = jnp.stack([ask_label & ask_mask, bid_label & bid_mask], axis=-1)
 
-    return level_label.astype(jnp.float32), level_mask.astype(jnp.float32)
+    return side_label.astype(jnp.float32), side_mask.astype(jnp.float32)
 
 
 def make_train(config):
@@ -723,7 +726,7 @@ def make_train(config):
                     )
                 else:
                     reward_shape = traj_batch_padded[i].reward.shape
-                    surv_label = jnp.zeros((config["NUM_STEPS"], reward_shape[1], 10), dtype=jnp.float32)
+                    surv_label = jnp.zeros((config["NUM_STEPS"], reward_shape[1], 10, 2), dtype=jnp.float32)
                     surv_mask = jnp.zeros_like(surv_label)
                 survival_labels.append(surv_label)
                 survival_masks.append(surv_mask)

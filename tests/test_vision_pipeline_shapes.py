@@ -29,9 +29,9 @@ class VisionPipelineShapeTest(unittest.TestCase):
         tokens = vision.apply(vision_params, vision_obs, return_tokens=True)
         pooled = vision.apply(vision_params, vision_obs)
 
-        self.assertEqual(tokens.shape, (time_steps, batch_size, 10, embed_dim))
+        self.assertEqual(tokens.shape, (time_steps, batch_size, 10, 2, embed_dim))
         self.assertEqual(pooled.shape, (time_steps, batch_size, embed_dim))
-        self.assertTrue(bool(jnp.allclose(pooled, jnp.mean(tokens, axis=-2), atol=1e-5)))
+        self.assertTrue(bool(jnp.allclose(pooled, jnp.mean(tokens, axis=(-3, -2)), atol=1e-5)))
 
         ema = EMASmoothing(alpha=0.5)
         ema_params = ema.init(rng, exec_obs)
@@ -42,6 +42,10 @@ class VisionPipelineShapeTest(unittest.TestCase):
         fusion_params = fusion.init(rng, smoothed, tokens)
         fused = fusion.apply(fusion_params, smoothed, tokens)
         self.assertEqual(fused.shape, (time_steps, batch_size, embed_dim // 2))
+
+        legacy_tokens = jnp.mean(tokens, axis=-2)
+        legacy_fused = fusion.apply(fusion_params, smoothed, legacy_tokens)
+        self.assertEqual(legacy_fused.shape, (time_steps, batch_size, embed_dim // 2))
 
         reliability = LevelWiseReliabilityHead(hidden_dim=64)
         h_prev = jnp.ones((batch_size, embed_dim), dtype=jnp.float32)
@@ -60,7 +64,7 @@ class VisionPipelineShapeTest(unittest.TestCase):
             h_prev=h_prev,
             tick_shift=tick_shift,
         )
-        self.assertEqual(reliability_scores.shape, (time_steps, batch_size, 10, 1))
+        self.assertEqual(reliability_scores.shape, (time_steps, batch_size, 10, 2, 1))
         self.assertEqual(filtered_tokens.shape, tokens.shape)
         self.assertTrue(bool(jnp.all(reliability_scores >= 0.0)))
         self.assertTrue(bool(jnp.all(reliability_scores <= 1.0)))
@@ -75,7 +79,7 @@ class VisionPipelineShapeTest(unittest.TestCase):
             h_prev=h_prev,
             tick_shift=tick_shift[0],
         )
-        self.assertEqual(single_scores.shape, (batch_size, 10, 1))
+        self.assertEqual(single_scores.shape, (batch_size, 10, 2, 1))
         self.assertEqual(single_filtered.shape, tokens[0].shape)
         single_fused = fusion.apply(fusion_params, smoothed[0], single_filtered)
         self.assertEqual(single_fused.shape, (batch_size, embed_dim // 2))

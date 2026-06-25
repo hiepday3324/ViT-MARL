@@ -5,7 +5,7 @@ from typing import Dict
 
 
 class VisionAgent(nn.Module):
-    """Encode orderbook matrices into level-centered contextual tokens."""
+    """Encode orderbook matrices into side-aware level-wise tokens."""
 
     embed_dim: int
     hidden_size: int = 128
@@ -16,11 +16,11 @@ class VisionAgent(nn.Module):
     def __call__(self, x, *, train: bool = False, return_tokens: bool = False):
         """Encode LOB observations.
 
-        Inputs are shaped ``(..., levels, features, sides)``. The returned
-        tokens are level-centered contextual tokens: token ``k`` still maps to
-        LOB level ``k``, but includes local context from neighboring levels.
-        The default output is pooled over levels; ``return_tokens=True``
-        preserves per-level tokens for cross-attention and reliability heads.
+        Inputs are shaped ``(..., levels, features, sides)``. With
+        ``return_tokens=True`` the output is shaped
+        ``(..., levels, sides, embed_dim)`` so Ask and Bid remain separate
+        tokens at each level. The default output is pooled over both levels and
+        sides.
         """
         del train
         x = jnp.asarray(x, dtype=jnp.float32)
@@ -29,28 +29,28 @@ class VisionAgent(nn.Module):
         if x.ndim < 3:
             raise ValueError(f"VisionAgent expects at least 3 dims, got shape {x.shape}")
 
-        raw_levels = x.reshape(*x.shape[:-3], x.shape[-3], -1)
-        self_tokens = nn.Dense(self.hidden_size, name="self_fc")(raw_levels)
+        side_features = jnp.swapaxes(x, -1, -2)
+
+        self_tokens = nn.Dense(self.hidden_size, name="self_fc")(side_features)
         self_tokens = nn.relu(self_tokens)
         self_tokens = nn.Dense(self.embed_dim, name="self_embed")(self_tokens)
 
         context = nn.Conv(
             features=self.hidden_size,
-            kernel_size=(3, 2),
+            kernel_size=(3, 1),
             padding="SAME",
             name="context_conv_1",
-        )(x)
+        )(side_features)
         context = nn.relu(context)
         context = nn.LayerNorm(name="context_norm_1")(context)
         context = nn.Conv(
             features=self.hidden_size,
-            kernel_size=(3, 2),
+            kernel_size=(3, 1),
             padding="SAME",
             name="context_conv_2",
         )(context)
         context = nn.relu(context)
         context = nn.LayerNorm(name="context_norm_2")(context)
-        context = jnp.mean(context, axis=-2)
         context_tokens = nn.Dense(self.hidden_size, name="context_fc")(context)
         context_tokens = nn.relu(context_tokens)
         context_tokens = nn.Dense(self.embed_dim, name="context_embed")(context_tokens)
@@ -69,13 +69,13 @@ class VisionAgent(nn.Module):
         else:
             alpha = jnp.asarray(alpha_init, dtype=self_tokens.dtype)
 
-        level_tokens = self_tokens + alpha * context_tokens
-        level_tokens = nn.LayerNorm(name="token_norm")(level_tokens)
+        level_side_tokens = self_tokens + alpha * context_tokens
+        level_side_tokens = nn.LayerNorm(name="token_norm")(level_side_tokens)
 
         if return_tokens:
-            return level_tokens
+            return level_side_tokens
 
-        return jnp.mean(level_tokens, axis=-2)
+        return jnp.mean(level_side_tokens, axis=(-3, -2))
 
 
 def _l2_normalize(x: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:

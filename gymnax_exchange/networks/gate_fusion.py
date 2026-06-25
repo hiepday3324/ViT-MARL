@@ -25,7 +25,7 @@ class EMASmoothing(nn.Module):
 
 
 class StableGatedCrossAttention(nn.Module):
-    """Cross-attend smoothed numeric state to per-level vision tokens."""
+    """Cross-attend smoothed numeric state to vision tokens."""
 
     d_model: int = 128
 
@@ -34,19 +34,25 @@ class StableGatedCrossAttention(nn.Module):
         """Fuse execution observations and vision tokens.
 
         ``o_t_smoothed`` is ``(time, batch, exec_features)``.
-        ``z_t`` is either ``(time, batch, levels, vision_features)`` or a pooled
-        ``(time, batch, vision_features)`` tensor. The pooled form is accepted as
-        a compatibility fallback, but meaningful attention requires level tokens.
+        ``z_t`` is either side-aware
+        ``(time, batch, levels, sides, vision_features)``, legacy per-level
+        ``(time, batch, levels, vision_features)``, or a pooled
+        ``(time, batch, vision_features)`` tensor. Side-aware tokens are
+        flattened internally into ``levels * sides`` attention tokens:
+        L1-Ask, L1-Bid, L2-Ask, L2-Bid, ...
         """
         o_t_smoothed = jnp.asarray(o_t_smoothed, dtype=jnp.float32)
         z_t = jnp.asarray(z_t, dtype=jnp.float32)
 
         if z_t.ndim == o_t_smoothed.ndim:
             z_t = z_t[..., None, :]
+        elif z_t.ndim == o_t_smoothed.ndim + 2:
+            z_t = z_t.reshape(*z_t.shape[:-3], z_t.shape[-3] * z_t.shape[-2], z_t.shape[-1])
         if z_t.ndim != o_t_smoothed.ndim + 1:
             raise ValueError(
                 "StableGatedCrossAttention expects vision tokens shaped "
-                f"{o_t_smoothed.shape[:-1]} + (levels, features), got {z_t.shape}"
+                f"{o_t_smoothed.shape[:-1]} + (levels, features) or "
+                f"{o_t_smoothed.shape[:-1]} + (levels, sides, features), got {z_t.shape}"
             )
 
         query = nn.Dense(self.d_model, name="W_Q")(o_t_smoothed)
