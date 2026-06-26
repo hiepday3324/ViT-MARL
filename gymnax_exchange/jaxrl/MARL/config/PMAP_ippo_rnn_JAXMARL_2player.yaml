@@ -16,6 +16,13 @@
 "survival_delta_steps": 10
 "survival_min_volume": 1.0
 "survival_ratio": 0.5
+"survival_target_mode": "actionability_weighted_min_horizon"
+"actionability_mode": "passive_limit"
+"actionability_eta": 0.1
+"actionability_depth": 3
+"actionability_far_level_weight": 0.25
+"reliability_loss_type": "bce"
+"survival_eps": 1e-8
 "TOTAL_TIMESTEPS": 1e10
 "UPDATE_EPOCHS": 4
 "NUM_MINIBATCHES": 16

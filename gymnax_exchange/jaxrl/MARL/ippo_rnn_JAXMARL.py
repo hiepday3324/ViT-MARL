@@ -49,6 +49,11 @@ from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig,Execution_Enviro
 from gymnax_exchange.networks.gate_fusion import EMASmoothing, StableGatedCrossAttention
 from gymnax_exchange.networks.reliability_head import LevelWiseReliabilityHead
 from gymnax_exchange.networks.vision_agent import VisionAgent, supervised_contrastive_loss
+from gymnax_exchange.jaxrl.MARL.reliability_targets import (
+    build_liquidity_survival_targets,
+    masked_reliability_loss,
+    resolve_rollout_is_sell_task,
+)
 import wandb
 import functools
 import matplotlib.pyplot as plt
@@ -259,90 +264,6 @@ def unbatchify(x, num_envs, num_agents):
         return y.reshape((num_envs, num_agents, *y.shape[1:]))
 
     return jax.tree_util.tree_map(_unbatchify, x)
-
-
-def masked_bce_loss(reliability_scores, labels, mask, eps=1e-8):
-    if reliability_scores.ndim == labels.ndim + 1:
-        reliability_scores = jnp.squeeze(reliability_scores, axis=-1)
-
-    r = jnp.clip(reliability_scores, eps, 1.0 - eps)
-    y = labels.astype(jnp.float32)
-    m = mask.astype(jnp.float32)
-
-    bce = -(y * jnp.log(r) + (1.0 - y) * jnp.log(1.0 - r))
-    return jnp.sum(bce * m) / jnp.maximum(jnp.sum(m), eps)
-
-
-def build_liquidity_survival_targets(
-    vision_obs,
-    mid_prices,
-    *,
-    tick_size,
-    survival_delta_steps,
-    survival_min_volume,
-    survival_ratio,
-    num_steps,
-):
-    """Build side-aware liquidity survival labels from LOB vision frames.
-
-    The returned labels and masks are shaped ``(time, batch, levels, sides)``.
-    Side 0 is Ask and side 1 is Bid; Ask/Bid are preserved as separate
-    reliability targets.
-    """
-    vision_obs = jnp.asarray(vision_obs, dtype=jnp.float32)
-    mid_prices = jnp.asarray(mid_prices, dtype=jnp.float32)
-
-    if mid_prices.ndim == 1:
-        mid_prices = mid_prices[:, None]
-    if mid_prices.shape[1] != vision_obs.shape[1]:
-        if vision_obs.shape[1] % mid_prices.shape[1] != 0:
-            raise ValueError(
-                "Cannot broadcast world mid_prices to actor vision observations: "
-                f"mid_prices batch={mid_prices.shape[1]}, vision batch={vision_obs.shape[1]}."
-            )
-        repeat_factor = vision_obs.shape[1] // mid_prices.shape[1]
-        mid_prices = jnp.repeat(mid_prices, repeat_factor, axis=1)
-
-    current_obs = vision_obs[:num_steps]
-    future_obs = vision_obs[survival_delta_steps:survival_delta_steps + num_steps]
-    current_mid = mid_prices[:num_steps, :, None]
-    future_mid = mid_prices[survival_delta_steps:survival_delta_steps + num_steps, :, None]
-
-    ask_gap = current_obs[..., 0, 0]
-    bid_gap = current_obs[..., 0, 1]
-    ask_volume = jnp.expm1(current_obs[..., 1, 0])
-    bid_volume = jnp.expm1(current_obs[..., 1, 1])
-
-    future_ask_gap = future_obs[..., 0, 0]
-    future_bid_gap = future_obs[..., 0, 1]
-    future_ask_volume = jnp.expm1(future_obs[..., 1, 0])
-    future_bid_volume = jnp.expm1(future_obs[..., 1, 1])
-
-    tick_size = jnp.asarray(tick_size, dtype=jnp.float32)
-    ask_key = jnp.rint((current_mid + ask_gap * tick_size) / tick_size)
-    bid_key = jnp.rint((current_mid - bid_gap * tick_size) / tick_size)
-    future_ask_key = jnp.rint((future_mid + future_ask_gap * tick_size) / tick_size)
-    future_bid_key = jnp.rint((future_mid - future_bid_gap * tick_size) / tick_size)
-
-    ask_mask = ask_volume >= survival_min_volume
-    bid_mask = bid_volume >= survival_min_volume
-    ask_matches = future_ask_key[..., None, :] == ask_key[..., :, None]
-    bid_matches = future_bid_key[..., None, :] == bid_key[..., :, None]
-    matched_future_ask_volume = jnp.max(
-        jnp.where(ask_matches, future_ask_volume[..., None, :], 0.0),
-        axis=-1,
-    )
-    matched_future_bid_volume = jnp.max(
-        jnp.where(bid_matches, future_bid_volume[..., None, :], 0.0),
-        axis=-1,
-    )
-    ask_label = matched_future_ask_volume >= survival_ratio * ask_volume
-    bid_label = matched_future_bid_volume >= survival_ratio * bid_volume
-
-    side_mask = jnp.stack([ask_mask, bid_mask], axis=-1)
-    side_label = jnp.stack([ask_label & ask_mask, bid_label & bid_mask], axis=-1)
-
-    return side_label.astype(jnp.float32), side_mask.astype(jnp.float32)
 
 
 def make_train(config):
@@ -667,6 +588,20 @@ def make_train(config):
                 volatility_labels.append(labels)
 
                 if isinstance(traj_batch_padded[i].obs, dict) and "vision_obs" in traj_batch_padded[i].obs:
+                    survival_target_mode = config.get(
+                        "survival_target_mode",
+                        "actionability_weighted_min_horizon",
+                    )
+                    if survival_target_mode == "actionability_weighted_min_horizon":
+                        execution_task = getattr(env.list_of_agents_configs[i], "task", None)
+                        is_sell_task = resolve_rollout_is_sell_task(
+                            traj_batch_padded[i].info["agent"],
+                            task=execution_task,
+                            num_steps=config["NUM_STEPS"],
+                            batch_size=traj_batch_padded[i].obs["vision_obs"].shape[1],
+                        )
+                    else:
+                        is_sell_task = None
                     surv_label, surv_mask = build_liquidity_survival_targets(
                         traj_batch_padded[i].obs["vision_obs"],
                         mid_prices,
@@ -675,6 +610,16 @@ def make_train(config):
                         survival_min_volume=config.get("survival_min_volume", 1.0),
                         survival_ratio=config.get("survival_ratio", 0.5),
                         num_steps=config["NUM_STEPS"],
+                        survival_target_mode=survival_target_mode,
+                        is_sell_task=is_sell_task,
+                        actionability_mode=config.get("actionability_mode", "passive_limit"),
+                        actionability_eta=config.get("actionability_eta", 0.1),
+                        actionability_depth=config.get("actionability_depth", 3),
+                        actionability_far_level_weight=config.get(
+                            "actionability_far_level_weight",
+                            0.25,
+                        ),
+                        eps=config.get("survival_eps", 1e-8),
                     )
                 else:
                     reward_shape = traj_batch_padded[i].reward.shape
@@ -818,7 +763,14 @@ def make_train(config):
                                 and isinstance(traj_batch.obs, dict)
                             ):
                                 reliability_scores = aux_info["reliability_scores"]
-                                survival_loss = masked_bce_loss(reliability_scores, surv_labels, surv_mask)
+                                # Soft targets use the same auxiliary slot as the legacy survival loss.
+                                survival_loss = masked_reliability_loss(
+                                    reliability_scores,
+                                    surv_labels,
+                                    surv_mask,
+                                    loss_type=config.get("reliability_loss_type", "bce"),
+                                    eps=config.get("survival_eps", 1e-8),
+                                )
                                 lambda_surv = config.get("lambda_surv", 0.0)
                                 survival_mask_ratio = jnp.mean(surv_mask.astype(jnp.float32))
                                 reliability_mean = jnp.mean(reliability_scores)

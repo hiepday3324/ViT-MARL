@@ -3,13 +3,13 @@ from flax import linen as nn
 
 
 class LevelWiseReliabilityHead(nn.Module):
-    """Estimate side-aware liquidity reliability ``r_{t,k,s}``."""
+    """Estimate side-aware liquidity reliability ``r_{t,k,s}``.
+
+    Side-awareness comes from the token tensor's ``(levels, sides, features)``
+    structure. The head does not use learned level-rank or side-ID embeddings.
+    """
 
     hidden_dim: int = 128
-    level_embed_dim: int = 16
-    side_embed_dim: int = 8
-    max_levels: int = 64
-    max_sides: int = 2
     gate_epsilon: float = 0.1
 
     @nn.compact
@@ -42,12 +42,19 @@ class LevelWiseReliabilityHead(nn.Module):
             squeeze_time = True
             squeeze_legacy_side = True
         elif z_tokens.ndim == 4:
-            if z_tokens.shape[-2] == self.max_sides:
+            if obs_exec.ndim == 2:
                 z_tokens = z_tokens[None, ...]
                 squeeze_time = True
-            else:
+            elif obs_exec.ndim == 3:
                 z_tokens = z_tokens[..., None, :]
                 squeeze_legacy_side = True
+            else:
+                raise ValueError(
+                    "Cannot distinguish single-step side-aware tokens from legacy "
+                    "time-major tokens without obs_exec shaped (batch, features) "
+                    "or (time, batch, features); "
+                    f"got {obs_exec.shape}."
+                )
         elif z_tokens.ndim != 5:
             raise ValueError(
                 "z_tokens must be side-aware (time, batch, levels, sides, features), "
@@ -104,30 +111,12 @@ class LevelWiseReliabilityHead(nn.Module):
         obs_exec = jnp.broadcast_to(obs_exec[:, :, None, None, :], (time_steps, batch_size, n_levels, n_sides, obs_exec.shape[-1]))
         h_prev = jnp.broadcast_to(h_prev[:, :, None, None, :], (time_steps, batch_size, n_levels, n_sides, h_prev.shape[-1]))
 
-        level_ids = jnp.arange(n_levels, dtype=jnp.int32)
-        level_emb = nn.Embed(
-            num_embeddings=self.max_levels,
-            features=self.level_embed_dim,
-            name="level_embed",
-        )(level_ids)
-        level_emb = jnp.broadcast_to(level_emb[None, None, :, None, :], (time_steps, batch_size, n_levels, n_sides, self.level_embed_dim))
-
-        side_ids = jnp.arange(n_sides, dtype=jnp.int32)
-        side_emb = nn.Embed(
-            num_embeddings=max(self.max_sides, n_sides),
-            features=self.side_embed_dim,
-            name="side_embed",
-        )(side_ids)
-        side_emb = jnp.broadcast_to(side_emb[None, None, None, :, :], (time_steps, batch_size, n_levels, n_sides, self.side_embed_dim))
-
         z_proj = nn.relu(nn.Dense(self.hidden_dim, name="z_proj")(z_tokens))
         obs_proj = nn.relu(nn.Dense(self.hidden_dim, name="obs_proj")(obs_exec))
         h_proj = nn.relu(nn.Dense(self.hidden_dim, name="h_proj")(h_prev))
         shift_proj = nn.relu(nn.Dense(self.hidden_dim, name="shift_proj")(tick_shift))
-        level_proj = nn.relu(nn.Dense(self.hidden_dim, name="level_proj")(level_emb))
-        side_proj = nn.relu(nn.Dense(self.hidden_dim, name="side_proj")(side_emb))
 
-        x = jnp.concatenate([z_proj, obs_proj, h_proj, shift_proj, level_proj, side_proj], axis=-1)
+        x = jnp.concatenate([z_proj, obs_proj, h_proj, shift_proj], axis=-1)
         x = nn.relu(nn.Dense(self.hidden_dim, name="mlp_l1")(x))
         x = nn.relu(nn.Dense(self.hidden_dim, name="mlp_l2")(x))
         reliability_scores = nn.sigmoid(nn.Dense(1, name="score")(x))

@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import os
 import sys
+from flax.traverse_util import flatten_dict
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, ".."))
@@ -57,6 +58,12 @@ class VisionPipelineShapeTest(unittest.TestCase):
             h_prev=h_prev,
             tick_shift=tick_shift,
         )
+        flat_params = flatten_dict(reliability_params["params"])
+        param_names = ["/".join(key) for key in flat_params]
+        self.assertFalse(any("level_embed" in name for name in param_names))
+        self.assertFalse(any("level_proj" in name for name in param_names))
+        self.assertFalse(any("side_embed" in name for name in param_names))
+        self.assertFalse(any("side_proj" in name for name in param_names))
         reliability_scores, filtered_tokens = reliability.apply(
             reliability_params,
             z_tokens=tokens,
