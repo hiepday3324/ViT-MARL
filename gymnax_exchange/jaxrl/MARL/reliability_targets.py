@@ -104,6 +104,62 @@ def _matched_future_volumes(current_key, future_key, future_volume):
     )
 
 
+def _normalize_episode_done(episode_done, *, required_steps, batch_size):
+    """Normalize post-step actor done flags to ``(time, batch)``."""
+    if episode_done is None:
+        return jnp.zeros((required_steps, batch_size), dtype=jnp.bool_)
+
+    episode_done = jnp.asarray(episode_done, dtype=jnp.bool_)
+    if episode_done.ndim == 3:
+        if episode_done.shape[-1] != 1:
+            raise ValueError(
+                "episode_done with three dimensions must have trailing size one; "
+                f"got {episode_done.shape}."
+            )
+        episode_done = jnp.squeeze(episode_done, axis=-1)
+
+    if episode_done.ndim == 1:
+        if episode_done.shape[0] < required_steps:
+            raise ValueError(
+                "episode_done must include the full current plus future horizon: "
+                f"need at least {required_steps}, got {episode_done.shape[0]}."
+            )
+        return jnp.broadcast_to(
+            episode_done[:required_steps, None],
+            (required_steps, batch_size),
+        )
+
+    if episode_done.ndim == 2:
+        if episode_done.shape[0] < required_steps:
+            raise ValueError(
+                "episode_done must include the full current plus future horizon: "
+                f"need at least {required_steps}, got {episode_done.shape[0]}."
+            )
+        episode_done = episode_done[:required_steps]
+        if episode_done.shape[1] == batch_size:
+            return episode_done
+        if episode_done.shape[1] == 1:
+            return jnp.broadcast_to(episode_done, (required_steps, batch_size))
+        raise ValueError(
+            "episode_done batch dimension must match vision observations or be one; "
+            f"got {episode_done.shape[1]}, expected {batch_size}."
+        )
+
+    raise ValueError(
+        "episode_done must be shaped (time,), (time, batch), or "
+        f"(time, batch, 1); got {episode_done.shape}."
+    )
+
+
+def _build_valid_horizon_mask(episode_done, *, num_steps, survival_delta_steps):
+    """Return samples whose inclusive interval ``[t, t + Delta]`` has no done."""
+    invalid_windows = [
+        episode_done[tau:tau + num_steps]
+        for tau in range(survival_delta_steps + 1)
+    ]
+    return ~jnp.any(jnp.stack(invalid_windows, axis=0), axis=0)
+
+
 def build_liquidity_survival_targets(
     vision_obs,
     mid_prices,
@@ -113,6 +169,7 @@ def build_liquidity_survival_targets(
     survival_min_volume,
     survival_ratio,
     num_steps,
+    episode_done=None,
     survival_target_mode="actionability_weighted_min_horizon",
     is_sell_task=None,
     actionability_mode="passive_limit",
@@ -125,8 +182,11 @@ def build_liquidity_survival_targets(
 
     Inputs use the existing LOB contract ``(time, batch, levels, features,
     sides)``. Outputs are ``(time, batch, levels, sides)`` with side order
-    ``[Ask, Bid]``. The actionability-weighted mode uses a soft minimum-horizon
-    volume-survival target, attenuating less executable sides and far levels.
+    ``[Ask, Bid]``. ``episode_done`` is an optional post-step, actor-aligned
+    done flag; any done in the inclusive interval ``[t, t + Delta]`` masks
+    that target from the reliability loss without changing its label value.
+    The actionability-weighted mode uses a soft minimum-horizon volume-survival
+    target, attenuating less executable sides and far levels.
     """
     valid_modes = {
         "final_step_binary",
@@ -199,7 +259,18 @@ def build_liquidity_survival_targets(
         final_matched_ask_volume = matched_ask_volume
         final_matched_bid_volume = matched_bid_volume
 
+    episode_done = _normalize_episode_done(
+        episode_done,
+        required_steps=required_steps,
+        batch_size=vision_obs.shape[1],
+    )
+    valid_horizon = _build_valid_horizon_mask(
+        episode_done,
+        num_steps=num_steps,
+        survival_delta_steps=survival_delta_steps,
+    )
     side_mask = jnp.stack([ask_mask, bid_mask], axis=-1)
+    side_mask = side_mask & valid_horizon[:, :, None, None]
     if survival_target_mode == "final_step_binary":
         ask_label = final_matched_ask_volume >= survival_ratio * ask_volume
         bid_label = final_matched_bid_volume >= survival_ratio * bid_volume

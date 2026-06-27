@@ -92,6 +92,39 @@ class ReliabilityTargetTest(unittest.TestCase):
         self.assertAlmostEqual(float(sell_labels[0, 0, 0, 0]), 1.0, places=5)
         self.assertAlmostEqual(float(sell_labels[0, 0, 0, 1]), 0.1, places=5)
 
+    def test_episode_done_masks_the_inclusive_horizon_without_changing_labels(self):
+        vision_obs = self._make_vision_obs(time_steps=4)
+        labels_without_done, mask_without_done = self._build_targets(
+            vision_obs,
+            mode="min_horizon_soft",
+            delta=2,
+        )
+
+        for done_index in (0, 1, 2):
+            with self.subTest(done_index=done_index):
+                episode_done = jnp.zeros((4, 1, 1), dtype=jnp.bool_)
+                episode_done = episode_done.at[done_index, 0, 0].set(True)
+                labels_with_done, mask_with_done = self._build_targets(
+                    vision_obs,
+                    mode="min_horizon_soft",
+                    delta=2,
+                    episode_done=episode_done,
+                )
+                self.assertTrue(bool(jnp.allclose(labels_with_done, labels_without_done)))
+                self.assertTrue(bool(jnp.all(mask_with_done[0, 0] == 0.0)))
+
+        done_after_horizon = jnp.zeros((4, 1), dtype=jnp.bool_)
+        done_after_horizon = done_after_horizon.at[3, 0].set(True)
+        labels_after_horizon, mask_after_horizon = self._build_targets(
+            vision_obs,
+            mode="min_horizon_soft",
+            delta=2,
+            episode_done=done_after_horizon,
+        )
+        self.assertTrue(bool(jnp.allclose(labels_after_horizon, labels_without_done)))
+        self.assertTrue(bool(jnp.all(mask_after_horizon[0, 0] == mask_without_done[0, 0])))
+        self.assertTrue(bool(jnp.any(mask_after_horizon[0, 0] == 1.0)))
+
     def test_masked_reliability_loss_accepts_soft_labels_for_bce_and_mse(self):
         scores = jnp.array([[[[[0.2], [0.8]], [[0.5], [0.4]]]]], dtype=jnp.float32)
         labels = jnp.array([[[[0.1, 0.9], [0.3, 0.7]]]], dtype=jnp.float32)
