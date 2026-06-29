@@ -635,7 +635,11 @@ def make_train(config):
                          jnp.where(future_vol > config.get("VOL_LOW", 0.005), 1, 0))
                 volatility_labels.append(labels)
 
-                if isinstance(traj_batch_padded[i].obs, dict) and "vision_obs" in traj_batch_padded[i].obs:
+                if (
+                    config.get("use_survival_loss", False)
+                    and isinstance(traj_batch_padded[i].obs, dict)
+                    and "vision_obs" in traj_batch_padded[i].obs
+                ):
                     survival_target_mode = config.get(
                         "survival_target_mode",
                         "actionability_weighted_min_horizon",
@@ -796,14 +800,14 @@ def make_train(config):
                             )
 
                             # TÍNH SUPCON LOSS CHO VISION AGENT
-                            if isinstance(traj_batch.obs, dict):
+                            use_supcon_loss = config.get("use_supcon_loss", True)
+                            lambda_supcon = config.get("lambda_supcon", config.get("SUPCON_ALPHA", 0.1))
+                            if use_supcon_loss and lambda_supcon != 0.0 and isinstance(traj_batch.obs, dict):
                                 z_flat = z_vision.reshape(-1, z_vision.shape[-1])
                                 labels_flat = vol_labels.reshape(-1)
                                 supcon_loss = supervised_contrastive_loss(z_flat, labels_flat, temperature=0.1)
-                                alpha = config.get("SUPCON_ALPHA", 0.1)
                             else:
                                 supcon_loss = jnp.array(0.0)
-                                alpha = jnp.array(0.0)
 
                             # LOSS CUỐI CÙNG (Cộng PPO và SupCon có hệ số)
                             if (
@@ -829,8 +833,12 @@ def make_train(config):
                                 survival_mask_ratio = jnp.array(0.0)
                                 reliability_mean = jnp.array(0.0)
 
+                            if use_supcon_loss and lambda_supcon != 0.0:
+                                weighted_supcon_loss = lambda_supcon * supcon_loss
+                            else:
+                                weighted_supcon_loss = jnp.array(0.0)
                             weighted_survival_loss = lambda_surv * survival_loss
-                            total_loss = ppo_loss + alpha * supcon_loss + weighted_survival_loss
+                            total_loss = ppo_loss + weighted_supcon_loss + weighted_survival_loss
 
                             # debug
                             approx_kl = ((ratio - 1) - logratio).mean()
@@ -848,6 +856,7 @@ def make_train(config):
                                 weighted_survival_loss,
                                 survival_mask_ratio,
                                 reliability_mean,
+                                weighted_supcon_loss,
                             )
                         grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                         total_loss, grads = grad_fn(
@@ -963,10 +972,12 @@ def make_train(config):
                     "ratio_0": ratio_0,
                     "approx_kl": loss_info[1][4],
                     "clip_frac": loss_info[1][5],
+                    "supcon_loss": loss_info[1][6],
                     "survival_loss": loss_info[1][7],
                     "weighted_survival_loss": loss_info[1][8],
                     "survival_mask_ratio": loss_info[1][9],
                     "reliability_mean": loss_info[1][10],
+                    "weighted_supcon_loss": loss_info[1][11],
                     "weighted_entropy_loss": loss_info[1][2] * config["ENT_COEF"][i],
                     "weighted_value_loss": loss_info[1][0] * config["VF_COEF"][i],
                 })

@@ -146,6 +146,7 @@ def supervised_contrastive_loss(embeddings, labels, temperature=0.1):
     mask = mask - self_mask
     logits = jnp.where(self_mask.astype(bool), -jnp.inf, logits)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
+    log_probs = jnp.where(self_mask.astype(bool), 0.0, log_probs)
     num_positives = jnp.maximum(mask.sum(axis=1), eps)
     log_prob_positives = jnp.sum(mask * log_probs, axis=1) / num_positives
 

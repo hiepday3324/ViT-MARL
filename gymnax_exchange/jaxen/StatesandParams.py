@@ -48,6 +48,8 @@ from typing import Any
 import chex
 
 
+ITT_WINDOW_SIZE = 64
+
 
 ########################################################################################
 ########################################################################################
@@ -111,6 +113,12 @@ class ExecEnvState():
     vwap_rm: float
     is_sell_task: int
     trade_duration: float
+    rl_vol_window: jnp.ndarray
+    rl_cost_window: jnp.ndarray
+    base_vol_window: jnp.ndarray
+    base_cost_window: jnp.ndarray
+    reward_window_ptr: jnp.int32
+    reward_window_count: jnp.int32
 
 
 

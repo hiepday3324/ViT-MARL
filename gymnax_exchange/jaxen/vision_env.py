@@ -122,7 +122,7 @@ from gymnax_exchange.jaxen.base_env import BaseLOBEnv
 from gymnax_exchange.utils import utils
 import dataclasses
 from gymnax_exchange.jaxob.jaxob_config import Execution_EnvironmentConfig,World_EnvironmentConfig
-from gymnax_exchange.jaxen.StatesandParams import ExecEnvState, ExecEnvParams, WorldState
+from gymnax_exchange.jaxen.StatesandParams import ExecEnvState, ExecEnvParams, WorldState, ITT_WINDOW_SIZE
 from gymnax_exchange.jaxob.jaxob_config import World_EnvironmentConfig
 from gymnax_exchange.jaxen.StatesandParams import MultiAgentState, WorldState
 
@@ -132,6 +132,84 @@ import jax.tree_util as jtu
 
 ACTION_LOW = jnp.array([-1.0, 0.0, 0.0], dtype=jnp.float32)
 ACTION_HIGH = jnp.array([3.0, 1.0, 1.0], dtype=jnp.float32)
+
+
+def _zero_itt_reward_window():
+    return jnp.zeros((ITT_WINDOW_SIZE,), dtype=jnp.float32)
+
+
+def _update_itt_reward_window(
+        rl_vol_window,
+        rl_cost_window,
+        base_vol_window,
+        base_cost_window,
+        reward_window_ptr,
+        reward_window_count,
+        V_RL_step,
+        C_RL_step,
+        V_base_step,
+        C_base_step):
+    reward_window_ptr = jnp.asarray(reward_window_ptr, dtype=jnp.int32)
+    reward_window_count = jnp.asarray(reward_window_count, dtype=jnp.int32)
+    idx = reward_window_ptr % ITT_WINDOW_SIZE
+
+    rl_vol_window = rl_vol_window.at[idx].set(jnp.asarray(V_RL_step, dtype=jnp.float32))
+    rl_cost_window = rl_cost_window.at[idx].set(jnp.asarray(C_RL_step, dtype=jnp.float32))
+    base_vol_window = base_vol_window.at[idx].set(jnp.asarray(V_base_step, dtype=jnp.float32))
+    base_cost_window = base_cost_window.at[idx].set(jnp.asarray(C_base_step, dtype=jnp.float32))
+
+    reward_window_ptr = reward_window_ptr + jnp.array(1, dtype=jnp.int32)
+    reward_window_count = jnp.minimum(
+        reward_window_count + jnp.array(1, dtype=jnp.int32),
+        jnp.array(ITT_WINDOW_SIZE, dtype=jnp.int32),
+    )
+    return (
+        rl_vol_window,
+        rl_cost_window,
+        base_vol_window,
+        base_cost_window,
+        reward_window_ptr,
+        reward_window_count,
+    )
+
+
+def _compute_windowed_itt_reward(
+        V_RL_k,
+        C_RL_k,
+        V_base_k,
+        C_base_k,
+        p_benchmark_tick,
+        is_sell_task,
+        doom_quant,
+        task_to_execute,
+        reward_lambda,
+        terminal_penalty_beta):
+    matched_base_cost = C_base_k + (V_RL_k - V_base_k) * p_benchmark_tick
+    direction_switch = jnp.where(is_sell_task, 1.0, -1.0)
+    r_comp_raw = direction_switch * (C_RL_k - matched_base_cost)
+    denom_comp = jnp.maximum(jnp.maximum(V_RL_k, V_base_k), 1.0)
+    r_comp = r_comp_raw / denom_comp
+
+    denom_base = jnp.maximum(V_base_k, 1.0)
+    r_mimic = -jnp.abs(V_RL_k - V_base_k) / denom_base
+
+    denom_task = jnp.maximum(jnp.asarray(task_to_execute, dtype=jnp.float32), 1.0)
+    r_terminal = -terminal_penalty_beta * jnp.asarray(doom_quant, dtype=jnp.float32) / denom_task
+
+    reward_main = r_comp + reward_lambda * r_mimic
+    reward = reward_main + r_terminal
+    return {
+        "reward": reward,
+        "reward_main": reward_main,
+        "matched_base_cost": matched_base_cost,
+        "r_comp_raw": r_comp_raw,
+        "r_comp": r_comp,
+        "r_mimic": r_mimic,
+        "r_terminal": r_terminal,
+        "denom_comp": denom_comp,
+        "denom_base": denom_base,
+        "denom_task": denom_task,
+    }
 
 
 class ExecutionAgent():
@@ -456,6 +534,12 @@ class ExecutionAgent():
             vwap_rm = 0.,
             is_sell_task = is_sell_task,
             trade_duration = 0.,
+            rl_vol_window = _zero_itt_reward_window(),
+            rl_cost_window = _zero_itt_reward_window(),
+            base_vol_window = _zero_itt_reward_window(),
+            base_cost_window = _zero_itt_reward_window(),
+            reward_window_ptr = jnp.array(0, dtype=jnp.int32),
+            reward_window_count = jnp.array(0, dtype=jnp.int32),
         )
 
         # Calculate things for the message obs space
@@ -578,6 +662,12 @@ class ExecutionAgent():
             vwap_rm=0.,
             is_sell_task=is_sell_task, # updated on reset
             trade_duration=0.,
+            rl_vol_window=_zero_itt_reward_window(),
+            rl_cost_window=_zero_itt_reward_window(),
+            base_vol_window=_zero_itt_reward_window(),
+            base_cost_window=_zero_itt_reward_window(),
+            reward_window_ptr=jnp.array(0, dtype=jnp.int32),
+            reward_window_count=jnp.array(0, dtype=jnp.int32),
             # updated on reset:
             delta_time=0.,
         )
@@ -1431,6 +1521,14 @@ class ExecutionAgent():
         #jax.debug.print("action_msgs exec: {}", action_msgs)
         return action_msgs 
 
+    def _get_static_twap_baseline_volume(self, world_state: WorldState, agent_state: ExecEnvState):
+        max_steps = jnp.maximum(
+            jnp.asarray(world_state.max_steps_in_episode, dtype=jnp.float32),
+            1.0,
+        )
+        task_to_execute = jnp.asarray(agent_state.task_to_execute, dtype=jnp.float32)
+        return task_to_execute / max_steps
+
     def _getActionMsgs_PolicyBlending(self, action: jax.Array, world_state : WorldState, agent_state: ExecEnvState, agent_params: ExecEnvParams):
         """
         Policy Blending Action (CORRECTED VERSION):
@@ -1500,8 +1598,7 @@ class ExecutionAgent():
         # 2. Logic Policy Blending (Bắt chước TWAP rồi vượt qua)
         # Tính V_twap: Khối lượng mục tiêu cho mỗi bước thời gian
         # v_twap = Tổng khối lượng / Số bước dự kiến
-        total_steps = world_state.max_steps_in_episode
-        v_twap = agent_state.task_to_execute / total_steps
+        v_twap = self._get_static_twap_baseline_volume(world_state, agent_state)
         
         # V_base mặc định đặt tại Level 1 
         # Công thức Dual-PPO: V_actual = V_base + (V_twap * Action) 
@@ -2087,24 +2184,23 @@ class ExecutionAgent():
                     bestasks: chex.Array, 
                     bestbids: chex.Array, 
                     time: jax.Array) -> jnp.int32:
-        #########################################################################################
-        # Add artificial trade if episode is done
-        # Important: this artificial trade is not saved, its just used to calculate the reward
-        #########################################################################################
+        eps = jnp.asarray(1e-8, dtype=jnp.float32)
 
+        # A. Real execution before any terminal completion accounting.
         agent_trades_before_unwind = job.get_agent_trades(trades, agent_params.trader_id)
-        quant_executed_this_step = jnp.abs(agent_trades_before_unwind[:,1].sum()) # QUants can be negative, therefore take absolute value
-        quant_left = agent_state.task_to_execute - (agent_state.quant_executed + quant_executed_this_step)
+        agentQuant_step = jnp.abs(agent_trades_before_unwind[:, 1]).sum()
+        c_rl_step = (
+            agent_trades_before_unwind[:, 0]
+            // self.world_config.tick_size
+            * jnp.abs(agent_trades_before_unwind[:, 1])
+        ).sum()
+        quant_left_before_unwind = (
+            agent_state.task_to_execute
+            - agent_state.quant_executed
+            - agentQuant_step
+        )
 
-        #jax.debug.print(f"quant_left: {quant_left}")
-
-        # print("trader id: ", agent_params.trader_id)
-        # print("trades before unwind: ", agent_trades_before_unwind)
-        #jax.debug.print(f"quant_executed_this_step: {quant_executed_this_step}")
-        # print(f"agent_state.task_to_execute: {agent_state.task_to_execute}")
-        # print(f"quant_left: {quant_left}")
-
-        #-----check if ep over-----#
+        # B. Terminal completion penalty; do not add synthetic doom trades to reward inputs.
         if self.world_config.ep_type == 'fixed_time':
             remainingTime = self.world_config.episode_time - jnp.array((time - world_state.init_time)[0], dtype=jnp.int32)
             ep_is_over = remainingTime <= self.world_config.last_step_seconds   # 5 seconds
@@ -2117,14 +2213,6 @@ class ExecutionAgent():
             #jax.debug.print("ep_is_over: {}", ep_is_over)
             #jax.debug.print("world_state.max_steps_in_episode: {}", world_state.max_steps_in_episode)
             #jax.debug.print("world_state.step_counter: {}", world_state.step_counter)
-        averageMidprice = ((bestbids[:, 0] + bestasks[:, 0]) / 2).mean() // self.world_config.tick_size * self.world_config.tick_size
-        #jax.debug.print("mid_price:{}",mid_price)
-
-
-        #jax.debug.print(f"bestbid 0: {bestbids[-1,0]}")
-        #jax.debug.print(f"bestask 0: {bestasks[-1,0]}")
-        # print(bestasks[-10,0])
-
         penalty = self.cfg.doom_price_penalty
 
         doom_price = jax.lax.cond(
@@ -2133,69 +2221,77 @@ class ExecutionAgent():
             lambda: (((bestasks[-1,0]) * (1+penalty))// self.world_config.tick_size * self.world_config.tick_size).astype(jnp.int32),
         )
 
-        #jax.debug.print("doom_price: {}", doom_price)
-
-        def place_midprice_trade(trades, price, quant, time):
-            '''Place a doom trade at a trade at mid price to close out our mm agent at the end of the episode.'''
-            
-            # print("price shape: {}", price.shape)
-            # print("quant shape: {}", quant.shape)
-            # print("time shape: {}", time.shape)
-            # print("trader id shape: {}", agent_params.trader_id.shape)
-            #jax.debug.print("quant_left: {}", jnp.abs(quant_left))
-            
-            
-            mid_trade = job.create_trade(
-                price, quant, self.world_config.artificial_order_id_end_episode,  self.world_config.placeholder_order_id, *time, self.world_config.artificial_trader_id_end_episode, agent_params.trader_id)
-            trades = job.add_trade(trades, mid_trade)
-            #jax.debug.print("called?")
-            return trades
-        
-        #Get side to place trade. +ve quant means we (aggresive) sold.
-        side_sign=(agent_state.is_sell_task*2-1) # 1 if sell, -1 if buy
-        
-        # Add artificial trade to trades object if episode is over and we still have remaining quantity
-        trades = jax.lax.cond(
-            ep_is_over & (jnp.abs(quant_left) > 0),  # Check if episode is over and we still have remaining quantity
-            place_midprice_trade,  # Place a midprice trade
-            lambda trades, b, c, d: trades,  # If not, return the existing trades
-            trades, doom_price, side_sign*jnp.abs(quant_left), time  # Inv +ve means incoming is sell so standing buy.
+        doom_quant = jnp.where(
+            ep_is_over,
+            jnp.maximum(quant_left_before_unwind, 0),
+            0,
         )
-        #Return traded amounts
-        doom_quant = ep_is_over * quant_left
+        # C. Windowed imitate-then-transcend reward using only real step trades.
+        V_RL_step = jnp.asarray(agentQuant_step, dtype=jnp.float32)
+        C_RL_step = jnp.asarray(c_rl_step, dtype=jnp.float32)
+        V_base_step = jnp.asarray(
+            self._get_static_twap_baseline_volume(world_state, agent_state),
+            dtype=jnp.float32,
+        )
+        p_benchmark_tick = jnp.asarray(
+            jax.lax.cond(
+                agent_state.is_sell_task,
+                lambda: bestbids[-1, 0] // self.world_config.tick_size,
+                lambda: bestasks[-1, 0] // self.world_config.tick_size,
+            ),
+            dtype=jnp.float32,
+        )
+        C_base_step = V_base_step * p_benchmark_tick
 
-        #jax.debug.print("trades exec env: {}", trades)
+        (
+            rl_vol_window,
+            rl_cost_window,
+            base_vol_window,
+            base_cost_window,
+            reward_window_ptr,
+            reward_window_count,
+        ) = _update_itt_reward_window(
+            agent_state.rl_vol_window,
+            agent_state.rl_cost_window,
+            agent_state.base_vol_window,
+            agent_state.base_cost_window,
+            agent_state.reward_window_ptr,
+            agent_state.reward_window_count,
+            V_RL_step,
+            C_RL_step,
+            V_base_step,
+            C_base_step,
+        )
 
-        #################################
-        # Get reward
-        #################################
+        V_RL_k = jnp.sum(rl_vol_window)
+        C_RL_k = jnp.sum(rl_cost_window)
+        V_base_k = jnp.sum(base_vol_window)
+        C_base_k = jnp.sum(base_cost_window)
 
-        # ========== get reward and revenue ==========
-        # Gather the 'trades' that are nonempty, make the rest 0
-        executed = jnp.where((trades[:, 0] >= 0)[:, jnp.newaxis], trades, 0)
-        # Mask to keep only the trades where the RL agent is involved, apply mask.
-        # mask2 = ((job.INITID < executed[:, 2]) & (executed[:, 2] < 0)) | ((job.INITID < executed[:, 3]) & (executed[:, 3] < 0))
-        mask2 = (agent_params.trader_id == executed[:, 6])  | (agent_params.trader_id == executed[:, 7]) #Mask to find trader ID
-        agentTrades = jnp.where(mask2[:, jnp.newaxis], executed, 0)
-        otherTrades = jnp.where(mask2[:, jnp.newaxis], 0, executed)
-        # jax.debug.print('agentTrades\n {}', agentTrades[:30])
-        agentQuant = jnp.abs(agentTrades[:,1]).sum() # new_execution quants
+        reward_terms = _compute_windowed_itt_reward(
+            V_RL_k,
+            C_RL_k,
+            V_base_k,
+            C_base_k,
+            p_benchmark_tick,
+            agent_state.is_sell_task,
+            doom_quant,
+            agent_state.task_to_execute,
+            self.cfg.reward_lambda,
+            self.cfg.terminal_penalty_beta,
+        )
+        reward = reward_terms["reward"]
+        reward_main = reward_terms["reward_main"]
+        matched_base_cost = reward_terms["matched_base_cost"]
+        r_comp_raw = reward_terms["r_comp_raw"]
+        r_comp = reward_terms["r_comp"]
+        r_mimic = reward_terms["r_mimic"]
+        r_terminal = reward_terms["r_terminal"]
+        denom_comp = reward_terms["denom_comp"]
+        denom_base = reward_terms["denom_base"]
+        denom_task = reward_terms["denom_task"]
 
-
-        def check_final_quant(ep_is_over,quant_left,doom_quant,doom_price,trades,agentTrades,otherTrades):
-            if ep_is_over and quant_left!=0:
-                print("DOOM TRADE HAPPENED")
-                print(doom_quant,doom_price)
-                print("The trades post doom are.")
-                print(trades)
-                print("The agent trades post doom are.")
-                print(agentTrades)
-                print("The other trades post doom are.")
-                print(otherTrades)
-
-        # jax.debug.callback(check_final_quant,ep_is_over,quant_left,doom_quant,doom_price,trades,agentTrades,otherTrades)
-        
-        #jax.debug.print("agentTrades:{}",agentTrades)
+        agentQuant = agentQuant_step
 
         # ---------- used for vwap, revenue ----------
         # vwapFunc = lambda tr: jnp.nan_to_num(
@@ -2207,43 +2303,35 @@ class ExecutionAgent():
 
         # 1. TÍNH C_RL (DOANH THU/CHI PHÍ THỰC TẾ CỦA AGENT)
         # Revenue = Sum(Price * Volume)
-        c_rl = (agentTrades[:, 0] // self.world_config.tick_size * jnp.abs(agentTrades[:, 1])).sum()
+        c_rl = C_RL_step
 
         # 2. XÁC ĐỊNH GIÁ BENCHMARK P (MARKET ORDER PRICE)
         # Theo Dual-Window PPO: So sánh Limit Order của Agent với Market Order của Baseline.
         # - Sell Task: Benchmark bán ngay lập tức -> Khớp tại Best Bid.
         # - Buy Task: Benchmark mua ngay lập tức -> Khớp tại Best Ask.
-        p_benchmark = jax.lax.cond(
-            agent_state.is_sell_task,
-            lambda: bestbids[-1, 0] // self.world_config.tick_size, 
-            lambda: bestasks[-1, 0] // self.world_config.tick_size  
-        )
+        p_benchmark = p_benchmark_tick
 
         # 3. TÍNH R_COMP (CẠNH TRANH - SPREAD CAPTURE)
         # V_base: Volume mục tiêu của TWAP trong bước này
-        total_steps = world_state.max_steps_in_episode
-        v_base = agent_state.task_to_execute / total_steps
+        v_base = V_base_step
 
         # Chi phí Benchmark giả định (nếu TWAP khớp Market Order với volume thực tế của Agent)
         # c_base_matched = v_rl * p_benchmark
-        c_base_matched = agentQuant * p_benchmark
-
-        direction_switch = jnp.sign(agent_state.is_sell_task * 2 - 1) # Sell=1, Buy=-1
+        direction_switch = jnp.where(agent_state.is_sell_task, 1.0, -1.0)
 
         # R_comp: Lợi nhuận kiếm được từ việc đặt Limit Order so với Market Order
         # Buy: (Cost_Market - Cost_Limit) > 0
         # Sell: (Rev_Limit - Rev_Market) > 0
-        r_comp = direction_switch * (c_rl - c_base_matched)
+        # r_comp/r_mimic/reward are computed from the rolling j=64 window above.
 
         # 4. TÍNH R_MIMIC (HÌNH PHẠT KHỐI LƯỢNG)
         # Phạt nếu khối lượng khớp lệch so với kế hoạch TWAP
-        delta_v = agentQuant - v_base
-        r_mimic = -jnp.abs(delta_v)
-        r_mimic_scaled = r_mimic / (v_base + 1.0)
+        r_mimic_scaled = r_mimic
 
         # 5. TỔNG HỢP REWARD
         alpha = self.cfg.reward_lambda
-        reward = r_comp + alpha * r_mimic_scaled
+        reward_main = r_comp + alpha * r_mimic_scaled
+        reward = reward_main + r_terminal
         
         # jax.debug.print("DEBUG REWARD: Step {}, Executed Vol: {}, v_base: {}", world_state.step_counter, agentQuant, v_base)
         # 6. CẬP NHẬT METRICS & LOGGING
@@ -2262,17 +2350,49 @@ class ExecutionAgent():
         price_drift_rm = rollingMeanValueFunc_FLOAT(agent_state.price_drift_rm, (p_benchmark - agent_state.init_price // self.world_config.tick_size))
 
         # Tính toán thông tin phụ
-        trade_duration_step = (jnp.abs(agentTrades[:, 1]) / agent_state.task_to_execute * (agentTrades[:, -2] - world_state.init_time[0])).sum()
+        trade_duration_step = (
+            jnp.abs(agent_trades_before_unwind[:, 1])
+            / (agent_state.task_to_execute + eps)
+            * (agent_trades_before_unwind[:, -2] - world_state.init_time[0])
+        ).sum()
         trade_duration = agent_state.trade_duration + trade_duration_step
-        quant_left = agent_state.task_to_execute - agent_state.quant_executed - agentQuant
+        quant_left = quant_left_before_unwind
 
         reward_info = {
             "reward": reward,
+            "reward_main": reward_main,
             "r_comp": r_comp,
-            "r_mimic": r_mimic_scaled,
+            "r_comp_raw": r_comp_raw,
+            "r_mimic": r_mimic,
+            "r_terminal": r_terminal,
+            "V_RL_step": V_RL_step,
+            "C_RL_step": C_RL_step,
+            "V_base_step": V_base_step,
+            "C_base_step": C_base_step,
+            "V_RL_k": V_RL_k,
+            "C_RL_k": C_RL_k,
+            "V_base_k": V_base_k,
+            "C_base_k": C_base_k,
+            "matched_base_cost": matched_base_cost,
+            "denom_comp": denom_comp,
+            "denom_base": denom_base,
+            "denom_task": denom_task,
+            "rl_vol_window": rl_vol_window,
+            "rl_cost_window": rl_cost_window,
+            "base_vol_window": base_vol_window,
+            "base_cost_window": base_cost_window,
+            "reward_window_ptr": reward_window_ptr,
+            "reward_window_count": reward_window_count,
+            "agentQuant_step": agentQuant_step,
+            "c_rl_step": c_rl_step,
+            "v_base_step": v_base,
+            "max_steps_in_episode": world_state.max_steps_in_episode,
+            "step_counter": world_state.step_counter,
+            "quant_executed_so_far": agent_state.quant_executed,
             "agentQuant": agentQuant,
             "targetQuant": v_base,
             "p_benchmark": p_benchmark,
+            "quant_left_before_unwind": quant_left_before_unwind,
             "revenue": c_rl,
             "advantage": r_comp, # Advantage chính là R_comp
             "drift": drift,
@@ -2282,17 +2402,13 @@ class ExecutionAgent():
             "slippage_rm": slippage_rm,
             "price_drift_rm": price_drift_rm,
             "trade_duration": trade_duration,
+            "doom_price": doom_price,
+            "terminal_penalty_beta": self.cfg.terminal_penalty_beta,
             "doom_quant": doom_quant, # Biến này đã tính ở phần trên, vẫn truy cập được
             "reward_lam1": r_comp 
         }
 
-        reward_scaled = reward
-
-        # Giữ lại logic debug đặc biệt (nếu cần)
-        if self.cfg.reward_space == "finish_fast":
-                reward_scaled = -jnp.abs(quant_left) / 10.0
-
-        return reward_scaled, reward_info
+        return reward, reward_info
 
 
 
@@ -2320,7 +2436,13 @@ class ExecutionAgent():
             price_adv_rm = new_price_adv_rm,
             price_drift_rm = new_price_drift_rm,
             vwap_rm = new_vwap_rm,
-            trade_duration = new_trade_duration)
+            trade_duration = new_trade_duration,
+            rl_vol_window = extras["rl_vol_window"],
+            rl_cost_window = extras["rl_cost_window"],
+            base_vol_window = extras["base_vol_window"],
+            base_cost_window = extras["base_cost_window"],
+            reward_window_ptr = extras["reward_window_ptr"],
+            reward_window_count = extras["reward_window_count"])
         
         # Get done
         done = self.is_terminal(world_state, agent_state)
@@ -2353,6 +2475,35 @@ class ExecutionAgent():
             "doom_quant": doom_quant,
             "is_sell_task": agent_state.is_sell_task,
             "reward": new_reward,
+            "reward_main": extras["reward_main"],
+            "r_comp": extras["r_comp"],
+            "r_comp_raw": extras["r_comp_raw"],
+            "r_mimic": extras["r_mimic"],
+            "r_terminal": extras["r_terminal"],
+            "V_RL_step": extras["V_RL_step"],
+            "C_RL_step": extras["C_RL_step"],
+            "V_base_step": extras["V_base_step"],
+            "C_base_step": extras["C_base_step"],
+            "V_RL_k": extras["V_RL_k"],
+            "C_RL_k": extras["C_RL_k"],
+            "V_base_k": extras["V_base_k"],
+            "C_base_k": extras["C_base_k"],
+            "matched_base_cost": extras["matched_base_cost"],
+            "denom_comp": extras["denom_comp"],
+            "denom_base": extras["denom_base"],
+            "denom_task": extras["denom_task"],
+            "reward_window_ptr": extras["reward_window_ptr"],
+            "reward_window_count": extras["reward_window_count"],
+            "agentQuant_step": extras["agentQuant_step"],
+            "c_rl_step": extras["c_rl_step"],
+            "v_base_step": extras["v_base_step"],
+            "max_steps_in_episode": extras["max_steps_in_episode"],
+            "step_counter": extras["step_counter"],
+            "quant_executed_so_far": extras["quant_executed_so_far"],
+            "p_benchmark": extras["p_benchmark"],
+            "quant_left_before_unwind": extras["quant_left_before_unwind"],
+            "doom_price": extras["doom_price"],
+            "terminal_penalty_beta": extras["terminal_penalty_beta"],
         }
 
         #jax.debug.print("info exec env: {}", info)

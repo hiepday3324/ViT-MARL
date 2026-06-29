@@ -12,6 +12,7 @@ if project_root not in sys.path:
 from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     build_liquidity_survival_targets,
     masked_reliability_loss,
+    resolve_rollout_is_sell_task,
 )
 
 
@@ -137,6 +138,22 @@ class ReliabilityTargetTest(unittest.TestCase):
         self.assertEqual(mse.shape, ())
         self.assertTrue(bool(jnp.isfinite(bce)))
         self.assertTrue(bool(jnp.isfinite(mse)))
+
+    def test_resolve_rollout_is_sell_task_accepts_padded_rollout(self):
+        padded = jnp.zeros((42, 2), dtype=jnp.float32)
+        padded = padded.at[1, 0].set(1.0)
+        padded = padded.at[33:, :].set(1.0)
+
+        resolved = resolve_rollout_is_sell_task(
+            {"is_sell_task": padded},
+            task="random",
+            num_steps=32,
+            batch_size=2,
+        )
+
+        self.assertEqual(resolved.shape, (32, 2))
+        self.assertEqual(float(resolved[1, 0]), 1.0)
+        self.assertEqual(float(resolved[-1, 0]), 0.0)
 
 
 if __name__ == "__main__":

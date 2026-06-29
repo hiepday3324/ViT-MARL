@@ -66,7 +66,9 @@ def resolve_rollout_is_sell_task(
     if is_sell_task.ndim == 0:
         is_sell_task = jnp.full((num_steps, batch_size), is_sell_task)
     elif is_sell_task.ndim == 1:
-        if is_sell_task.shape[0] == batch_size:
+        if is_sell_task.shape[0] >= num_steps and batch_size == 1:
+            is_sell_task = is_sell_task[:num_steps, None]
+        elif is_sell_task.shape[0] == batch_size:
             is_sell_task = jnp.broadcast_to(is_sell_task[None, :], (num_steps, batch_size))
         elif is_sell_task.shape[0] == num_steps and batch_size == 1:
             is_sell_task = is_sell_task[:, None]
@@ -76,7 +78,9 @@ def resolve_rollout_is_sell_task(
                 f"{is_sell_task.shape} to ({num_steps}, {batch_size})."
             )
     elif is_sell_task.ndim == 2:
-        if is_sell_task.shape == (num_steps, batch_size):
+        if is_sell_task.shape[0] >= num_steps and is_sell_task.shape[1] == batch_size:
+            is_sell_task = is_sell_task[:num_steps]
+        elif is_sell_task.shape == (num_steps, batch_size):
             pass
         elif is_sell_task.shape == (1, batch_size):
             is_sell_task = jnp.broadcast_to(is_sell_task, (num_steps, batch_size))

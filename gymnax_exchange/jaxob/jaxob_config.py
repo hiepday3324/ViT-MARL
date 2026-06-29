@@ -127,6 +127,8 @@ class Execution_EnvironmentConfig():
     short_name:str="EXE"
     seconds_before_episode_end:int=5
     doom_price_penalty: float = 0.1
+    terminal_penalty_beta: float = 1.0
+    itt_window_size: int = 64
     larger_far_touch_quant: bool = False
     
  

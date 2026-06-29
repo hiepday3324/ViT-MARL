@@ -122,7 +122,7 @@ from gymnax_exchange.jaxen.base_env import BaseLOBEnv
 from gymnax_exchange.utils import utils
 import dataclasses
 from gymnax_exchange.jaxob.jaxob_config import Execution_EnvironmentConfig,World_EnvironmentConfig
-from gymnax_exchange.jaxen.StatesandParams import ExecEnvState, ExecEnvParams, WorldState
+from gymnax_exchange.jaxen.StatesandParams import ExecEnvState, ExecEnvParams, WorldState, ITT_WINDOW_SIZE
 from gymnax_exchange.jaxob.jaxob_config import World_EnvironmentConfig
 from gymnax_exchange.jaxen.StatesandParams import MultiAgentState, WorldState
 
@@ -437,6 +437,12 @@ class ExecutionAgent():
             vwap_rm = 0.,
             is_sell_task = is_sell_task,
             trade_duration = 0.,
+            rl_vol_window = jnp.zeros((ITT_WINDOW_SIZE,), dtype=jnp.float32),
+            rl_cost_window = jnp.zeros((ITT_WINDOW_SIZE,), dtype=jnp.float32),
+            base_vol_window = jnp.zeros((ITT_WINDOW_SIZE,), dtype=jnp.float32),
+            base_cost_window = jnp.zeros((ITT_WINDOW_SIZE,), dtype=jnp.float32),
+            reward_window_ptr = jnp.array(0, dtype=jnp.int32),
+            reward_window_count = jnp.array(0, dtype=jnp.int32),
         )
 
         # Calculate things for the message obs space
@@ -559,6 +565,12 @@ class ExecutionAgent():
             vwap_rm=0.,
             is_sell_task=is_sell_task, # updated on reset
             trade_duration=0.,
+            rl_vol_window=jnp.zeros((ITT_WINDOW_SIZE,), dtype=jnp.float32),
+            rl_cost_window=jnp.zeros((ITT_WINDOW_SIZE,), dtype=jnp.float32),
+            base_vol_window=jnp.zeros((ITT_WINDOW_SIZE,), dtype=jnp.float32),
+            base_cost_window=jnp.zeros((ITT_WINDOW_SIZE,), dtype=jnp.float32),
+            reward_window_ptr=jnp.array(0, dtype=jnp.int32),
+            reward_window_count=jnp.array(0, dtype=jnp.int32),
             # updated on reset:
             delta_time=0.,
         )

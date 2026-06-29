@@ -132,6 +132,54 @@ class MARLEnv(MultiAgentEnv):
         self.num_msgs_per_step = int(num_msg_per_step)
         self.num_action_msgs_per_step_by_all_agents = int(num_action_msg_per_step_by_all_agents)
 
+    def _message_diagnostics(
+        self,
+        action_msgs: jnp.ndarray,
+        cancel_msgs: jnp.ndarray,
+    ) -> Dict[str, jnp.ndarray]:
+        """Summarize already-built messages without changing their behavior."""
+        action_is_live = jnp.logical_and(
+            action_msgs[..., 0] == 1,
+            action_msgs[..., 2] > 0,
+        )
+        cancel_is_live = jnp.logical_and(
+            cancel_msgs[..., 0] == 2,
+            cancel_msgs[..., 2] > 0,
+        )
+
+        action_msg_volume = jnp.sum(
+            jnp.where(action_is_live, action_msgs[..., 2], 0),
+            axis=-1,
+        )
+        cancel_msg_count = jnp.sum(cancel_is_live.astype(jnp.int32), axis=-1)
+        cancel_msg_volume = jnp.sum(
+            jnp.where(cancel_is_live, cancel_msgs[..., 2], 0),
+            axis=-1,
+        )
+
+        action_quants = action_msgs[..., 2]
+        action_prices = action_msgs[..., 3]
+        if action_quants.shape[-1] < 3:
+            pad_width = 3 - action_quants.shape[-1]
+            action_quants = jnp.pad(action_quants, ((0, 0), (0, pad_width)))
+            action_prices = jnp.pad(action_prices, ((0, 0), (0, pad_width)))
+
+        target_quants = action_quants[:, :3]
+        target_prices = action_prices[:, :3]
+
+        return {
+            "cancel_msg_count": cancel_msg_count,
+            "cancel_msg_volume": cancel_msg_volume,
+            "action_msg_volume": action_msg_volume,
+            "target_quants_l1": target_quants[:, 0],
+            "target_quants_l2": target_quants[:, 1],
+            "target_quants_l3": target_quants[:, 2],
+            "target_prices_l1": target_prices[:, 0],
+            "target_prices_l2": target_prices[:, 1],
+            "target_prices_l3": target_prices[:, 2],
+            "target_quants_sum": jnp.sum(target_quants, axis=-1),
+        }
+
     @property
     def default_params(self) -> MultiAgentParams:
         # Get the base parameters from BaseLOBEnv
@@ -283,6 +331,7 @@ class MARLEnv(MultiAgentEnv):
 
         all_action_msgs_list = [] # One element for each agent type
         all_cancel_msgs_list = [] # One element for each agent type
+        all_message_diag_list = [] # Per-agent-type message diagnostics
 
         #jax.debug.print("action: {}", actions)
 
@@ -297,6 +346,7 @@ class MARLEnv(MultiAgentEnv):
             action_msgs, cancel_msgs = vmapped_function(agent_actions, state.world_state, agent_state, agent_params)
             all_action_msgs_list.append(action_msgs)
             all_cancel_msgs_list.append(cancel_msgs)
+            all_message_diag_list.append(self._message_diagnostics(action_msgs, cancel_msgs))
 
         #jax.debug.print("all action msgs: {}", all_action_msgs_list)
        # print(f"all cancel msgs: {all_cancel_msgs_list}")
@@ -512,6 +562,7 @@ class MARLEnv(MultiAgentEnv):
             extras = agent_extras_list[agent_type_index]
             vmapped_function = vmap(self.instance_list[agent_type_index].update_state_and_get_done_and_info, in_axes=(None,0,0), out_axes = (0,0,0))
             states, dones, infos = vmapped_function(new_world_state, agent_state, extras)
+            infos = {**infos, **all_message_diag_list[agent_type_index]}
             new_agent_states_list.append(states)
             new_agent_dones_list.append(dones)
             new_agent_infos_list.append(infos)

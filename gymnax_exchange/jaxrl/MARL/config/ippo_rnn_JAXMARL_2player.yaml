@@ -13,6 +13,8 @@
 "reliability_hidden_dim": 128
 "use_survival_loss": False
 "lambda_surv": 0.0
+"use_supcon_loss": True
+"lambda_supcon": 0.1
 "survival_delta_steps": 10
 "survival_min_volume": 1.0
 "survival_ratio": 0.5

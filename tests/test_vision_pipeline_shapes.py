@@ -94,6 +94,7 @@ class VisionPipelineShapeTest(unittest.TestCase):
         labels = jnp.zeros((time_steps, batch_size), dtype=jnp.int32)
         loss = supervised_contrastive_loss(pooled.reshape(-1, embed_dim), labels.reshape(-1))
         self.assertEqual(loss.shape, ())
+        self.assertTrue(bool(jnp.isfinite(loss)))
 
 
 if __name__ == "__main__":

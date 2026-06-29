@@ -587,7 +587,11 @@ def make_train(config):
                          jnp.where(future_vol > config.get("VOL_LOW", 0.005), 1, 0))
                 volatility_labels.append(labels)
 
-                if isinstance(traj_batch_padded[i].obs, dict) and "vision_obs" in traj_batch_padded[i].obs:
+                if (
+                    config.get("use_survival_loss", False)
+                    and isinstance(traj_batch_padded[i].obs, dict)
+                    and "vision_obs" in traj_batch_padded[i].obs
+                ):
                     survival_target_mode = config.get(
                         "survival_target_mode",
                         "actionability_weighted_min_horizon",
@@ -741,21 +745,19 @@ def make_train(config):
                                 entropy = pi.entropy().mean()
 
                             # TỔNG HỢP PPO LOSS
-                            ppo_loss = (
-                                loss_actor
-                                + config["VF_COEF"][i] * value_loss
-                                - config["ENT_COEF"][i] * entropy
-                            )
+                            weighted_value_loss = config["VF_COEF"][i] * value_loss
+                            weighted_entropy_term = -config["ENT_COEF"][i] * entropy
+                            ppo_loss = loss_actor + weighted_value_loss + weighted_entropy_term
 
                             # TÍNH SUPCON LOSS CHO VISION AGENT
-                            if isinstance(traj_batch.obs, dict):
+                            use_supcon_loss = config.get("use_supcon_loss", True)
+                            lambda_supcon = config.get("lambda_supcon", config.get("SUPCON_ALPHA", 0.1))
+                            if use_supcon_loss and lambda_supcon != 0.0 and isinstance(traj_batch.obs, dict):
                                 z_flat = z_vision.reshape(-1, z_vision.shape[-1])
                                 labels_flat = vol_labels.reshape(-1)
                                 supcon_loss = supervised_contrastive_loss(z_flat, labels_flat, temperature=0.1)
-                                alpha = config.get("SUPCON_ALPHA", 0.1)
                             else:
                                 supcon_loss = jnp.array(0.0)
-                                alpha = jnp.array(0.0)
 
                             # LOSS CUỐI CÙNG (Cộng PPO và SupCon có hệ số)
                             if (
@@ -781,8 +783,13 @@ def make_train(config):
                                 survival_mask_ratio = jnp.array(0.0)
                                 reliability_mean = jnp.array(0.0)
 
+                            if use_supcon_loss and lambda_supcon != 0.0:
+                                weighted_supcon_loss = lambda_supcon * supcon_loss
+                            else:
+                                weighted_supcon_loss = jnp.array(0.0)
                             weighted_survival_loss = lambda_surv * survival_loss
-                            total_loss = ppo_loss + alpha * supcon_loss + weighted_survival_loss
+                            aux_loss = weighted_supcon_loss + weighted_survival_loss
+                            total_loss = ppo_loss + aux_loss
 
                             # debug
                             approx_kl = ((ratio - 1) - logratio).mean()
@@ -800,6 +807,11 @@ def make_train(config):
                                 weighted_survival_loss,
                                 survival_mask_ratio,
                                 reliability_mean,
+                                ppo_loss,
+                                weighted_value_loss,
+                                weighted_entropy_term,
+                                weighted_supcon_loss,
+                                aux_loss,
                             )
                         grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                         total_loss, grads = grad_fn(
@@ -904,22 +916,55 @@ def make_train(config):
             for i,loss_info in enumerate(loss_infos):
                 ratio_0 = loss_info[1][3].at[0,0].get().mean()
                 loss_info = jax.tree.map(lambda x: x.mean(), loss_info)
-                metrics["loss"].append({
+                loss_metrics = {
                     "total_loss": loss_info[0],
                     "value_loss": loss_info[1][0],
                     "actor_loss": loss_info[1][1],
+                    "policy_loss": loss_info[1][1],
                     "entropy": loss_info[1][2],
+                    "entropy_loss": -loss_info[1][2],
                     "ratio": loss_info[1][3],
                     "ratio_0": ratio_0,
                     "approx_kl": loss_info[1][4],
                     "clip_frac": loss_info[1][5],
+                    "supcon_loss": loss_info[1][6],
                     "survival_loss": loss_info[1][7],
+                    "reliability_loss": loss_info[1][7],
                     "weighted_survival_loss": loss_info[1][8],
                     "survival_mask_ratio": loss_info[1][9],
                     "reliability_mean": loss_info[1][10],
+                    "ppo_loss": loss_info[1][11],
+                    "weighted_value_loss": loss_info[1][12],
+                    "weighted_entropy_term": loss_info[1][13],
+                    "weighted_supcon_loss": loss_info[1][14],
+                    "aux_loss": loss_info[1][15],
+                    "total_loss_with_aux": loss_info[0],
                     "weighted_entropy_loss": loss_info[1][2] * config["ENT_COEF"][i],
-                    "weighted_value_loss": loss_info[1][0] * config["VF_COEF"][i],
+                    "lambda_supcon": jnp.array(
+                        config.get("lambda_supcon", config.get("SUPCON_ALPHA", 0.1)),
+                        dtype=jnp.float32,
+                    ),
+                    "use_supcon_loss": jnp.array(
+                        float(config.get("use_supcon_loss", True)),
+                        dtype=jnp.float32,
+                    ),
+                    "lambda_surv": jnp.array(config.get("lambda_surv", 0.0), dtype=jnp.float32),
+                    "use_survival_loss": jnp.array(
+                        float(config.get("use_survival_loss", False)),
+                        dtype=jnp.float32,
+                    ),
+                }
+                ratio_eps = 1e-8
+                abs_ppo_loss = jnp.abs(loss_metrics["ppo_loss"])
+                abs_aux_loss = jnp.abs(loss_metrics["aux_loss"])
+                loss_metrics.update({
+                    "abs_ppo_loss": abs_ppo_loss,
+                    "abs_aux_loss": abs_aux_loss,
+                    "aux_to_ppo_ratio": abs_aux_loss / (abs_ppo_loss + ratio_eps),
+                    "supcon_to_ppo_ratio": jnp.abs(loss_metrics["weighted_supcon_loss"]) / (abs_ppo_loss + ratio_eps),
+                    "survival_to_ppo_ratio": jnp.abs(loss_metrics["weighted_survival_loss"]) / (abs_ppo_loss + ratio_eps),
                 })
+                metrics["loss"].append(loss_metrics)
 
 
             #jax.debug.print(f"traj_batch: {len(traj_batch)}")
@@ -1041,6 +1086,50 @@ def make_train(config):
                 #         logging_dict[f"agent_{agent_name}/loss_{loss_idx}"] = m
                 # Needed?
 
+                def _loss_value(loss_metrics, key, default=0.0):
+                    if key in loss_metrics:
+                        return float(np.nanmean(np.array(loss_metrics[key])))
+                    return float(default)
+
+                def _loss_bool(loss_metrics, key, default=False):
+                    default_value = 1.0 if default else 0.0
+                    return bool(_loss_value(loss_metrics, key, default_value) >= 0.5)
+
+                loss_diag_parts = [
+                    "LOSS_DIAG",
+                    f"update={int(metric['update_steps'])}",
+                ]
+                for loss_agent_index, loss_metrics in enumerate(metric["loss"]):
+                    loss_agent_name = agent_type_names[loss_agent_index]
+                    loss_diag_parts.extend([
+                        f"{loss_agent_name}_total_loss={_loss_value(loss_metrics, 'total_loss'):.6g}",
+                        f"{loss_agent_name}_policy_loss={_loss_value(loss_metrics, 'policy_loss'):.6g}",
+                        f"{loss_agent_name}_value_loss={_loss_value(loss_metrics, 'value_loss'):.6g}",
+                        f"{loss_agent_name}_entropy_loss={_loss_value(loss_metrics, 'entropy_loss'):.6g}",
+                        f"{loss_agent_name}_ppo_loss={_loss_value(loss_metrics, 'ppo_loss'):.6g}",
+                        f"{loss_agent_name}_aux_loss={_loss_value(loss_metrics, 'aux_loss'):.6g}",
+                        f"{loss_agent_name}_lambda_supcon={_loss_value(loss_metrics, 'lambda_supcon'):.6g}",
+                        f"{loss_agent_name}_use_supcon_loss={_loss_bool(loss_metrics, 'use_supcon_loss')}",
+                        f"{loss_agent_name}_lambda_surv={_loss_value(loss_metrics, 'lambda_surv'):.6g}",
+                        f"{loss_agent_name}_use_survival_loss={_loss_bool(loss_metrics, 'use_survival_loss')}",
+                        f"{loss_agent_name}_survival_loss={_loss_value(loss_metrics, 'survival_loss'):.6g}",
+                        f"{loss_agent_name}_reliability_loss={_loss_value(loss_metrics, 'reliability_loss'):.6g}",
+                        f"{loss_agent_name}_supcon_loss={_loss_value(loss_metrics, 'supcon_loss'):.6g}",
+                        f"{loss_agent_name}_weighted_value_loss={_loss_value(loss_metrics, 'weighted_value_loss'):.6g}",
+                        f"{loss_agent_name}_weighted_entropy_term={_loss_value(loss_metrics, 'weighted_entropy_term'):.6g}",
+                        f"{loss_agent_name}_weighted_supcon_loss={_loss_value(loss_metrics, 'weighted_supcon_loss'):.6g}",
+                        f"{loss_agent_name}_weighted_survival_loss={_loss_value(loss_metrics, 'weighted_survival_loss'):.6g}",
+                        f"{loss_agent_name}_total_loss_with_aux={_loss_value(loss_metrics, 'total_loss_with_aux'):.6g}",
+                        f"{loss_agent_name}_abs_ppo_loss={_loss_value(loss_metrics, 'abs_ppo_loss'):.6g}",
+                        f"{loss_agent_name}_abs_aux_loss={_loss_value(loss_metrics, 'abs_aux_loss'):.6g}",
+                        f"{loss_agent_name}_aux_to_ppo_ratio={_loss_value(loss_metrics, 'aux_to_ppo_ratio'):.6g}",
+                        f"{loss_agent_name}_supcon_to_ppo_ratio={_loss_value(loss_metrics, 'supcon_to_ppo_ratio'):.6g}",
+                        f"{loss_agent_name}_survival_to_ppo_ratio={_loss_value(loss_metrics, 'survival_to_ppo_ratio'):.6g}",
+                        f"{loss_agent_name}_approx_kl={_loss_value(loss_metrics, 'approx_kl'):.6g}",
+                        f"{loss_agent_name}_clip_frac={_loss_value(loss_metrics, 'clip_frac'):.6g}",
+                    ])
+                print(" ".join(loss_diag_parts))
+
                 for agent_index, tr in enumerate(metric["traj_batch"]):
                     agent_name = agent_type_names[agent_index]
 
@@ -1090,9 +1179,37 @@ def make_train(config):
                         def _fmt(values):
                             return "[" + ",".join(f"{float(v):.4g}" for v in np.array(values).reshape(-1)) + "]"
 
+                        def _stats_text(prefix, values):
+                            return (
+                                f"{prefix}_mean={float(np.nanmean(values)):.6g} "
+                                f"{prefix}_min={float(np.nanmin(values)):.6g} "
+                                f"{prefix}_max={float(np.nanmax(values)):.6g}"
+                            )
+
                         doom_quant = _flat_info("doom_quant")
                         quant_left = _flat_info("quant_left")
                         agent_quant = _flat_info("agentQuant", np.nan)
+                        agent_quant_step = _flat_info("agentQuant_step", np.nan)
+                        V_RL_k = _flat_info("V_RL_k", np.nan)
+                        V_base_k = _flat_info("V_base_k", np.nan)
+                        r_comp_raw = _flat_info("r_comp_raw", np.nan)
+                        r_comp = _flat_info("r_comp", np.nan)
+                        r_mimic = _flat_info("r_mimic", np.nan)
+                        r_terminal = _flat_info("r_terminal", np.nan)
+                        reward_main = _flat_info("reward_main", np.nan)
+                        reward_info_values = _flat_info("reward", np.nan)
+                        quant_left_before_unwind = _flat_info("quant_left_before_unwind", np.nan)
+                        denom_comp = _flat_info("denom_comp", np.nan)
+                        denom_base = _flat_info("denom_base", np.nan)
+                        denom_task = _flat_info("denom_task", np.nan)
+                        reward_window_count = _flat_info("reward_window_count", np.nan)
+                        target_quants_l1 = _flat_info("target_quants_l1", np.nan)
+                        target_quants_l2 = _flat_info("target_quants_l2", np.nan)
+                        target_quants_l3 = _flat_info("target_quants_l3", np.nan)
+                        target_quants_sum = _flat_info("target_quants_sum", np.nan)
+                        action_msg_volume = _flat_info("action_msg_volume", np.nan)
+                        cancel_msg_count = _flat_info("cancel_msg_count", np.nan)
+                        cancel_msg_volume = _flat_info("cancel_msg_volume", np.nan)
                         is_sell_task = _flat_info("is_sell_task").astype(bool)
                         action_values = np.array(tr.action)
                         if isinstance(env.action_spaces[agent_index], spaces.Discrete):
@@ -1109,7 +1226,28 @@ def make_train(config):
                             f"doom_quant_max={float(np.max(doom_quant)):.6g} "
                             f"quant_left_mean={float(np.mean(quant_left)):.6g} "
                             f"quant_left_max={float(np.max(quant_left)):.6g} "
+                            f"terminal_left_before_unwind_mean={float(np.nanmean(quant_left_before_unwind)):.6g} "
                             f"agentQuant_mean={float(np.nanmean(agent_quant)):.6g} "
+                            f"agentQuant_step_mean={float(np.nanmean(agent_quant_step)):.6g} "
+                            f"V_RL_k_mean={float(np.nanmean(V_RL_k)):.6g} "
+                            f"V_base_k_mean={float(np.nanmean(V_base_k)):.6g} "
+                            f"{_stats_text('r_comp_raw', r_comp_raw)} "
+                            f"{_stats_text('r_comp', r_comp)} "
+                            f"{_stats_text('r_mimic', r_mimic)} "
+                            f"{_stats_text('r_terminal', r_terminal)} "
+                            f"{_stats_text('reward_main', reward_main)} "
+                            f"{_stats_text('reward', reward_info_values)} "
+                            f"{_stats_text('denom_comp', denom_comp)} "
+                            f"{_stats_text('denom_base', denom_base)} "
+                            f"{_stats_text('denom_task', denom_task)} "
+                            f"{_stats_text('reward_window_count', reward_window_count)} "
+                            f"target_quants_mean={float(np.nanmean(target_quants_sum / 3.0)):.6g} "
+                            f"target_quants_l1_mean={float(np.nanmean(target_quants_l1)):.6g} "
+                            f"target_quants_l2_mean={float(np.nanmean(target_quants_l2)):.6g} "
+                            f"target_quants_l3_mean={float(np.nanmean(target_quants_l3)):.6g} "
+                            f"action_msg_volume_mean={float(np.nanmean(action_msg_volume)):.6g} "
+                            f"cancel_msg_count_mean={float(np.nanmean(cancel_msg_count)):.6g} "
+                            f"cancel_msg_volume_mean={float(np.nanmean(cancel_msg_volume)):.6g} "
                             f"buy_reward={_masked_mean(rewards, ~is_sell_task):.6g} "
                             f"sell_reward={_masked_mean(rewards, is_sell_task):.6g} "
                             f"action_mean={_fmt(np.mean(action_2d, axis=0))} "
