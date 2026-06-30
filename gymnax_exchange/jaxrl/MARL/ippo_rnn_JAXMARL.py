@@ -124,7 +124,13 @@ class ReliabilityFusionRNN(nn.Module):
         embedding_t = nn.relu(embedding_t)
 
         new_rnn_state, y_t = nn.GRUCell(features=self.config["FC_DIM_SIZE"])(rnn_state, embedding_t)
-        return new_rnn_state, (y_t, reliability_scores_t)
+        rvd_diag_t = {
+            "z_tokens_norm": jnp.linalg.norm(z_tokens_t, axis=-1),
+            "filtered_tokens_norm": jnp.linalg.norm(filtered_tokens_t, axis=-1),
+            "fusion_output_norm": jnp.linalg.norm(fused_t, axis=-1),
+            "pre_rnn_embedding_norm": jnp.linalg.norm(embedding_t, axis=-1),
+        }
+        return new_rnn_state, (y_t, reliability_scores_t, rvd_diag_t)
 
 # FIXME: APPLY VISION 
 class ActorCriticRNN(nn.Module):
@@ -153,11 +159,14 @@ class ActorCriticRNN(nn.Module):
                 if tick_shift is None:
                     tick_shift = jnp.zeros((*obs_exec.shape[:2], 1), dtype=obs_exec.dtype)
 
-                hidden, (embedding, reliability_scores) = ReliabilityFusionRNN(config=self.config)(
+                hidden, (embedding, reliability_scores, rvd_diag) = ReliabilityFusionRNN(config=self.config)(
                     hidden,
                     (obs_exec, obs_exec_smoothed, z_tokens, dones, tick_shift),
                 )
-                aux_info = {"reliability_scores": reliability_scores}
+                aux_info = {
+                    "reliability_scores": reliability_scores,
+                    **rvd_diag,
+                }
             else:
                 fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
                 fused_obs = fusion(obs_exec_smoothed, z_tokens)
@@ -170,8 +179,18 @@ class ActorCriticRNN(nn.Module):
 
                 hidden, embedding = ScannedRNN()(hidden, rnn_in)
                 aux_info = {
-                    "reliability_scores": jnp.zeros((*z_tokens.shape[:-1], 1), dtype=z_tokens.dtype)
+                    "reliability_scores": jnp.zeros((*z_tokens.shape[:-1], 1), dtype=z_tokens.dtype),
+                    "z_tokens_norm": jnp.linalg.norm(z_tokens, axis=-1),
+                    "filtered_tokens_norm": jnp.linalg.norm(z_tokens, axis=-1),
+                    "fusion_output_norm": jnp.linalg.norm(fused_obs, axis=-1),
+                    "pre_rnn_embedding_norm": jnp.linalg.norm(embedding, axis=-1),
                 }
+
+            aux_info.update({
+                "exec_obs_norm": jnp.linalg.norm(obs_exec, axis=-1),
+                "vision_token_pooled_norm": jnp.linalg.norm(z_vision, axis=-1),
+                "actor_input_norm": jnp.linalg.norm(embedding, axis=-1),
+            })
         else:
             fused_obs = obs
             z_vision = jnp.zeros((1,))
@@ -183,8 +202,16 @@ class ActorCriticRNN(nn.Module):
             rnn_in = (embedding, dones)
 
             hidden, embedding = ScannedRNN()(hidden, rnn_in)
+            zero_diag = jnp.zeros(embedding.shape[:-1], dtype=embedding.dtype)
             aux_info = {
-                "reliability_scores": jnp.zeros((*embedding.shape[:-1], 1, 1), dtype=embedding.dtype)
+                "reliability_scores": jnp.zeros((*embedding.shape[:-1], 1, 1, 1), dtype=embedding.dtype),
+                "z_tokens_norm": zero_diag,
+                "filtered_tokens_norm": zero_diag,
+                "fusion_output_norm": zero_diag,
+                "pre_rnn_embedding_norm": zero_diag,
+                "exec_obs_norm": jnp.linalg.norm(obs, axis=-1),
+                "vision_token_pooled_norm": zero_diag,
+                "actor_input_norm": jnp.linalg.norm(embedding, axis=-1),
             }
         actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
             embedding
@@ -498,7 +525,7 @@ def make_train(config):
                 transitions=[]
                 for i,train_state in enumerate(train_states):
                     done_batch['agents'][i] = batchify(done["agents"][i],config["NUM_ACTORS_PERTYPE"][i]).squeeze()
-                    obs_batch = batchify(obsv[i],config["NUM_ACTORS_PERTYPE"][i])
+                    obs_batch = batchify(last_obs[i],config["NUM_ACTORS_PERTYPE"][i])
                     action_batch = batchify_action(actions[i],config["NUM_ACTORS_PERTYPE"][i])
                     value = values[i]
                     log_prob = log_probs[i]
@@ -759,13 +786,49 @@ def make_train(config):
                             else:
                                 supcon_loss = jnp.array(0.0)
 
+                            reliability_scores = aux_info["reliability_scores"]
+                            if reliability_scores.ndim == 4:
+                                reliability_scores = reliability_scores[..., None]
+
+                            reliability_mean = jnp.mean(reliability_scores)
+                            reliability_std = jnp.std(reliability_scores)
+                            reliability_min = jnp.min(reliability_scores)
+                            reliability_max = jnp.max(reliability_scores)
+
+                            reliability_level_mean = jnp.mean(reliability_scores, axis=(0, 1, 3, 4))
+                            reliability_level_mean = reliability_level_mean[:10]
+                            reliability_level_mean = jnp.pad(
+                                reliability_level_mean,
+                                (0, 10 - reliability_level_mean.shape[0]),
+                                constant_values=0.0,
+                            )
+                            reliability_side_mean = jnp.mean(reliability_scores, axis=(0, 1, 2, 4))
+                            reliability_side_mean = reliability_side_mean[:2]
+                            reliability_side_mean = jnp.pad(
+                                reliability_side_mean,
+                                (0, 2 - reliability_side_mean.shape[0]),
+                                constant_values=0.0,
+                            )
+
+                            z_tokens_norm = aux_info["z_tokens_norm"]
+                            filtered_tokens_norm = aux_info["filtered_tokens_norm"]
+                            z_tokens_norm_mean = jnp.mean(z_tokens_norm)
+                            z_tokens_norm_std = jnp.std(z_tokens_norm)
+                            filtered_tokens_norm_mean = jnp.mean(filtered_tokens_norm)
+                            filtered_tokens_norm_std = jnp.std(filtered_tokens_norm)
+                            filtering_ratio = filtered_tokens_norm_mean / jnp.maximum(z_tokens_norm_mean, 1e-8)
+                            exec_obs_norm_mean = jnp.mean(aux_info["exec_obs_norm"])
+                            vision_token_pooled_norm_mean = jnp.mean(aux_info["vision_token_pooled_norm"])
+                            fusion_output_norm_mean = jnp.mean(aux_info["fusion_output_norm"])
+                            pre_rnn_embedding_norm_mean = jnp.mean(aux_info["pre_rnn_embedding_norm"])
+                            actor_input_norm_mean = jnp.mean(aux_info["actor_input_norm"])
+
                             # LOSS CUỐI CÙNG (Cộng PPO và SupCon có hệ số)
                             if (
                                 config.get("use_survival_loss", False)
                                 and config.get("use_reliability_head", False)
                                 and isinstance(traj_batch.obs, dict)
                             ):
-                                reliability_scores = aux_info["reliability_scores"]
                                 # Soft targets use the same auxiliary slot as the legacy survival loss.
                                 survival_loss = masked_reliability_loss(
                                     reliability_scores,
@@ -776,12 +839,10 @@ def make_train(config):
                                 )
                                 lambda_surv = config.get("lambda_surv", 0.0)
                                 survival_mask_ratio = jnp.mean(surv_mask.astype(jnp.float32))
-                                reliability_mean = jnp.mean(reliability_scores)
                             else:
                                 survival_loss = jnp.array(0.0)
                                 lambda_surv = jnp.array(0.0)
                                 survival_mask_ratio = jnp.array(0.0)
-                                reliability_mean = jnp.array(0.0)
 
                             if use_supcon_loss and lambda_supcon != 0.0:
                                 weighted_supcon_loss = lambda_supcon * supcon_loss
@@ -812,6 +873,31 @@ def make_train(config):
                                 weighted_entropy_term,
                                 weighted_supcon_loss,
                                 aux_loss,
+                                reliability_std,
+                                reliability_min,
+                                reliability_max,
+                                reliability_level_mean[0],
+                                reliability_level_mean[1],
+                                reliability_level_mean[2],
+                                reliability_level_mean[3],
+                                reliability_level_mean[4],
+                                reliability_level_mean[5],
+                                reliability_level_mean[6],
+                                reliability_level_mean[7],
+                                reliability_level_mean[8],
+                                reliability_level_mean[9],
+                                reliability_side_mean[0],
+                                reliability_side_mean[1],
+                                z_tokens_norm_mean,
+                                z_tokens_norm_std,
+                                filtered_tokens_norm_mean,
+                                filtered_tokens_norm_std,
+                                filtering_ratio,
+                                exec_obs_norm_mean,
+                                vision_token_pooled_norm_mean,
+                                fusion_output_norm_mean,
+                                pre_rnn_embedding_norm_mean,
+                                actor_input_norm_mean,
                             )
                         grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                         total_loss, grads = grad_fn(
@@ -938,6 +1024,31 @@ def make_train(config):
                     "weighted_entropy_term": loss_info[1][13],
                     "weighted_supcon_loss": loss_info[1][14],
                     "aux_loss": loss_info[1][15],
+                    "reliability_std": loss_info[1][16],
+                    "reliability_min": loss_info[1][17],
+                    "reliability_max": loss_info[1][18],
+                    "reliability_level_mean_0": loss_info[1][19],
+                    "reliability_level_mean_1": loss_info[1][20],
+                    "reliability_level_mean_2": loss_info[1][21],
+                    "reliability_level_mean_3": loss_info[1][22],
+                    "reliability_level_mean_4": loss_info[1][23],
+                    "reliability_level_mean_5": loss_info[1][24],
+                    "reliability_level_mean_6": loss_info[1][25],
+                    "reliability_level_mean_7": loss_info[1][26],
+                    "reliability_level_mean_8": loss_info[1][27],
+                    "reliability_level_mean_9": loss_info[1][28],
+                    "reliability_side0_mean": loss_info[1][29],
+                    "reliability_side1_mean": loss_info[1][30],
+                    "z_tokens_norm_mean": loss_info[1][31],
+                    "z_tokens_norm_std": loss_info[1][32],
+                    "filtered_tokens_norm_mean": loss_info[1][33],
+                    "filtered_tokens_norm_std": loss_info[1][34],
+                    "filtering_ratio": loss_info[1][35],
+                    "exec_obs_norm_mean": loss_info[1][36],
+                    "vision_token_pooled_norm_mean": loss_info[1][37],
+                    "fusion_output_norm_mean": loss_info[1][38],
+                    "pre_rnn_embedding_norm_mean": loss_info[1][39],
+                    "actor_input_norm_mean": loss_info[1][40],
                     "total_loss_with_aux": loss_info[0],
                     "weighted_entropy_loss": loss_info[1][2] * config["ENT_COEF"][i],
                     "lambda_supcon": jnp.array(
@@ -1023,7 +1134,7 @@ def make_train(config):
 
                     for i, train_state in enumerate(train_states):
                         done_batch['agents'][i] = batchify(done["agents"][i],config["NUM_ACTORS_PERTYPE"][i]).squeeze()
-                        obs_batch = batchify(obsv[i],config["NUM_ACTORS_PERTYPE"][i])
+                        obs_batch = batchify(last_obs[i],config["NUM_ACTORS_PERTYPE"][i])
                         action_batch = batchify_action(actions[i],config["NUM_ACTORS_PERTYPE"][i])
                         value = values[i]
                         log_prob = log_probs[i]
@@ -1081,7 +1192,8 @@ def make_train(config):
                     metrics["traj_batch_eval"] = eval_traj_batch
 
             def callback(metric):
-                print("Update step:", metric["update_steps"])
+                update_idx = int(metric["update_steps"])
+                print(f"\n==================== UPDATE {update_idx} / {config['NUM_UPDATES']} ====================")
                 # for loss_idx, m in enumerate(metric["loss"]):
                 #         logging_dict[f"agent_{agent_name}/loss_{loss_idx}"] = m
                 # Needed?
@@ -1095,40 +1207,96 @@ def make_train(config):
                     default_value = 1.0 if default else 0.0
                     return bool(_loss_value(loss_metrics, key, default_value) >= 0.5)
 
-                loss_diag_parts = [
-                    "LOSS_DIAG",
-                    f"update={int(metric['update_steps'])}",
-                ]
+                def _fmt_values(values):
+                    return "[" + ", ".join(f"{float(v):.4g}" for v in np.array(values).reshape(-1)) + "]"
+
+                exe_loss_metrics = None
+                print("[TRAINING LOSS]")
                 for loss_agent_index, loss_metrics in enumerate(metric["loss"]):
                     loss_agent_name = agent_type_names[loss_agent_index]
-                    loss_diag_parts.extend([
+                    if loss_agent_name == "EXE":
+                        exe_loss_metrics = loss_metrics
+                    print(" ".join([
+                        "LOSS_DIAG",
+                        f"update={update_idx}",
+                        f"agent={loss_agent_name}",
                         f"{loss_agent_name}_total_loss={_loss_value(loss_metrics, 'total_loss'):.6g}",
+                        f"{loss_agent_name}_ppo_loss={_loss_value(loss_metrics, 'ppo_loss'):.6g}",
                         f"{loss_agent_name}_policy_loss={_loss_value(loss_metrics, 'policy_loss'):.6g}",
                         f"{loss_agent_name}_value_loss={_loss_value(loss_metrics, 'value_loss'):.6g}",
                         f"{loss_agent_name}_entropy_loss={_loss_value(loss_metrics, 'entropy_loss'):.6g}",
-                        f"{loss_agent_name}_ppo_loss={_loss_value(loss_metrics, 'ppo_loss'):.6g}",
                         f"{loss_agent_name}_aux_loss={_loss_value(loss_metrics, 'aux_loss'):.6g}",
+                        f"{loss_agent_name}_approx_kl={_loss_value(loss_metrics, 'approx_kl'):.6g}",
+                        f"{loss_agent_name}_clip_frac={_loss_value(loss_metrics, 'clip_frac'):.6g}",
+                    ]))
+
+                print("[AUX LOSS]")
+                for loss_agent_index, loss_metrics in enumerate(metric["loss"]):
+                    loss_agent_name = agent_type_names[loss_agent_index]
+                    print(" ".join([
+                        "AUX_DIAG",
+                        f"update={update_idx}",
+                        f"agent={loss_agent_name}",
                         f"{loss_agent_name}_lambda_supcon={_loss_value(loss_metrics, 'lambda_supcon'):.6g}",
                         f"{loss_agent_name}_use_supcon_loss={_loss_bool(loss_metrics, 'use_supcon_loss')}",
                         f"{loss_agent_name}_lambda_surv={_loss_value(loss_metrics, 'lambda_surv'):.6g}",
                         f"{loss_agent_name}_use_survival_loss={_loss_bool(loss_metrics, 'use_survival_loss')}",
-                        f"{loss_agent_name}_survival_loss={_loss_value(loss_metrics, 'survival_loss'):.6g}",
-                        f"{loss_agent_name}_reliability_loss={_loss_value(loss_metrics, 'reliability_loss'):.6g}",
                         f"{loss_agent_name}_supcon_loss={_loss_value(loss_metrics, 'supcon_loss'):.6g}",
-                        f"{loss_agent_name}_weighted_value_loss={_loss_value(loss_metrics, 'weighted_value_loss'):.6g}",
-                        f"{loss_agent_name}_weighted_entropy_term={_loss_value(loss_metrics, 'weighted_entropy_term'):.6g}",
                         f"{loss_agent_name}_weighted_supcon_loss={_loss_value(loss_metrics, 'weighted_supcon_loss'):.6g}",
+                        f"{loss_agent_name}_survival_loss={_loss_value(loss_metrics, 'survival_loss'):.6g}",
                         f"{loss_agent_name}_weighted_survival_loss={_loss_value(loss_metrics, 'weighted_survival_loss'):.6g}",
-                        f"{loss_agent_name}_total_loss_with_aux={_loss_value(loss_metrics, 'total_loss_with_aux'):.6g}",
+                        f"{loss_agent_name}_reliability_loss={_loss_value(loss_metrics, 'reliability_loss'):.6g}",
                         f"{loss_agent_name}_abs_ppo_loss={_loss_value(loss_metrics, 'abs_ppo_loss'):.6g}",
                         f"{loss_agent_name}_abs_aux_loss={_loss_value(loss_metrics, 'abs_aux_loss'):.6g}",
                         f"{loss_agent_name}_aux_to_ppo_ratio={_loss_value(loss_metrics, 'aux_to_ppo_ratio'):.6g}",
                         f"{loss_agent_name}_supcon_to_ppo_ratio={_loss_value(loss_metrics, 'supcon_to_ppo_ratio'):.6g}",
                         f"{loss_agent_name}_survival_to_ppo_ratio={_loss_value(loss_metrics, 'survival_to_ppo_ratio'):.6g}",
-                        f"{loss_agent_name}_approx_kl={_loss_value(loss_metrics, 'approx_kl'):.6g}",
-                        f"{loss_agent_name}_clip_frac={_loss_value(loss_metrics, 'clip_frac'):.6g}",
-                    ])
-                print(" ".join(loss_diag_parts))
+                    ]))
+
+                print("[RVD FORWARD]")
+                if exe_loss_metrics is not None:
+                    reliability_levels = [
+                        _loss_value(exe_loss_metrics, f"reliability_level_mean_{idx}")
+                        for idx in range(10)
+                    ]
+                    print(" ".join([
+                        "RVD_DIAG",
+                        f"update={update_idx}",
+                        f"reliability_mean={_loss_value(exe_loss_metrics, 'reliability_mean'):.6g}",
+                        f"reliability_std={_loss_value(exe_loss_metrics, 'reliability_std'):.6g}",
+                        f"reliability_min={_loss_value(exe_loss_metrics, 'reliability_min'):.6g}",
+                        f"reliability_max={_loss_value(exe_loss_metrics, 'reliability_max'):.6g}",
+                        f"reliability_side0_mean={_loss_value(exe_loss_metrics, 'reliability_side0_mean'):.6g}",
+                        f"reliability_side1_mean={_loss_value(exe_loss_metrics, 'reliability_side1_mean'):.6g}",
+                    ]))
+                    print(
+                        "RVD_DIAG_LEVELS "
+                        f"update={update_idx} "
+                        f"reliability_level_mean={_fmt_values(reliability_levels)}"
+                    )
+                    print(" ".join([
+                        "RVD_TOKEN_DIAG",
+                        f"update={update_idx}",
+                        f"z_tokens_norm_mean={_loss_value(exe_loss_metrics, 'z_tokens_norm_mean'):.6g}",
+                        f"z_tokens_norm_std={_loss_value(exe_loss_metrics, 'z_tokens_norm_std'):.6g}",
+                        f"filtered_tokens_norm_mean={_loss_value(exe_loss_metrics, 'filtered_tokens_norm_mean'):.6g}",
+                        f"filtered_tokens_norm_std={_loss_value(exe_loss_metrics, 'filtered_tokens_norm_std'):.6g}",
+                        f"filtering_ratio={_loss_value(exe_loss_metrics, 'filtering_ratio'):.6g}",
+                    ]))
+                    print(" ".join([
+                        "RVD_FUSION_DIAG",
+                        f"update={update_idx}",
+                        f"exec_obs_norm_mean={_loss_value(exe_loss_metrics, 'exec_obs_norm_mean'):.6g}",
+                        f"vision_token_pooled_norm_mean={_loss_value(exe_loss_metrics, 'vision_token_pooled_norm_mean'):.6g}",
+                        f"fusion_output_norm_mean={_loss_value(exe_loss_metrics, 'fusion_output_norm_mean'):.6g}",
+                        f"pre_rnn_embedding_norm_mean={_loss_value(exe_loss_metrics, 'pre_rnn_embedding_norm_mean'):.6g}",
+                        f"actor_input_norm_mean={_loss_value(exe_loss_metrics, 'actor_input_norm_mean'):.6g}",
+                    ]))
+                else:
+                    print(f"RVD_DIAG update={update_idx} status=no_execution_loss_metrics")
+
+                print("[GRADIENTS]")
+                print(f"GRAD_DIAG update={update_idx} grad_norm_status=deferred")
 
                 for agent_index, tr in enumerate(metric["traj_batch"]):
                     agent_name = agent_type_names[agent_index]
@@ -1217,20 +1385,29 @@ def make_train(config):
                         else:
                             action_2d = action_values.reshape(-1, action_values.shape[-1])
 
+                        avg_reward_exe = float(np.array(metric['avg_reward'][agent_index]))
+                        action_mean = np.mean(action_2d, axis=0)
+                        action_min = np.min(action_2d, axis=0)
+                        action_max = np.max(action_2d, axis=0)
+
+                        print("[EXECUTION REWARD]")
                         print(
-                            "EXE_DIAG "
-                            f"update={int(metric['update_steps'])} "
-                            f"avg_reward={float(np.array(metric['avg_reward'][agent_index])):.6g} "
-                            f"doom_count={int(np.sum(doom_quant > 0))} "
-                            f"doom_quant_mean={float(np.mean(doom_quant)):.6g} "
-                            f"doom_quant_max={float(np.max(doom_quant)):.6g} "
-                            f"quant_left_mean={float(np.mean(quant_left)):.6g} "
-                            f"quant_left_max={float(np.max(quant_left)):.6g} "
-                            f"terminal_left_before_unwind_mean={float(np.nanmean(quant_left_before_unwind)):.6g} "
-                            f"agentQuant_mean={float(np.nanmean(agent_quant)):.6g} "
-                            f"agentQuant_step_mean={float(np.nanmean(agent_quant_step)):.6g} "
+                            "EXE_REWARD_DIAG "
+                            f"update={update_idx} "
+                            f"avg_reward_EXE={avg_reward_exe:.6g} "
                             f"V_RL_k_mean={float(np.nanmean(V_RL_k)):.6g} "
                             f"V_base_k_mean={float(np.nanmean(V_base_k)):.6g} "
+                            f"r_comp_mean={float(np.nanmean(r_comp)):.6g} "
+                            f"r_mimic_mean={float(np.nanmean(r_mimic)):.6g} "
+                            f"r_terminal_mean={float(np.nanmean(r_terminal)):.6g} "
+                            f"reward_main_mean={float(np.nanmean(reward_main)):.6g} "
+                            f"reward_mean={float(np.nanmean(reward_info_values)):.6g} "
+                            f"buy_reward={_masked_mean(rewards, ~is_sell_task):.6g} "
+                            f"sell_reward={_masked_mean(rewards, is_sell_task):.6g}"
+                        )
+                        print(
+                            "EXE_REWARD_RANGE_DIAG "
+                            f"update={update_idx} "
                             f"{_stats_text('r_comp_raw', r_comp_raw)} "
                             f"{_stats_text('r_comp', r_comp)} "
                             f"{_stats_text('r_mimic', r_mimic)} "
@@ -1240,19 +1417,37 @@ def make_train(config):
                             f"{_stats_text('denom_comp', denom_comp)} "
                             f"{_stats_text('denom_base', denom_base)} "
                             f"{_stats_text('denom_task', denom_task)} "
-                            f"{_stats_text('reward_window_count', reward_window_count)} "
+                            f"{_stats_text('reward_window_count', reward_window_count)}"
+                        )
+
+                        print("[ACTION / EXECUTION]")
+                        print(
+                            "EXE_ACTION_DIAG "
+                            f"update={update_idx} "
+                            f"action_mean={_fmt(action_mean)} "
+                            f"action_min={_fmt(action_min)} "
+                            f"action_max={_fmt(action_max)} "
                             f"target_quants_mean={float(np.nanmean(target_quants_sum / 3.0)):.6g} "
                             f"target_quants_l1_mean={float(np.nanmean(target_quants_l1)):.6g} "
                             f"target_quants_l2_mean={float(np.nanmean(target_quants_l2)):.6g} "
                             f"target_quants_l3_mean={float(np.nanmean(target_quants_l3)):.6g} "
                             f"action_msg_volume_mean={float(np.nanmean(action_msg_volume)):.6g} "
+                            f"agentQuant_step_mean={float(np.nanmean(agent_quant_step)):.6g} "
                             f"cancel_msg_count_mean={float(np.nanmean(cancel_msg_count)):.6g} "
-                            f"cancel_msg_volume_mean={float(np.nanmean(cancel_msg_volume)):.6g} "
-                            f"buy_reward={_masked_mean(rewards, ~is_sell_task):.6g} "
-                            f"sell_reward={_masked_mean(rewards, is_sell_task):.6g} "
-                            f"action_mean={_fmt(np.mean(action_2d, axis=0))} "
-                            f"action_min={_fmt(np.min(action_2d, axis=0))} "
-                            f"action_max={_fmt(np.max(action_2d, axis=0))}"
+                            f"cancel_msg_volume_mean={float(np.nanmean(cancel_msg_volume)):.6g}"
+                        )
+                        print(
+                            "EXE_DIAG "
+                            f"update={update_idx} "
+                            f"avg_reward={avg_reward_exe:.6g} "
+                            f"doom_count={int(np.sum(doom_quant > 0))} "
+                            f"doom_quant_mean={float(np.mean(doom_quant)):.6g} "
+                            f"doom_quant_max={float(np.max(doom_quant)):.6g} "
+                            f"quant_left_mean={float(np.mean(quant_left)):.6g} "
+                            f"quant_left_max={float(np.max(quant_left)):.6g} "
+                            f"terminal_left_before_unwind_mean={float(np.nanmean(quant_left_before_unwind)):.6g} "
+                            f"agentQuant_mean={float(np.nanmean(agent_quant)):.6g} "
+                            f"agentQuant_step_mean={float(np.nanmean(agent_quant_step)):.6g}"
                         )
                     
                     # Process world info if available
@@ -1304,6 +1499,16 @@ def make_train(config):
                 for agent_index, agent_value in enumerate(metric["avg_reward"]):
                     agent_name = agent_type_names[agent_index]
                     print(f"avg_reward_{agent_name} {agent_value}")
+                summary_parts = [
+                    "SUMMARY_DIAG",
+                    f"update={update_idx}",
+                    "status=update_completed",
+                ]
+                for agent_index, agent_value in enumerate(metric["avg_reward"]):
+                    agent_name = agent_type_names[agent_index]
+                    summary_parts.append(f"avg_reward_{agent_name}={float(np.array(agent_value)):.6g}")
+                print("[SUMMARY]")
+                print(" ".join(summary_parts))
 
             metrics["update_steps"] = update_steps
             jax.experimental.io_callback(callback, None, metrics)

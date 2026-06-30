@@ -546,7 +546,7 @@ def make_train(config):
                 transitions=[]
                 for i,train_state in enumerate(train_states):
                     done_batch['agents'][i] = batchify(done["agents"][i],local_num_actors_per_type[i]).squeeze()
-                    obs_batch = batchify(obsv[i],local_num_actors_per_type[i])
+                    obs_batch = batchify(last_obs[i],local_num_actors_per_type[i])
                     action_batch = batchify_action(actions[i],local_num_actors_per_type[i])
                     value = values[i]
                     log_prob = log_probs[i]
@@ -1039,7 +1039,7 @@ def make_train(config):
 
                     for i, train_state in enumerate(train_states):
                         done_batch['agents'][i] = batchify(done["agents"][i],local_num_actors_per_type[i]).squeeze()
-                        obs_batch = batchify(obsv[i],local_num_actors_per_type[i])
+                        obs_batch = batchify(last_obs[i],local_num_actors_per_type[i])
                         action_batch = batchify_action(actions[i],local_num_actors_per_type[i])
                         value = values[i]
                         log_prob = log_probs[i]
