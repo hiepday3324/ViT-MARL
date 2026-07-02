@@ -281,9 +281,10 @@ def build_liquidity_survival_targets(
         target = jnp.stack([ask_label & ask_mask, bid_label & bid_mask], axis=-1)
         return target.astype(jnp.float32), side_mask.astype(jnp.float32)
 
-    soft_survival = jnp.min(jnp.stack(future_ratios, axis=0), axis=0)
+    ratios = jnp.stack(future_ratios, axis=0)
+    min_survival = jnp.min(ratios, axis=0)
     if survival_target_mode == "min_horizon_soft":
-        return soft_survival.astype(jnp.float32), side_mask.astype(jnp.float32)
+        return min_survival.astype(jnp.float32), side_mask.astype(jnp.float32)
 
     if is_sell_task is None:
         raise ValueError(
@@ -313,5 +314,11 @@ def build_liquidity_survival_targets(
         actionability_far_level_weight,
     )
     actionability = side_weight[:, :, None, :] * level_weight[None, None, :, None]
-    target = soft_survival * actionability
+    mean_survival = jnp.mean(ratios, axis=0)
+    availability = jnp.mean(
+        (ratios >= survival_ratio).astype(jnp.float32),
+        axis=0,
+    )
+    robust_survival = mean_survival * availability
+    target = robust_survival * actionability
     return target.astype(jnp.float32), side_mask.astype(jnp.float32)

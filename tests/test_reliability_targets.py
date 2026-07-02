@@ -27,6 +27,19 @@ class ReliabilityTargetTest(unittest.TestCase):
         vision_obs = vision_obs.at[:, :, :, 1, :].set(jnp.log1p(volume))
         return vision_obs
 
+    def _make_ratio_vision_obs(self, ratios, current_volume=10.0):
+        ratios = jnp.asarray(ratios, dtype=jnp.float32)
+        vision_obs = self._make_vision_obs(
+            time_steps=ratios.shape[0] + 1,
+            batch_size=1,
+            levels=1,
+            volume=current_volume,
+        )
+        future_volumes = current_volume * ratios
+        vision_obs = vision_obs.at[1:, 0, 0, 1, :].set(jnp.log1p(future_volumes[:, None]))
+        vision_obs = vision_obs.at[1:, 0, 0, 2, :].set(jnp.log1p(future_volumes[:, None]))
+        return vision_obs
+
     def _build_targets(self, vision_obs, *, mode, is_sell_task=None, delta=2, **kwargs):
         num_steps = vision_obs.shape[0] - delta
         mid_prices = jnp.full((vision_obs.shape[0], vision_obs.shape[1]), 10_000.0)
@@ -92,6 +105,29 @@ class ReliabilityTargetTest(unittest.TestCase):
         )
         self.assertAlmostEqual(float(sell_labels[0, 0, 0, 0]), 1.0, places=5)
         self.assertAlmostEqual(float(sell_labels[0, 0, 0, 1]), 0.1, places=5)
+
+    def test_actionability_weighted_target_uses_availability_weighted_mean_survival(self):
+        cases = [
+            ([1.0, 0.8, 0.7, 0.9, 0.0, 0.8, 0.7, 0.6, 0.8, 0.7], 0.63),
+            ([1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 0.25),
+            ([0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], 0.01),
+        ]
+
+        for ratios, expected_target in cases:
+            with self.subTest(ratios=ratios):
+                vision_obs = self._make_ratio_vision_obs(ratios)
+                labels, mask = self._build_targets(
+                    vision_obs,
+                    mode="actionability_weighted_min_horizon",
+                    is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
+                    delta=len(ratios),
+                    actionability_eta=0.1,
+                    actionability_depth=1,
+                    actionability_far_level_weight=0.25,
+                )
+
+                self.assertAlmostEqual(float(labels[0, 0, 0, 0]), expected_target, places=5)
+                self.assertEqual(float(mask[0, 0, 0, 0]), 1.0)
 
     def test_episode_done_masks_the_inclusive_horizon_without_changing_labels(self):
         vision_obs = self._make_vision_obs(time_steps=4)
