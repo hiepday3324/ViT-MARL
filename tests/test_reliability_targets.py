@@ -40,6 +40,14 @@ class ReliabilityTargetTest(unittest.TestCase):
         vision_obs = vision_obs.at[1:, 0, 0, 2, :].set(jnp.log1p(future_volumes[:, None]))
         return vision_obs
 
+    def _expected_robust_survival(self, ratios, survival_ratio=0.5, temperature=0.15):
+        ratios = jnp.asarray(ratios, dtype=jnp.float32)
+        mean_survival = jnp.mean(ratios)
+        availability = jnp.mean(
+            1.0 / (1.0 + jnp.exp(-((ratios - survival_ratio) / temperature)))
+        )
+        return float(mean_survival * availability)
+
     def _build_targets(self, vision_obs, *, mode, is_sell_task=None, delta=2, **kwargs):
         num_steps = vision_obs.shape[0] - delta
         mid_prices = jnp.full((vision_obs.shape[0], vision_obs.shape[1]), 10_000.0)
@@ -92,10 +100,11 @@ class ReliabilityTargetTest(unittest.TestCase):
             is_sell_task=jnp.zeros((1, 1), dtype=jnp.float32),
             **common_kwargs,
         )
-        self.assertAlmostEqual(float(buy_labels[0, 0, 0, 0]), 0.1, places=5)
-        self.assertAlmostEqual(float(buy_labels[0, 0, 0, 1]), 1.0, places=5)
-        self.assertAlmostEqual(float(buy_labels[0, 0, 3, 0]), 0.025, places=5)
-        self.assertAlmostEqual(float(buy_labels[0, 0, 3, 1]), 0.25, places=5)
+        full_ratio_target = self._expected_robust_survival([1.0])
+        self.assertAlmostEqual(float(buy_labels[0, 0, 0, 0]), 0.1 * full_ratio_target, places=5)
+        self.assertAlmostEqual(float(buy_labels[0, 0, 0, 1]), full_ratio_target, places=5)
+        self.assertAlmostEqual(float(buy_labels[0, 0, 3, 0]), 0.025 * full_ratio_target, places=5)
+        self.assertAlmostEqual(float(buy_labels[0, 0, 3, 1]), 0.25 * full_ratio_target, places=5)
 
         sell_labels, _ = self._build_targets(
             vision_obs,
@@ -103,17 +112,17 @@ class ReliabilityTargetTest(unittest.TestCase):
             is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
             **common_kwargs,
         )
-        self.assertAlmostEqual(float(sell_labels[0, 0, 0, 0]), 1.0, places=5)
-        self.assertAlmostEqual(float(sell_labels[0, 0, 0, 1]), 0.1, places=5)
+        self.assertAlmostEqual(float(sell_labels[0, 0, 0, 0]), full_ratio_target, places=5)
+        self.assertAlmostEqual(float(sell_labels[0, 0, 0, 1]), 0.1 * full_ratio_target, places=5)
 
-    def test_actionability_weighted_target_uses_availability_weighted_mean_survival(self):
+    def test_actionability_weighted_target_uses_sigmoid_availability(self):
         cases = [
-            ([1.0, 0.8, 0.7, 0.9, 0.0, 0.8, 0.7, 0.6, 0.8, 0.7], 0.63),
-            ([1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 0.25),
-            ([0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], 0.01),
+            [0.5] * 10,
+            [0.4] * 10,
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         ]
 
-        for ratios, expected_target in cases:
+        for ratios in cases:
             with self.subTest(ratios=ratios):
                 vision_obs = self._make_ratio_vision_obs(ratios)
                 labels, mask = self._build_targets(
@@ -125,9 +134,28 @@ class ReliabilityTargetTest(unittest.TestCase):
                     actionability_depth=1,
                     actionability_far_level_weight=0.25,
                 )
+                expected_target = self._expected_robust_survival(ratios)
 
                 self.assertAlmostEqual(float(labels[0, 0, 0, 0]), expected_target, places=5)
                 self.assertEqual(float(mask[0, 0, 0, 0]), 1.0)
+
+    def test_sigmoid_availability_target_is_monotonic(self):
+        targets = []
+        for ratios in ([0.4] * 10, [0.5] * 10, [0.8] * 10):
+            vision_obs = self._make_ratio_vision_obs(ratios)
+            labels, _ = self._build_targets(
+                vision_obs,
+                mode="actionability_weighted_min_horizon",
+                is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
+                delta=len(ratios),
+                actionability_eta=0.1,
+                actionability_depth=1,
+                actionability_far_level_weight=0.25,
+            )
+            targets.append(float(labels[0, 0, 0, 0]))
+
+        self.assertLess(targets[0], targets[1])
+        self.assertLess(targets[1], targets[2])
 
     def test_episode_done_masks_the_inclusive_horizon_without_changing_labels(self):
         vision_obs = self._make_vision_obs(time_steps=4)

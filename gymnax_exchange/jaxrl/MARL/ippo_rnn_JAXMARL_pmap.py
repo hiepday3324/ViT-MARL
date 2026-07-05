@@ -661,6 +661,10 @@ def make_train(config):
                         survival_delta_steps=survival_delta_steps,
                         survival_min_volume=config.get("survival_min_volume", 1.0),
                         survival_ratio=config.get("survival_ratio", 0.5),
+                        survival_availability_temperature=config.get(
+                            "survival_availability_temperature",
+                            0.15,
+                        ),
                         num_steps=config["NUM_STEPS"],
                         episode_done=traj_batch_padded[i].info["agent"]["done"],
                         survival_target_mode=survival_target_mode,

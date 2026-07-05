@@ -180,6 +180,7 @@ def build_liquidity_survival_targets(
     actionability_eta=0.1,
     actionability_depth=3,
     actionability_far_level_weight=0.25,
+    survival_availability_temperature=0.15,
     eps=1e-8,
 ):
     """Build side-aware liquidity targets from normalized LOB vision frames.
@@ -189,8 +190,8 @@ def build_liquidity_survival_targets(
     ``[Ask, Bid]``. ``episode_done`` is an optional post-step, actor-aligned
     done flag; any done in the inclusive interval ``[t, t + Delta]`` masks
     that target from the reliability loss without changing its label value.
-    The actionability-weighted mode uses a soft minimum-horizon volume-survival
-    target, attenuating less executable sides and far levels.
+    The actionability-weighted mode uses an availability-weighted mean
+    volume-survival target, attenuating less executable sides and far levels.
     """
     valid_modes = {
         "final_step_binary",
@@ -315,8 +316,12 @@ def build_liquidity_survival_targets(
     )
     actionability = side_weight[:, :, None, :] * level_weight[None, None, :, None]
     mean_survival = jnp.mean(ratios, axis=0)
+    availability_temperature = jnp.maximum(
+        jnp.asarray(survival_availability_temperature, dtype=jnp.float32),
+        eps,
+    )
     availability = jnp.mean(
-        (ratios >= survival_ratio).astype(jnp.float32),
+        1.0 / (1.0 + jnp.exp(-((ratios - survival_ratio) / availability_temperature))),
         axis=0,
     )
     robust_survival = mean_survival * availability

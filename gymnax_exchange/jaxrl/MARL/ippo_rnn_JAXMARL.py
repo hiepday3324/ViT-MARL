@@ -614,8 +614,45 @@ def make_train(config):
                     mid_prices = jnp.repeat(mid_prices, batch_size // mid_prices.shape[1], axis=1)
                 return mid_prices
 
+            _surv_formula_components = (
+                "mean_survival",
+                "availability",
+                "rho_robust",
+                "a_side",
+                "a_level",
+                "y_rel",
+            )
+            _surv_dist_groups = (
+                "TOP3_ACTIONABLE",
+                "TOP3_NONACTIONABLE",
+                "FAR_ACTIONABLE",
+                "FAR_NONACTIONABLE",
+            )
+            _surv_dist_stats = (
+                "count",
+                "mean",
+                "std",
+                "min",
+                "p10",
+                "p25",
+                "p50",
+                "p75",
+                "p90",
+                "p95",
+                "p99",
+                "max",
+                "zero_rate",
+                "pos_rate_0p1",
+                "pos_rate_0p3",
+                "pos_rate_0p5",
+                "pos_rate_0p7",
+            )
+
+            def _surv_dist_key(component_name, group_name, stat_name):
+                return f"dist_{component_name}_{group_name}_{stat_name}"
+
             def _zero_mid_diag():
-                return {
+                diag = {
                     "obs_mid_available": jnp.array(0.0, dtype=jnp.float32),
                     "current_mid_mean": jnp.array(0.0, dtype=jnp.float32),
                     "reference_mid_mean": jnp.array(0.0, dtype=jnp.float32),
@@ -650,6 +687,14 @@ def make_train(config):
                     "max_abs_yrel_minus_product": jnp.array(0.0, dtype=jnp.float32),
                     "mean_abs_yrel_minus_product": jnp.array(0.0, dtype=jnp.float32),
                 }
+                for component_name in _surv_formula_components:
+                    for group_name in _surv_dist_groups:
+                        for stat_name in _surv_dist_stats:
+                            diag[_surv_dist_key(component_name, group_name, stat_name)] = jnp.array(
+                                0.0,
+                                dtype=jnp.float32,
+                            )
+                return diag
 
             def _build_survival_diag_components(
                 vision_obs,
@@ -714,8 +759,24 @@ def make_train(config):
 
                 ratios = jnp.stack(future_ratios, axis=0)
                 mean_survival = jnp.mean(ratios, axis=0)
+                availability_temperature = jnp.maximum(
+                    jnp.asarray(
+                        config.get("survival_availability_temperature", 0.15),
+                        dtype=jnp.float32,
+                    ),
+                    eps,
+                )
                 availability = jnp.mean(
-                    (ratios >= config.get("survival_ratio", 0.5)).astype(jnp.float32),
+                    1.0
+                    / (
+                        1.0
+                        + jnp.exp(
+                            -(
+                                (ratios - config.get("survival_ratio", 0.5))
+                                / availability_temperature
+                            )
+                        )
+                    ),
                     axis=0,
                 )
                 robust_survival = mean_survival * availability
@@ -807,6 +868,84 @@ def make_train(config):
                 y_rel_ask, y_rel_bid = _masked_side_level_mean(y_rel, component_mask)
                 masked_formula_diff = formula_diff * component_mask
                 component_mask_sum = jnp.maximum(jnp.sum(component_mask), 1e-8)
+
+                def _masked_stats(x, mask, eps_value=1e-8):
+                    x = jnp.asarray(x, dtype=jnp.float32)
+                    mask = jnp.asarray(mask, dtype=jnp.float32)
+                    count = jnp.sum(mask)
+                    safe_count = jnp.maximum(count, eps_value)
+                    mean = jnp.sum(x * mask) / safe_count
+                    centered = (x - mean) * mask
+                    std = jnp.sqrt(jnp.sum(jnp.square(centered)) / safe_count)
+                    flat_x = jnp.reshape(x, (-1,))
+                    flat_mask = jnp.reshape(mask > 0, (-1,))
+                    sorted_vals = jnp.sort(jnp.where(flat_mask, flat_x, jnp.inf))
+                    count_int = jnp.maximum(count.astype(jnp.int32), 1)
+                    has_values = count > 0
+
+                    def _percentile(q):
+                        idx = jnp.floor(q * (count_int.astype(jnp.float32) - 1.0)).astype(jnp.int32)
+                        return jnp.take(sorted_vals, idx)
+
+                    min_val = jnp.min(jnp.where(flat_mask, flat_x, jnp.inf))
+                    max_val = jnp.max(jnp.where(flat_mask, flat_x, -jnp.inf))
+                    zero_rate = jnp.sum(((x <= 1e-6).astype(jnp.float32)) * mask) / safe_count
+                    pos_rate_0p1 = jnp.sum(((x > 0.1).astype(jnp.float32)) * mask) / safe_count
+                    pos_rate_0p3 = jnp.sum(((x > 0.3).astype(jnp.float32)) * mask) / safe_count
+                    pos_rate_0p5 = jnp.sum(((x > 0.5).astype(jnp.float32)) * mask) / safe_count
+                    pos_rate_0p7 = jnp.sum(((x > 0.7).astype(jnp.float32)) * mask) / safe_count
+                    return {
+                        "count": count,
+                        "mean": jnp.where(has_values, mean, 0.0),
+                        "std": jnp.where(has_values, std, 0.0),
+                        "min": jnp.where(has_values, min_val, 0.0),
+                        "p10": jnp.where(has_values, _percentile(0.10), 0.0),
+                        "p25": jnp.where(has_values, _percentile(0.25), 0.0),
+                        "p50": jnp.where(has_values, _percentile(0.50), 0.0),
+                        "p75": jnp.where(has_values, _percentile(0.75), 0.0),
+                        "p90": jnp.where(has_values, _percentile(0.90), 0.0),
+                        "p95": jnp.where(has_values, _percentile(0.95), 0.0),
+                        "p99": jnp.where(has_values, _percentile(0.99), 0.0),
+                        "max": jnp.where(has_values, max_val, 0.0),
+                        "zero_rate": jnp.where(has_values, zero_rate, 0.0),
+                        "pos_rate_0p1": jnp.where(has_values, pos_rate_0p1, 0.0),
+                        "pos_rate_0p3": jnp.where(has_values, pos_rate_0p3, 0.0),
+                        "pos_rate_0p5": jnp.where(has_values, pos_rate_0p5, 0.0),
+                        "pos_rate_0p7": jnp.where(has_values, pos_rate_0p7, 0.0),
+                    }
+
+                base_mask = component_mask > 0
+                level_ids_for_diag = jnp.arange(robust_survival.shape[2])
+                top_level_mask = (level_ids_for_diag < config.get("actionability_depth", 3))[
+                    None,
+                    None,
+                    :,
+                    None,
+                ]
+                far_level_mask = (level_ids_for_diag >= config.get("actionability_depth", 3))[
+                    None,
+                    None,
+                    :,
+                    None,
+                ]
+                midpoint = (1.0 + config.get("actionability_eta", 0.1)) / 2.0
+                actionable_mask = a_side_component > midpoint
+                nonactionable_mask = a_side_component <= midpoint
+                dist_group_masks = {
+                    "TOP3_ACTIONABLE": base_mask & top_level_mask & actionable_mask,
+                    "TOP3_NONACTIONABLE": base_mask & top_level_mask & nonactionable_mask,
+                    "FAR_ACTIONABLE": base_mask & far_level_mask & actionable_mask,
+                    "FAR_NONACTIONABLE": base_mask & far_level_mask & nonactionable_mask,
+                }
+                dist_components = {
+                    "mean_survival": mean_survival,
+                    "availability": availability,
+                    "rho_robust": robust_survival,
+                    "a_side": a_side_component,
+                    "a_level": a_level_component,
+                    "y_rel": y_rel,
+                }
+
                 mid_diag.update({
                     "mean_survival_ask": mean_survival_ask,
                     "mean_survival_bid": mean_survival_bid,
@@ -825,6 +964,16 @@ def make_train(config):
                     ),
                     "mean_abs_yrel_minus_product": jnp.sum(masked_formula_diff) / component_mask_sum,
                 })
+                for component_name in _surv_formula_components:
+                    for group_name in _surv_dist_groups:
+                        stats = _masked_stats(
+                            dist_components[component_name],
+                            dist_group_masks[group_name],
+                        )
+                        for stat_name in _surv_dist_stats:
+                            mid_diag[_surv_dist_key(component_name, group_name, stat_name)] = stats[
+                                stat_name
+                            ]
                 return robust_survival.astype(jnp.float32), actionability.astype(jnp.float32), mid_diag
 
             for i in range(len(stashed_runner_state[0])): # Lặp qua train_states
@@ -872,6 +1021,10 @@ def make_train(config):
                         survival_delta_steps=survival_delta_steps,
                         survival_min_volume=config.get("survival_min_volume", 1.0),
                         survival_ratio=config.get("survival_ratio", 0.5),
+                        survival_availability_temperature=config.get(
+                            "survival_availability_temperature",
+                            0.15,
+                        ),
                         num_steps=config["NUM_STEPS"],
                         episode_done=traj_batch_padded[i].info["agent"]["done"],
                         survival_target_mode=survival_target_mode,
@@ -1645,8 +1798,9 @@ def make_train(config):
                     print(" ".join([
                         "SURV_FORMULA_COMPONENTS",
                         f"update={update_idx}",
-                        'formula="rho_robust=mean_survival*availability; y_rel=rho_robust*a_side*a_level"',
+                        'formula="availability=mean(sigmoid((ratio-gamma)/temperature)); rho_robust=mean_survival*availability; y_rel=rho_robust*a_side*a_level"',
                         f"gamma={config.get('survival_ratio', 0.5)}",
+                        f"temperature={config.get('survival_availability_temperature', 0.15)}",
                         f"delta={config.get('survival_delta_steps', 10)}",
                         "side_order=[Ask,Bid]",
                         "level_order=[0,1,2,3,4,5,6,7,8,9]",
@@ -1693,6 +1847,52 @@ def make_train(config):
                         f"max_abs_yrel_minus_product={_mid_value('max_abs_yrel_minus_product'):.6g}",
                         f"mean_abs_yrel_minus_product={_mid_value('mean_abs_yrel_minus_product'):.6g}",
                     ]))
+                    surv_dist_components = (
+                        "mean_survival",
+                        "availability",
+                        "rho_robust",
+                        "a_side",
+                        "a_level",
+                        "y_rel",
+                    )
+                    surv_dist_groups = (
+                        "TOP3_ACTIONABLE",
+                        "TOP3_NONACTIONABLE",
+                        "FAR_ACTIONABLE",
+                        "FAR_NONACTIONABLE",
+                    )
+                    surv_dist_stats = (
+                        "count",
+                        "mean",
+                        "std",
+                        "min",
+                        "p10",
+                        "p25",
+                        "p50",
+                        "p75",
+                        "p90",
+                        "p95",
+                        "p99",
+                        "max",
+                        "zero_rate",
+                        "pos_rate_0p1",
+                        "pos_rate_0p3",
+                        "pos_rate_0p5",
+                        "pos_rate_0p7",
+                    )
+                    for component_name in surv_dist_components:
+                        for group_name in surv_dist_groups:
+                            fields = [
+                                "SURV_DIST",
+                                f"update={update_idx}",
+                                f"component={component_name}",
+                                f"group={group_name}",
+                            ]
+                            fields.extend(
+                                f"{stat_name}={_mid_value(f'dist_{component_name}_{group_name}_{stat_name}'):.6g}"
+                                for stat_name in surv_dist_stats
+                            )
+                            print(" ".join(fields))
 
                 print("[GRADIENTS]")
                 print(f"GRAD_DIAG update={update_idx} grad_norm_status=deferred")
