@@ -108,6 +108,37 @@ def _matched_future_volumes(current_key, future_key, future_volume):
     )
 
 
+def _broadcast_raw_orders(raw_orders, *, required_steps, batch_size, name):
+    raw_orders = jnp.asarray(raw_orders, dtype=jnp.float32)
+    if raw_orders.ndim != 4:
+        raise ValueError(
+            f"{name} must have shape (time, batch, nOrders, 6), got {raw_orders.shape}."
+        )
+    if raw_orders.shape[0] < required_steps:
+        raise ValueError(
+            f"{name} must include current and future horizon frames: "
+            f"need at least {required_steps}, got {raw_orders.shape[0]}."
+        )
+    if raw_orders.shape[1] != batch_size:
+        if batch_size % raw_orders.shape[1] != 0:
+            raise ValueError(
+                f"Cannot broadcast {name} to actor vision observations: "
+                f"{name} batch={raw_orders.shape[1]}, vision batch={batch_size}."
+            )
+        raw_orders = jnp.repeat(raw_orders, batch_size // raw_orders.shape[1], axis=1)
+    return raw_orders
+
+
+def _fullbook_volume_at_key(raw_orders, price_key, tick_size):
+    raw_orders = jnp.asarray(raw_orders, dtype=jnp.float32)
+    price_key = jnp.asarray(price_key, dtype=jnp.float32)
+    tick_size = jnp.asarray(tick_size, dtype=jnp.float32)
+    price = price_key * tick_size
+    matches = raw_orders[..., None, :, 0] == price[..., :, None]
+    qty = raw_orders[..., None, :, 1]
+    return jnp.sum(jnp.where(matches, qty, 0.0), axis=-1).astype(jnp.float32)
+
+
 def _normalize_episode_done(episode_done, *, required_steps, batch_size):
     """Normalize post-step actor done flags to ``(time, batch)``."""
     if episode_done is None:
@@ -181,6 +212,9 @@ def build_liquidity_survival_targets(
     actionability_depth=3,
     actionability_far_level_weight=0.25,
     survival_availability_temperature=0.15,
+    ask_raw_orders=None,
+    bid_raw_orders=None,
+    survival_target_book_source="vision_topk",
     eps=1e-8,
 ):
     """Build side-aware liquidity targets from normalized LOB vision frames.
@@ -202,6 +236,12 @@ def build_liquidity_survival_targets(
         raise ValueError(
             f"Unknown survival_target_mode: {survival_target_mode}. "
             f"Expected one of {sorted(valid_modes)}."
+        )
+    valid_book_sources = {"vision_topk", "fullbook"}
+    if survival_target_book_source not in valid_book_sources:
+        raise ValueError(
+            f"Unknown survival_target_book_source: {survival_target_book_source}. "
+            f"Expected one of {sorted(valid_book_sources)}."
         )
     if survival_delta_steps < 1:
         raise ValueError("survival_delta_steps must be at least one.")
@@ -242,22 +282,52 @@ def build_liquidity_survival_targets(
     bid_key = jnp.rint((current_mid - bid_gap * tick_size) / tick_size)
     ask_mask = ask_volume >= survival_min_volume
     bid_mask = bid_volume >= survival_min_volume
+    if survival_target_book_source == "fullbook":
+        if ask_raw_orders is None or bid_raw_orders is None:
+            raise ValueError(
+                "ask_raw_orders and bid_raw_orders are required when "
+                "survival_target_book_source='fullbook'."
+            )
+        ask_raw_orders = _broadcast_raw_orders(
+            ask_raw_orders,
+            required_steps=required_steps,
+            batch_size=vision_obs.shape[1],
+            name="ask_raw_orders",
+        )
+        bid_raw_orders = _broadcast_raw_orders(
+            bid_raw_orders,
+            required_steps=required_steps,
+            batch_size=vision_obs.shape[1],
+            name="bid_raw_orders",
+        )
 
     future_ratios = []
     final_matched_ask_volume = None
     final_matched_bid_volume = None
     for tau in range(1, survival_delta_steps + 1):
-        future_obs = vision_obs[tau:tau + num_steps]
-        future_mid = mid_prices[tau:tau + num_steps, :, None]
-        future_ask_gap = future_obs[..., 0, 0]
-        future_bid_gap = future_obs[..., 0, 1]
-        future_ask_volume = jnp.expm1(future_obs[..., 1, 0])
-        future_bid_volume = jnp.expm1(future_obs[..., 1, 1])
-        future_ask_key = jnp.rint((future_mid + future_ask_gap * tick_size) / tick_size)
-        future_bid_key = jnp.rint((future_mid - future_bid_gap * tick_size) / tick_size)
+        if survival_target_book_source == "fullbook":
+            matched_ask_volume = _fullbook_volume_at_key(
+                ask_raw_orders[tau:tau + num_steps],
+                ask_key,
+                tick_size,
+            )
+            matched_bid_volume = _fullbook_volume_at_key(
+                bid_raw_orders[tau:tau + num_steps],
+                bid_key,
+                tick_size,
+            )
+        else:
+            future_obs = vision_obs[tau:tau + num_steps]
+            future_mid = mid_prices[tau:tau + num_steps, :, None]
+            future_ask_gap = future_obs[..., 0, 0]
+            future_bid_gap = future_obs[..., 0, 1]
+            future_ask_volume = jnp.expm1(future_obs[..., 1, 0])
+            future_bid_volume = jnp.expm1(future_obs[..., 1, 1])
+            future_ask_key = jnp.rint((future_mid + future_ask_gap * tick_size) / tick_size)
+            future_bid_key = jnp.rint((future_mid - future_bid_gap * tick_size) / tick_size)
 
-        matched_ask_volume = _matched_future_volumes(ask_key, future_ask_key, future_ask_volume)
-        matched_bid_volume = _matched_future_volumes(bid_key, future_bid_key, future_bid_volume)
+            matched_ask_volume = _matched_future_volumes(ask_key, future_ask_key, future_ask_volume)
+            matched_bid_volume = _matched_future_volumes(bid_key, future_bid_key, future_bid_volume)
         ask_ratio = jnp.clip(matched_ask_volume / (ask_volume + eps), 0.0, 1.0)
         bid_ratio = jnp.clip(matched_bid_volume / (bid_volume + eps), 0.0, 1.0)
         future_ratios.append(jnp.stack([ask_ratio, bid_ratio], axis=-1))

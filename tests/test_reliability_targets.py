@@ -40,6 +40,9 @@ class ReliabilityTargetTest(unittest.TestCase):
         vision_obs = vision_obs.at[1:, 0, 0, 2, :].set(jnp.log1p(future_volumes[:, None]))
         return vision_obs
 
+    def _make_raw_orders(self, time_steps, batch_size=1, n_orders=4):
+        return jnp.zeros((time_steps, batch_size, n_orders, 6), dtype=jnp.float32)
+
     def _expected_robust_survival(self, ratios, survival_ratio=0.5, temperature=0.15):
         ratios = jnp.asarray(ratios, dtype=jnp.float32)
         mean_survival = jnp.mean(ratios)
@@ -84,6 +87,101 @@ class ReliabilityTargetTest(unittest.TestCase):
         labels, _ = self._build_targets(vision_obs, mode="min_horizon_soft", delta=2)
 
         self.assertLess(float(labels[0, 0, 0, 0]), 1e-6)
+
+    def test_vision_topk_source_keeps_topk_lookup_behavior(self):
+        visible = self._make_ratio_vision_obs([0.8], current_volume=100.0)
+        visible_labels, _ = self._build_targets(
+            visible,
+            mode="actionability_weighted_min_horizon",
+            is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
+            delta=1,
+            actionability_depth=1,
+            survival_target_book_source="vision_topk",
+        )
+        self.assertAlmostEqual(
+            float(visible_labels[0, 0, 0, 0]),
+            self._expected_robust_survival([0.8]),
+            places=5,
+        )
+
+        missing = self._make_vision_obs(time_steps=2, levels=1, volume=100.0)
+        missing = missing.at[1, 0, 0, 0, 0].set(10.0)
+        missing_labels, _ = self._build_targets(
+            missing,
+            mode="actionability_weighted_min_horizon",
+            is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
+            delta=1,
+            actionability_depth=1,
+            survival_target_book_source="vision_topk",
+        )
+        self.assertLess(float(missing_labels[0, 0, 0, 0]), 1e-6)
+
+    def test_fullbook_recovers_price_outside_future_topk(self):
+        vision_obs = self._make_vision_obs(time_steps=2, levels=1, volume=100.0)
+        vision_obs = vision_obs.at[1, 0, 0, 0, 0].set(10.0)
+        ask_raw_orders = self._make_raw_orders(time_steps=2)
+        bid_raw_orders = self._make_raw_orders(time_steps=2)
+        ask_raw_orders = ask_raw_orders.at[1, 0, 0, 0].set(10_100.0)
+        ask_raw_orders = ask_raw_orders.at[1, 0, 0, 1].set(80.0)
+
+        labels, mask = self._build_targets(
+            vision_obs,
+            mode="actionability_weighted_min_horizon",
+            is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
+            delta=1,
+            actionability_depth=1,
+            survival_target_book_source="fullbook",
+            ask_raw_orders=ask_raw_orders,
+            bid_raw_orders=bid_raw_orders,
+        )
+
+        self.assertAlmostEqual(
+            float(labels[0, 0, 0, 0]),
+            self._expected_robust_survival([0.8]),
+            places=5,
+        )
+        self.assertEqual(float(mask[0, 0, 0, 0]), 1.0)
+
+    def test_fullbook_zero_when_price_missing_from_raw_book(self):
+        vision_obs = self._make_vision_obs(time_steps=2, levels=1, volume=100.0)
+        vision_obs = vision_obs.at[1, 0, 0, 0, 0].set(10.0)
+        ask_raw_orders = self._make_raw_orders(time_steps=2)
+        bid_raw_orders = self._make_raw_orders(time_steps=2)
+
+        labels, _ = self._build_targets(
+            vision_obs,
+            mode="actionability_weighted_min_horizon",
+            is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
+            delta=1,
+            actionability_depth=1,
+            survival_target_book_source="fullbook",
+            ask_raw_orders=ask_raw_orders,
+            bid_raw_orders=bid_raw_orders,
+        )
+
+        self.assertLess(float(labels[0, 0, 0, 0]), 1e-6)
+
+    def test_fullbook_source_requires_raw_orders_and_valid_source(self):
+        vision_obs = self._make_vision_obs(time_steps=2, levels=1, volume=100.0)
+        with self.assertRaisesRegex(ValueError, "ask_raw_orders and bid_raw_orders"):
+            self._build_targets(
+                vision_obs,
+                mode="actionability_weighted_min_horizon",
+                is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
+                delta=1,
+                actionability_depth=1,
+                survival_target_book_source="fullbook",
+            )
+
+        with self.assertRaisesRegex(ValueError, "Unknown survival_target_book_source"):
+            self._build_targets(
+                vision_obs,
+                mode="actionability_weighted_min_horizon",
+                is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
+                delta=1,
+                actionability_depth=1,
+                survival_target_book_source="unknown",
+            )
 
     def test_passive_limit_actionability_respects_side_and_depth(self):
         vision_obs = self._make_vision_obs(time_steps=2)

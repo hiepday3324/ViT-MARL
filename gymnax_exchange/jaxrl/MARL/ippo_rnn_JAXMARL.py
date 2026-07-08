@@ -534,6 +534,8 @@ def make_train(config):
                     info_world_i = {
                         **info["world"],
                         "obs_mid_price": pre_step_env_state.world_state.mid_price,
+                        "obs_ask_raw_orders": pre_step_env_state.world_state.ask_raw_orders,
+                        "obs_bid_raw_orders": pre_step_env_state.world_state.bid_raw_orders,
                     }
                     info_i={"world":info_world_i,"agent":jax.tree.map(lambda x: x.reshape(config["NUM_ACTORS_PERTYPE"][i],-1),info["agents"][i])}
                     # print(f"info for agenttype {i}:", info_i)
@@ -613,6 +615,30 @@ def make_train(config):
                 if mid_prices.shape[1] != batch_size:
                     mid_prices = jnp.repeat(mid_prices, batch_size // mid_prices.shape[1], axis=1)
                 return mid_prices
+
+            def _broadcast_raw_orders(raw_orders, batch_size, name):
+                raw_orders = jnp.asarray(raw_orders, dtype=jnp.float32)
+                if raw_orders.ndim != 4:
+                    raise ValueError(
+                        f"{name} must have shape (time, batch, nOrders, 6), got {raw_orders.shape}."
+                    )
+                if raw_orders.shape[1] != batch_size:
+                    if batch_size % raw_orders.shape[1] != 0:
+                        raise ValueError(
+                            f"Cannot broadcast {name} to actor vision observations: "
+                            f"{name} batch={raw_orders.shape[1]}, vision batch={batch_size}."
+                        )
+                    raw_orders = jnp.repeat(raw_orders, batch_size // raw_orders.shape[1], axis=1)
+                return raw_orders
+
+            def _fullbook_volume_at_key(raw_orders, price_key, tick_size_value):
+                raw_orders = jnp.asarray(raw_orders, dtype=jnp.float32)
+                price_key = jnp.asarray(price_key, dtype=jnp.float32)
+                tick_size_value = jnp.asarray(tick_size_value, dtype=jnp.float32)
+                price = price_key * tick_size_value
+                matches = raw_orders[..., None, :, 0] == price[..., :, None]
+                qty = raw_orders[..., None, :, 1]
+                return jnp.sum(jnp.where(matches, qty, 0.0), axis=-1).astype(jnp.float32)
 
             _surv_formula_components = (
                 "mean_survival",
@@ -702,6 +728,9 @@ def make_train(config):
                 is_sell_task,
                 reference_mid_prices=None,
                 surv_mask=None,
+                ask_raw_orders=None,
+                bid_raw_orders=None,
+                book_source="vision_topk",
             ):
                 vision_obs = jnp.asarray(vision_obs, dtype=jnp.float32)
                 mid_prices = _broadcast_mid_prices(mid_prices, vision_obs.shape[1])
@@ -719,6 +748,22 @@ def make_train(config):
                 tick_size_arr = jnp.asarray(tick_size, dtype=jnp.float32)
                 ask_key = jnp.rint((current_mid + ask_gap * tick_size_arr) / tick_size_arr)
                 bid_key = jnp.rint((current_mid - bid_gap * tick_size_arr) / tick_size_arr)
+                if book_source == "fullbook":
+                    if ask_raw_orders is None or bid_raw_orders is None:
+                        raise ValueError(
+                            "obs_ask_raw_orders and obs_bid_raw_orders are required when "
+                            "survival_target_book_source='fullbook'."
+                        )
+                    ask_raw_orders = _broadcast_raw_orders(
+                        ask_raw_orders,
+                        vision_obs.shape[1],
+                        "obs_ask_raw_orders",
+                    )
+                    bid_raw_orders = _broadcast_raw_orders(
+                        bid_raw_orders,
+                        vision_obs.shape[1],
+                        "obs_bid_raw_orders",
+                    )
 
                 future_ratios = []
                 matched_ask_nonzero = []
@@ -729,24 +774,36 @@ def make_train(config):
                 bid_ratio_values = []
                 eps = config.get("survival_eps", 1e-8)
                 for tau in range(1, survival_delta_steps + 1):
-                    future_obs = vision_obs[tau:tau + config["NUM_STEPS"]]
-                    future_mid = mid_prices[tau:tau + config["NUM_STEPS"], :, None]
-                    future_ask_gap = future_obs[..., 0, 0]
-                    future_bid_gap = future_obs[..., 0, 1]
-                    future_ask_volume = jnp.expm1(future_obs[..., 1, 0])
-                    future_bid_volume = jnp.expm1(future_obs[..., 1, 1])
-                    future_ask_key = jnp.rint((future_mid + future_ask_gap * tick_size_arr) / tick_size_arr)
-                    future_bid_key = jnp.rint((future_mid - future_bid_gap * tick_size_arr) / tick_size_arr)
-                    ask_matches = future_ask_key[..., None, :] == ask_key[..., :, None]
-                    bid_matches = future_bid_key[..., None, :] == bid_key[..., :, None]
-                    matched_ask_volume = jnp.max(
-                        jnp.where(ask_matches, future_ask_volume[..., None, :], 0.0),
-                        axis=-1,
-                    )
-                    matched_bid_volume = jnp.max(
-                        jnp.where(bid_matches, future_bid_volume[..., None, :], 0.0),
-                        axis=-1,
-                    )
+                    if book_source == "fullbook":
+                        matched_ask_volume = _fullbook_volume_at_key(
+                            ask_raw_orders[tau:tau + config["NUM_STEPS"]],
+                            ask_key,
+                            tick_size_arr,
+                        )
+                        matched_bid_volume = _fullbook_volume_at_key(
+                            bid_raw_orders[tau:tau + config["NUM_STEPS"]],
+                            bid_key,
+                            tick_size_arr,
+                        )
+                    else:
+                        future_obs = vision_obs[tau:tau + config["NUM_STEPS"]]
+                        future_mid = mid_prices[tau:tau + config["NUM_STEPS"], :, None]
+                        future_ask_gap = future_obs[..., 0, 0]
+                        future_bid_gap = future_obs[..., 0, 1]
+                        future_ask_volume = jnp.expm1(future_obs[..., 1, 0])
+                        future_bid_volume = jnp.expm1(future_obs[..., 1, 1])
+                        future_ask_key = jnp.rint((future_mid + future_ask_gap * tick_size_arr) / tick_size_arr)
+                        future_bid_key = jnp.rint((future_mid - future_bid_gap * tick_size_arr) / tick_size_arr)
+                        ask_matches = future_ask_key[..., None, :] == ask_key[..., :, None]
+                        bid_matches = future_bid_key[..., None, :] == bid_key[..., :, None]
+                        matched_ask_volume = jnp.max(
+                            jnp.where(ask_matches, future_ask_volume[..., None, :], 0.0),
+                            axis=-1,
+                        )
+                        matched_bid_volume = jnp.max(
+                            jnp.where(bid_matches, future_bid_volume[..., None, :], 0.0),
+                            axis=-1,
+                        )
                     ask_ratio = jnp.clip(matched_ask_volume / (ask_volume + eps), 0.0, 1.0)
                     bid_ratio = jnp.clip(matched_bid_volume / (bid_volume + eps), 0.0, 1.0)
                     future_ratios.append(jnp.stack([ask_ratio, bid_ratio], axis=-1))
@@ -979,6 +1036,8 @@ def make_train(config):
             for i in range(len(stashed_runner_state[0])): # Lặp qua train_states
                 end_mid_prices = traj_batch_padded[i].info["world"]["end_mid_price"]
                 obs_mid_prices = traj_batch_padded[i].info["world"].get("obs_mid_price", end_mid_prices)
+                obs_ask_raw_orders = traj_batch_padded[i].info["world"].get("obs_ask_raw_orders", None)
+                obs_bid_raw_orders = traj_batch_padded[i].info["world"].get("obs_bid_raw_orders", None)
                 mid_prices = end_mid_prices
                 
                 # Quét cửa sổ tương lai (Logic giữ nguyên, chạy thẳng trên mid_prices chuẩn)
@@ -1025,6 +1084,12 @@ def make_train(config):
                             "survival_availability_temperature",
                             0.15,
                         ),
+                        ask_raw_orders=obs_ask_raw_orders,
+                        bid_raw_orders=obs_bid_raw_orders,
+                        survival_target_book_source=config.get(
+                            "survival_target_book_source",
+                            "vision_topk",
+                        ),
                         num_steps=config["NUM_STEPS"],
                         episode_done=traj_batch_padded[i].info["agent"]["done"],
                         survival_target_mode=survival_target_mode,
@@ -1045,6 +1110,9 @@ def make_train(config):
                             is_sell_task,
                             reference_mid_prices=end_mid_prices,
                             surv_mask=surv_mask,
+                            ask_raw_orders=obs_ask_raw_orders,
+                            bid_raw_orders=obs_bid_raw_orders,
+                            book_source=config.get("survival_target_book_source", "vision_topk"),
                         )
                     else:
                         surv_raw_ratio = surv_label
@@ -1055,6 +1123,9 @@ def make_train(config):
                             None,
                             reference_mid_prices=end_mid_prices,
                             surv_mask=surv_mask,
+                            ask_raw_orders=obs_ask_raw_orders,
+                            bid_raw_orders=obs_bid_raw_orders,
+                            book_source=config.get("survival_target_book_source", "vision_topk"),
                         )
                 else:
                     reward_shape = traj_batch_padded[i].reward.shape
@@ -1799,6 +1870,7 @@ def make_train(config):
                         "SURV_FORMULA_COMPONENTS",
                         f"update={update_idx}",
                         'formula="availability=mean(sigmoid((ratio-gamma)/temperature)); rho_robust=mean_survival*availability; y_rel=rho_robust*a_side*a_level"',
+                        f"book_source={config.get('survival_target_book_source', 'vision_topk')}",
                         f"gamma={config.get('survival_ratio', 0.5)}",
                         f"temperature={config.get('survival_availability_temperature', 0.15)}",
                         f"delta={config.get('survival_delta_steps', 10)}",

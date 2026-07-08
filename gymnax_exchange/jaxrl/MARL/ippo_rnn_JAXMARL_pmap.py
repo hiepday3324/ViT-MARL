@@ -534,6 +534,7 @@ def make_train(config):
                 '''
                 Cho các agent tương tác với môi trường, nhận lại obs mới, trạng thái và rewards
                 '''
+                pre_step_env_state = env_state
                 obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0,None)
                 )(rng_step, env_state, actions,env_params)
@@ -551,7 +552,13 @@ def make_train(config):
                     value = values[i]
                     log_prob = log_probs[i]
 
-                    info_i={"world":info["world"],"agent":jax.tree.map(lambda x: x.reshape(local_num_actors_per_type[i],-1),info["agents"][i])}
+                    info_world_i = {
+                        **info["world"],
+                        "obs_mid_price": pre_step_env_state.world_state.mid_price,
+                        "obs_ask_raw_orders": pre_step_env_state.world_state.ask_raw_orders,
+                        "obs_bid_raw_orders": pre_step_env_state.world_state.bid_raw_orders,
+                    }
+                    info_i={"world":info_world_i,"agent":jax.tree.map(lambda x: x.reshape(local_num_actors_per_type[i],-1),info["agents"][i])}
                     # print(f"info for agenttype {i}:", info_i)
 
 
@@ -619,7 +626,10 @@ def make_train(config):
                     "env.multi_agent_config.world_config.tick_size is None."
                 )
             for i in range(len(stashed_runner_state[0])): # Lặp qua train_states
-                mid_prices = traj_batch_padded[i].info["world"]["end_mid_price"]
+                end_mid_prices = traj_batch_padded[i].info["world"]["end_mid_price"]
+                mid_prices = traj_batch_padded[i].info["world"].get("obs_mid_price", end_mid_prices)
+                obs_ask_raw_orders = traj_batch_padded[i].info["world"].get("obs_ask_raw_orders", None)
+                obs_bid_raw_orders = traj_batch_padded[i].info["world"].get("obs_bid_raw_orders", None)
                 
                 # Quét cửa sổ tương lai (Logic giữ nguyên, chạy thẳng trên mid_prices chuẩn)
                 def calc_future_std(t):
@@ -664,6 +674,12 @@ def make_train(config):
                         survival_availability_temperature=config.get(
                             "survival_availability_temperature",
                             0.15,
+                        ),
+                        ask_raw_orders=obs_ask_raw_orders,
+                        bid_raw_orders=obs_bid_raw_orders,
+                        survival_target_book_source=config.get(
+                            "survival_target_book_source",
+                            "vision_topk",
                         ),
                         num_steps=config["NUM_STEPS"],
                         episode_done=traj_batch_padded[i].info["agent"]["done"],
