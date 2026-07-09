@@ -627,7 +627,7 @@ def make_train(config):
             survival_labels = []
             survival_masks = []
             survival_raw_ratios = []
-            survival_actionability_weights = []
+            survival_task_side_masks = []
             survival_mid_diags = []
             if not hasattr(env.multi_agent_config.world_config, "tick_size"):
                 raise ValueError(
@@ -677,15 +677,13 @@ def make_train(config):
                 "mean_survival",
                 "availability",
                 "rho_robust",
-                "a_side",
-                "a_level",
                 "y_rel",
             )
             _surv_dist_groups = (
-                "TOP3_ACTIONABLE",
-                "TOP3_NONACTIONABLE",
-                "FAR_ACTIONABLE",
-                "FAR_NONACTIONABLE",
+                "CURRENT_RANK_TOP3_TASK_SIDE",
+                "CURRENT_RANK_TOP3_OPPOSITE_SIDE",
+                "CURRENT_RANK_FAR_TASK_SIDE",
+                "CURRENT_RANK_FAR_OPPOSITE_SIDE",
             )
             _surv_dist_stats = (
                 "count",
@@ -756,10 +754,6 @@ def make_train(config):
                     "availability_bid": jnp.zeros((10,), dtype=jnp.float32),
                     "rho_robust_ask": jnp.zeros((10,), dtype=jnp.float32),
                     "rho_robust_bid": jnp.zeros((10,), dtype=jnp.float32),
-                    "a_side_ask": jnp.zeros((10,), dtype=jnp.float32),
-                    "a_side_bid": jnp.zeros((10,), dtype=jnp.float32),
-                    "a_level_ask": jnp.zeros((10,), dtype=jnp.float32),
-                    "a_level_bid": jnp.zeros((10,), dtype=jnp.float32),
                     "y_rel_ask": jnp.zeros((10,), dtype=jnp.float32),
                     "y_rel_bid": jnp.zeros((10,), dtype=jnp.float32),
                     "max_abs_yrel_minus_product": jnp.array(0.0, dtype=jnp.float32),
@@ -808,8 +802,6 @@ def make_train(config):
                 surv_mask=None,
                 ask_raw_orders=None,
                 bid_raw_orders=None,
-                book_source="vision_topk",
-                fullbook_match_mode="same_side",
             ):
                 vision_obs = jnp.asarray(vision_obs, dtype=jnp.float32)
                 mid_prices = _broadcast_mid_prices(mid_prices, vision_obs.shape[1])
@@ -827,22 +819,21 @@ def make_train(config):
                 tick_size_arr = jnp.asarray(tick_size, dtype=jnp.float32)
                 ask_key = jnp.rint((current_mid + ask_gap * tick_size_arr) / tick_size_arr)
                 bid_key = jnp.rint((current_mid - bid_gap * tick_size_arr) / tick_size_arr)
-                if book_source == "fullbook":
-                    if ask_raw_orders is None or bid_raw_orders is None:
-                        raise ValueError(
-                            "obs_ask_raw_orders and obs_bid_raw_orders are required when "
-                            "survival_target_book_source='fullbook'."
-                        )
-                    ask_raw_orders = _broadcast_raw_orders(
-                        ask_raw_orders,
-                        vision_obs.shape[1],
-                        "obs_ask_raw_orders",
+                if ask_raw_orders is None or bid_raw_orders is None:
+                    raise ValueError(
+                        "obs_ask_raw_orders and obs_bid_raw_orders are required for "
+                        "fullbook absolute-price survival diagnostics."
                     )
-                    bid_raw_orders = _broadcast_raw_orders(
-                        bid_raw_orders,
-                        vision_obs.shape[1],
-                        "obs_bid_raw_orders",
-                    )
+                ask_raw_orders = _broadcast_raw_orders(
+                    ask_raw_orders,
+                    vision_obs.shape[1],
+                    "obs_ask_raw_orders",
+                )
+                bid_raw_orders = _broadcast_raw_orders(
+                    bid_raw_orders,
+                    vision_obs.shape[1],
+                    "obs_bid_raw_orders",
+                )
 
                 future_ratios = []
                 matched_ask_nonzero = []
@@ -871,70 +862,43 @@ def make_train(config):
                     return jnp.pad(vals, (0, 10 - vals.shape[0]), constant_values=0.0)
 
                 for tau in range(1, survival_delta_steps + 1):
-                    if book_source == "fullbook":
-                        future_ask_at_ask_key = _fullbook_volume_at_key(
-                            ask_raw_orders[tau:tau + config["NUM_STEPS"]],
-                            ask_key,
-                            tick_size_arr,
-                        )
-                        future_bid_at_bid_key = _fullbook_volume_at_key(
-                            bid_raw_orders[tau:tau + config["NUM_STEPS"]],
-                            bid_key,
-                            tick_size_arr,
-                        )
-                        if fullbook_match_mode == "absolute_price_sum":
-                            future_bid_at_ask_key = _fullbook_volume_at_key(
-                                bid_raw_orders[tau:tau + config["NUM_STEPS"]],
-                                ask_key,
-                                tick_size_arr,
-                            )
-                            future_ask_at_bid_key = _fullbook_volume_at_key(
-                                ask_raw_orders[tau:tau + config["NUM_STEPS"]],
-                                bid_key,
-                                tick_size_arr,
-                            )
-                            matched_ask_volume = future_ask_at_ask_key + future_bid_at_ask_key
-                            matched_bid_volume = future_ask_at_bid_key + future_bid_at_bid_key
-                        else:
-                            future_bid_at_ask_key = jnp.zeros_like(future_ask_at_ask_key)
-                            future_ask_at_bid_key = jnp.zeros_like(future_bid_at_bid_key)
-                            matched_ask_volume = future_ask_at_ask_key
-                            matched_bid_volume = future_bid_at_bid_key
-                    else:
-                        future_obs = vision_obs[tau:tau + config["NUM_STEPS"]]
-                        future_mid = mid_prices[tau:tau + config["NUM_STEPS"], :, None]
-                        future_ask_gap = future_obs[..., 0, 0]
-                        future_bid_gap = future_obs[..., 0, 1]
-                        future_ask_volume = jnp.expm1(future_obs[..., 1, 0])
-                        future_bid_volume = jnp.expm1(future_obs[..., 1, 1])
-                        future_ask_key = jnp.rint((future_mid + future_ask_gap * tick_size_arr) / tick_size_arr)
-                        future_bid_key = jnp.rint((future_mid - future_bid_gap * tick_size_arr) / tick_size_arr)
-                        ask_matches = future_ask_key[..., None, :] == ask_key[..., :, None]
-                        bid_matches = future_bid_key[..., None, :] == bid_key[..., :, None]
-                        matched_ask_volume = jnp.max(
-                            jnp.where(ask_matches, future_ask_volume[..., None, :], 0.0),
-                            axis=-1,
-                        )
-                        matched_bid_volume = jnp.max(
-                            jnp.where(bid_matches, future_bid_volume[..., None, :], 0.0),
-                            axis=-1,
-                        )
+                    future_ask_at_ask_key = _fullbook_volume_at_key(
+                        ask_raw_orders[tau:tau + config["NUM_STEPS"]],
+                        ask_key,
+                        tick_size_arr,
+                    )
+                    future_bid_at_ask_key = _fullbook_volume_at_key(
+                        bid_raw_orders[tau:tau + config["NUM_STEPS"]],
+                        ask_key,
+                        tick_size_arr,
+                    )
+                    matched_ask_volume = future_ask_at_ask_key + future_bid_at_ask_key
+
+                    future_ask_at_bid_key = _fullbook_volume_at_key(
+                        ask_raw_orders[tau:tau + config["NUM_STEPS"]],
+                        bid_key,
+                        tick_size_arr,
+                    )
+                    future_bid_at_bid_key = _fullbook_volume_at_key(
+                        bid_raw_orders[tau:tau + config["NUM_STEPS"]],
+                        bid_key,
+                        tick_size_arr,
+                    )
+                    matched_bid_volume = future_ask_at_bid_key + future_bid_at_bid_key
                     if tau == 1:
                         matched_ask_tau1_sample = _sample_t0_b0(matched_ask_volume)
                         matched_bid_tau1_sample = _sample_t0_b0(matched_bid_volume)
-                        if book_source == "fullbook":
-                            future_ask_at_ask_tau1_sample = _sample_t0_b0(future_ask_at_ask_key)
-                            future_bid_at_ask_tau1_sample = _sample_t0_b0(future_bid_at_ask_key)
-                            future_ask_at_bid_tau1_sample = _sample_t0_b0(future_ask_at_bid_key)
-                            future_bid_at_bid_tau1_sample = _sample_t0_b0(future_bid_at_bid_key)
+                        future_ask_at_ask_tau1_sample = _sample_t0_b0(future_ask_at_ask_key)
+                        future_bid_at_ask_tau1_sample = _sample_t0_b0(future_bid_at_ask_key)
+                        future_ask_at_bid_tau1_sample = _sample_t0_b0(future_ask_at_bid_key)
+                        future_bid_at_bid_tau1_sample = _sample_t0_b0(future_bid_at_bid_key)
                     if tau == survival_delta_steps:
                         matched_ask_taud_sample = _sample_t0_b0(matched_ask_volume)
                         matched_bid_taud_sample = _sample_t0_b0(matched_bid_volume)
-                        if book_source == "fullbook":
-                            future_ask_at_ask_taud_sample = _sample_t0_b0(future_ask_at_ask_key)
-                            future_bid_at_ask_taud_sample = _sample_t0_b0(future_bid_at_ask_key)
-                            future_ask_at_bid_taud_sample = _sample_t0_b0(future_ask_at_bid_key)
-                            future_bid_at_bid_taud_sample = _sample_t0_b0(future_bid_at_bid_key)
+                        future_ask_at_ask_taud_sample = _sample_t0_b0(future_ask_at_ask_key)
+                        future_bid_at_ask_taud_sample = _sample_t0_b0(future_bid_at_ask_key)
+                        future_ask_at_bid_taud_sample = _sample_t0_b0(future_ask_at_bid_key)
+                        future_bid_at_bid_taud_sample = _sample_t0_b0(future_bid_at_bid_key)
                     ask_ratio = jnp.clip(matched_ask_volume / (ask_volume + eps), 0.0, 1.0)
                     bid_ratio = jnp.clip(matched_bid_volume / (bid_volume + eps), 0.0, 1.0)
                     future_ratios.append(jnp.stack([ask_ratio, bid_ratio], axis=-1))
@@ -1007,18 +971,16 @@ def make_train(config):
                     "future_bid_at_bid_key_taud_t0_b0": future_bid_at_bid_taud_sample,
                 }
                 if is_sell_task is None:
-                    side_weight = jnp.ones(robust_survival.shape[:2] + (2,), dtype=jnp.float32)
+                    task_side = jnp.ones(robust_survival.shape[:2] + (2,), dtype=jnp.float32)
                 else:
                     is_sell_task_bool = jnp.asarray(is_sell_task, dtype=jnp.bool_)
-                    ask_weight = jnp.where(is_sell_task_bool, 1.0, config.get("actionability_eta", 0.1))
-                    bid_weight = jnp.where(is_sell_task_bool, config.get("actionability_eta", 0.1), 1.0)
-                    side_weight = jnp.stack([ask_weight, bid_weight], axis=-1).astype(jnp.float32)
-                a_side_component = jnp.broadcast_to(
-                    side_weight[:, :, None, :],
+                    ask_task_side = jnp.where(is_sell_task_bool, 1.0, 0.0)
+                    bid_task_side = jnp.where(is_sell_task_bool, 0.0, 1.0)
+                    task_side = jnp.stack([ask_task_side, bid_task_side], axis=-1).astype(jnp.float32)
+                task_side_component = jnp.broadcast_to(
+                    task_side[:, :, None, :],
                     robust_survival.shape,
                 )
-                a_level_component = jnp.ones_like(robust_survival, dtype=jnp.float32)
-                actionability = a_side_component
                 y_rel = robust_survival
                 product = robust_survival
                 formula_diff = jnp.abs(y_rel - product)
@@ -1049,14 +1011,6 @@ def make_train(config):
                 )
                 rho_robust_ask, rho_robust_bid = _masked_side_level_mean(
                     robust_survival,
-                    component_mask,
-                )
-                a_side_ask, a_side_bid = _masked_side_level_mean(
-                    a_side_component,
-                    component_mask,
-                )
-                a_level_ask, a_level_bid = _masked_side_level_mean(
-                    a_level_component,
                     component_mask,
                 )
                 y_rel_ask, y_rel_bid = _masked_side_level_mean(y_rel, component_mask)
@@ -1110,33 +1064,30 @@ def make_train(config):
 
                 base_mask = component_mask > 0
                 level_ids_for_diag = jnp.arange(robust_survival.shape[2])
-                top_level_mask = (level_ids_for_diag < config.get("actionability_depth", 3))[
+                top_level_mask = (level_ids_for_diag < 3)[
                     None,
                     None,
                     :,
                     None,
                 ]
-                far_level_mask = (level_ids_for_diag >= config.get("actionability_depth", 3))[
+                far_level_mask = (level_ids_for_diag >= 3)[
                     None,
                     None,
                     :,
                     None,
                 ]
-                midpoint = (1.0 + config.get("actionability_eta", 0.1)) / 2.0
-                actionable_mask = a_side_component > midpoint
-                nonactionable_mask = a_side_component <= midpoint
+                task_side_mask = task_side_component > 0.5
+                opposite_side_mask = task_side_component <= 0.5
                 dist_group_masks = {
-                    "TOP3_ACTIONABLE": base_mask & top_level_mask & actionable_mask,
-                    "TOP3_NONACTIONABLE": base_mask & top_level_mask & nonactionable_mask,
-                    "FAR_ACTIONABLE": base_mask & far_level_mask & actionable_mask,
-                    "FAR_NONACTIONABLE": base_mask & far_level_mask & nonactionable_mask,
+                    "CURRENT_RANK_TOP3_TASK_SIDE": base_mask & top_level_mask & task_side_mask,
+                    "CURRENT_RANK_TOP3_OPPOSITE_SIDE": base_mask & top_level_mask & opposite_side_mask,
+                    "CURRENT_RANK_FAR_TASK_SIDE": base_mask & far_level_mask & task_side_mask,
+                    "CURRENT_RANK_FAR_OPPOSITE_SIDE": base_mask & far_level_mask & opposite_side_mask,
                 }
                 dist_components = {
                     "mean_survival": mean_survival,
                     "availability": availability,
                     "rho_robust": robust_survival,
-                    "a_side": a_side_component,
-                    "a_level": a_level_component,
                     "y_rel": y_rel,
                 }
 
@@ -1147,10 +1098,6 @@ def make_train(config):
                     "availability_bid": availability_bid,
                     "rho_robust_ask": rho_robust_ask,
                     "rho_robust_bid": rho_robust_bid,
-                    "a_side_ask": a_side_ask,
-                    "a_side_bid": a_side_bid,
-                    "a_level_ask": a_level_ask,
-                    "a_level_bid": a_level_bid,
                     "y_rel_ask": y_rel_ask,
                     "y_rel_bid": y_rel_bid,
                     "max_abs_yrel_minus_product": jnp.max(
@@ -1168,13 +1115,13 @@ def make_train(config):
                             mid_diag[_surv_dist_key(component_name, group_name, stat_name)] = stats[
                                 stat_name
                             ]
-                return robust_survival.astype(jnp.float32), actionability.astype(jnp.float32), mid_diag
+                return robust_survival.astype(jnp.float32), task_side_component.astype(jnp.float32), mid_diag
 
             def _build_reliability_alignment_diag(
                 reliability_scores,
                 surv_labels,
                 surv_mask,
-                surv_actionability,
+                surv_task_side,
             ):
                 score_shape = reliability_scores.shape
                 label_shape = surv_labels.shape
@@ -1249,27 +1196,25 @@ def make_train(config):
                 component_mask = jnp.asarray(surv_mask, dtype=jnp.float32)
                 base_mask = component_mask > 0
                 level_ids_for_diag = jnp.arange(surv_labels.shape[2])
-                top_level_mask = (level_ids_for_diag < config.get("actionability_depth", 3))[
+                top_level_mask = (level_ids_for_diag < 3)[
                     None,
                     None,
                     :,
                     None,
                 ]
-                far_level_mask = (level_ids_for_diag >= config.get("actionability_depth", 3))[
+                far_level_mask = (level_ids_for_diag >= 3)[
                     None,
                     None,
                     :,
                     None,
                 ]
-                side_actionability = surv_actionability
-                midpoint = (1.0 + config.get("actionability_eta", 0.1)) / 2.0
-                actionable_mask = side_actionability > midpoint
-                nonactionable_mask = side_actionability <= midpoint
+                task_side_mask = surv_task_side > 0.5
+                opposite_side_mask = surv_task_side <= 0.5
                 group_masks = {
-                    "TOP3_ACTIONABLE": base_mask & top_level_mask & actionable_mask,
-                    "TOP3_NONACTIONABLE": base_mask & top_level_mask & nonactionable_mask,
-                    "FAR_ACTIONABLE": base_mask & far_level_mask & actionable_mask,
-                    "FAR_NONACTIONABLE": base_mask & far_level_mask & nonactionable_mask,
+                    "CURRENT_RANK_TOP3_TASK_SIDE": base_mask & top_level_mask & task_side_mask,
+                    "CURRENT_RANK_TOP3_OPPOSITE_SIDE": base_mask & top_level_mask & opposite_side_mask,
+                    "CURRENT_RANK_FAR_TASK_SIDE": base_mask & far_level_mask & task_side_mask,
+                    "CURRENT_RANK_FAR_OPPOSITE_SIDE": base_mask & far_level_mask & opposite_side_mask,
                 }
                 rel_components = {
                     "score": aligned_scores,
@@ -1335,20 +1280,13 @@ def make_train(config):
                     and isinstance(traj_batch_padded[i].obs, dict)
                     and "vision_obs" in traj_batch_padded[i].obs
                 ):
-                    survival_target_mode = config.get(
-                        "survival_target_mode",
-                        "actionability_weighted_min_horizon",
+                    execution_task = getattr(env.list_of_agents_configs[i], "task", None)
+                    is_sell_task = resolve_rollout_is_sell_task(
+                        traj_batch_padded[i].info["agent"],
+                        task=execution_task,
+                        num_steps=config["NUM_STEPS"],
+                        batch_size=traj_batch_padded[i].obs["vision_obs"].shape[1],
                     )
-                    if survival_target_mode == "actionability_weighted_min_horizon":
-                        execution_task = getattr(env.list_of_agents_configs[i], "task", None)
-                        is_sell_task = resolve_rollout_is_sell_task(
-                            traj_batch_padded[i].info["agent"],
-                            task=execution_task,
-                            num_steps=config["NUM_STEPS"],
-                            batch_size=traj_batch_padded[i].obs["vision_obs"].shape[1],
-                        )
-                    else:
-                        is_sell_task = None
                     surv_label, surv_mask = build_liquidity_survival_targets(
                         traj_batch_padded[i].obs["vision_obs"],
                         obs_mid_prices,
@@ -1362,70 +1300,30 @@ def make_train(config):
                         ),
                         ask_raw_orders=obs_ask_raw_orders,
                         bid_raw_orders=obs_bid_raw_orders,
-                        survival_target_book_source=config.get(
-                            "survival_target_book_source",
-                            "vision_topk",
-                        ),
-                        survival_fullbook_match_mode=config.get(
-                            "survival_fullbook_match_mode",
-                            "same_side",
-                        ),
                         num_steps=config["NUM_STEPS"],
                         episode_done=traj_batch_padded[i].info["agent"]["done"],
-                        survival_target_mode=survival_target_mode,
-                        is_sell_task=is_sell_task,
-                        actionability_mode=config.get("actionability_mode", "passive_limit"),
-                        actionability_eta=config.get("actionability_eta", 0.1),
-                        actionability_depth=config.get("actionability_depth", 3),
-                        actionability_far_level_weight=config.get(
-                            "actionability_far_level_weight",
-                            0.25,
-                        ),
                         eps=config.get("survival_eps", 1e-8),
                     )
-                    if survival_target_mode == "actionability_weighted_min_horizon":
-                        surv_raw_ratio, surv_actionability, surv_mid_diag = _build_survival_diag_components(
-                            traj_batch_padded[i].obs["vision_obs"],
-                            obs_mid_prices,
-                            is_sell_task,
-                            reference_mid_prices=end_mid_prices,
-                            surv_mask=surv_mask,
-                            ask_raw_orders=obs_ask_raw_orders,
-                            bid_raw_orders=obs_bid_raw_orders,
-                            book_source=config.get("survival_target_book_source", "vision_topk"),
-                            fullbook_match_mode=config.get(
-                                "survival_fullbook_match_mode",
-                                "same_side",
-                            ),
-                        )
-                    else:
-                        surv_raw_ratio = surv_label
-                        surv_actionability = jnp.ones_like(surv_label)
-                        _, _, surv_mid_diag = _build_survival_diag_components(
-                            traj_batch_padded[i].obs["vision_obs"],
-                            obs_mid_prices,
-                            None,
-                            reference_mid_prices=end_mid_prices,
-                            surv_mask=surv_mask,
-                            ask_raw_orders=obs_ask_raw_orders,
-                            bid_raw_orders=obs_bid_raw_orders,
-                            book_source=config.get("survival_target_book_source", "vision_topk"),
-                            fullbook_match_mode=config.get(
-                                "survival_fullbook_match_mode",
-                                "same_side",
-                            ),
-                        )
+                    surv_raw_ratio, surv_task_side, surv_mid_diag = _build_survival_diag_components(
+                        traj_batch_padded[i].obs["vision_obs"],
+                        obs_mid_prices,
+                        is_sell_task,
+                        reference_mid_prices=end_mid_prices,
+                        surv_mask=surv_mask,
+                        ask_raw_orders=obs_ask_raw_orders,
+                        bid_raw_orders=obs_bid_raw_orders,
+                    )
                 else:
                     reward_shape = traj_batch_padded[i].reward.shape
                     surv_label = jnp.zeros((config["NUM_STEPS"], reward_shape[1], 10, 2), dtype=jnp.float32)
                     surv_mask = jnp.zeros_like(surv_label)
                     surv_raw_ratio = jnp.zeros_like(surv_label)
-                    surv_actionability = jnp.zeros_like(surv_label)
+                    surv_task_side = jnp.zeros_like(surv_label)
                     surv_mid_diag = _zero_mid_diag()
                 survival_labels.append(surv_label)
                 survival_masks.append(surv_mask)
                 survival_raw_ratios.append(surv_raw_ratio)
-                survival_actionability_weights.append(surv_actionability)
+                survival_task_side_masks.append(surv_task_side)
                 survival_mid_diags.append(surv_mid_diag)
 
             # ==========================================================
@@ -1507,7 +1405,7 @@ def make_train(config):
                             surv_labels,
                             surv_mask,
                             surv_raw_ratio,
-                            surv_actionability,
+                            surv_task_side,
                         ) = batch_info
 
                         def _loss_fn(
@@ -1520,7 +1418,7 @@ def make_train(config):
                             surv_labels,
                             surv_mask,
                             surv_raw_ratio,
-                            surv_actionability,
+                            surv_task_side,
                         ):
                             # RERUN NETWORK
                             _, pi, value, z_vision, aux_info = train_state.apply_fn(
@@ -1763,7 +1661,7 @@ def make_train(config):
                             surv_labels,
                             surv_mask,
                             surv_raw_ratio,
-                            surv_actionability,
+                            surv_task_side,
                         )
                         train_state = train_state.apply_gradients(grads=grads)
                         return train_state, total_loss
@@ -1777,7 +1675,7 @@ def make_train(config):
                         surv_labels,
                         surv_mask,
                         surv_raw_ratio,
-                        surv_actionability,
+                        surv_task_side,
                         rng,
                     ) = update_state
                     rng, _rng = jax.random.split(rng)
@@ -1795,7 +1693,7 @@ def make_train(config):
                         surv_labels,
                         surv_mask,
                         surv_raw_ratio,
-                        surv_actionability,
+                        surv_task_side,
                     )
                     permutation = jax.random.permutation(_rng, config["NUM_ACTORS_PERTYPE"][i])
 
@@ -1829,7 +1727,7 @@ def make_train(config):
                         surv_labels,
                         surv_mask,
                         surv_raw_ratio,
-                        surv_actionability,
+                        surv_task_side,
                         rng,
                     )
                     return update_state, total_loss
@@ -1844,7 +1742,7 @@ def make_train(config):
                     survival_labels[i],
                     survival_masks[i],
                     survival_raw_ratios[i],
-                    survival_actionability_weights[i],
+                    survival_task_side_masks[i],
                     rng,
                 )
                 update_state, loss_info = jax.lax.scan(
@@ -1871,7 +1769,7 @@ def make_train(config):
                             diag_aux_info["reliability_scores"],
                             survival_labels[i],
                             survival_masks[i],
-                            survival_actionability_weights[i],
+                            survival_task_side_masks[i],
                         )
                     )
                 else:
@@ -2294,8 +2192,8 @@ def make_train(config):
                         "SURV_FULLBOOK_MATCH_SAMPLE "
                         f"update={update_idx} "
                         "tau=1 "
-                        f"match_mode={config.get('survival_fullbook_match_mode', 'same_side')} "
-                        f"absprice_sum_enabled={str(config.get('survival_target_book_source', 'vision_topk') == 'fullbook' and config.get('survival_fullbook_match_mode', 'same_side') == 'absolute_price_sum').lower()} "
+                        "match_mode=absolute_price_sum "
+                        "absprice_sum_enabled=true "
                         f"ask_key_t0_b0={_fmt_values(_mid_values('ask_key_t0_b0'))} "
                         f"future_ask_at_ask_key={_fmt_values(_mid_values('future_ask_at_ask_key_tau1_t0_b0'))} "
                         f"future_bid_at_ask_key={_fmt_values(_mid_values('future_bid_at_ask_key_tau1_t0_b0'))} "
@@ -2309,8 +2207,8 @@ def make_train(config):
                         "SURV_FULLBOOK_MATCH_SAMPLE "
                         f"update={update_idx} "
                         f"tau={config.get('survival_delta_steps', 10)} "
-                        f"match_mode={config.get('survival_fullbook_match_mode', 'same_side')} "
-                        f"absprice_sum_enabled={str(config.get('survival_target_book_source', 'vision_topk') == 'fullbook' and config.get('survival_fullbook_match_mode', 'same_side') == 'absolute_price_sum').lower()} "
+                        "match_mode=absolute_price_sum "
+                        "absprice_sum_enabled=true "
                         f"ask_key_t0_b0={_fmt_values(_mid_values('ask_key_t0_b0'))} "
                         f"future_ask_at_ask_key={_fmt_values(_mid_values('future_ask_at_ask_key_taud_t0_b0'))} "
                         f"future_bid_at_ask_key={_fmt_values(_mid_values('future_bid_at_ask_key_taud_t0_b0'))} "
@@ -2324,17 +2222,15 @@ def make_train(config):
                         "SURV_FORMULA_COMPONENTS",
                         f"update={update_idx}",
                         'formula="availability=mean(sigmoid((ratio-gamma)/temperature)); rho_robust=mean_survival*availability; y_rel=rho_robust"',
-                        f"book_source={config.get('survival_target_book_source', 'vision_topk')}",
-                        f"fullbook_match_mode={config.get('survival_fullbook_match_mode', 'same_side')}",
-                        f"absprice_sum_enabled={str(config.get('survival_target_book_source', 'vision_topk') == 'fullbook' and config.get('survival_fullbook_match_mode', 'same_side') == 'absolute_price_sum').lower()}",
-                        f"future_numerator={'future_ask_plus_future_bid_at_current_price' if config.get('survival_target_book_source', 'vision_topk') == 'fullbook' and config.get('survival_fullbook_match_mode', 'same_side') == 'absolute_price_sum' else 'future_same_side_volume_at_current_price'}",
+                        "book_source=fullbook_raw_orders",
+                        "fullbook_match=absolute_price_sum",
+                        "absprice_sum_enabled=true",
+                        "future_numerator=future_ask_plus_future_bid_at_current_price",
                         "current_denominator=current_token_volume",
                         f"gamma={config.get('survival_ratio', 0.5)}",
                         f"temperature={config.get('survival_availability_temperature', 0.15)}",
                         f"delta={config.get('survival_delta_steps', 10)}",
-                        "a_side_removed_from_label=true",
-                        "a_level_removed_from_label=true",
-                        "actionability_far_level_weight_ignored=true",
+                        "task_side_used_for_diagnostics_only=true",
                         "side_order=[Ask,Bid]",
                         "level_order=[0,1,2,3,4,5,6,7,8,9]",
                     ]))
@@ -2357,18 +2253,6 @@ def make_train(config):
                         f"bid={_fmt_values(_mid_values('rho_robust_bid'))}"
                     )
                     print(
-                        "SURV_A_SIDE "
-                        f"update={update_idx} "
-                        f"ask={_fmt_values(_mid_values('a_side_ask'))} "
-                        f"bid={_fmt_values(_mid_values('a_side_bid'))}"
-                    )
-                    print(
-                        "SURV_A_LEVEL "
-                        f"update={update_idx} "
-                        f"ask={_fmt_values(_mid_values('a_level_ask'))} "
-                        f"bid={_fmt_values(_mid_values('a_level_bid'))}"
-                    )
-                    print(
                         "SURV_Y_REL "
                         f"update={update_idx} "
                         f"ask={_fmt_values(_mid_values('y_rel_ask'))} "
@@ -2385,15 +2269,13 @@ def make_train(config):
                         "mean_survival",
                         "availability",
                         "rho_robust",
-                        "a_side",
-                        "a_level",
                         "y_rel",
                     )
                     surv_dist_groups = (
-                        "TOP3_ACTIONABLE",
-                        "TOP3_NONACTIONABLE",
-                        "FAR_ACTIONABLE",
-                        "FAR_NONACTIONABLE",
+                        "CURRENT_RANK_TOP3_TASK_SIDE",
+                        "CURRENT_RANK_TOP3_OPPOSITE_SIDE",
+                        "CURRENT_RANK_FAR_TASK_SIDE",
+                        "CURRENT_RANK_FAR_OPPOSITE_SIDE",
                     )
                     surv_dist_stats = (
                         "count",
@@ -2509,10 +2391,10 @@ def make_train(config):
                         "signed_error",
                     )
                     rel_dist_groups = (
-                        "TOP3_ACTIONABLE",
-                        "TOP3_NONACTIONABLE",
-                        "FAR_ACTIONABLE",
-                        "FAR_NONACTIONABLE",
+                        "CURRENT_RANK_TOP3_TASK_SIDE",
+                        "CURRENT_RANK_TOP3_OPPOSITE_SIDE",
+                        "CURRENT_RANK_FAR_TASK_SIDE",
+                        "CURRENT_RANK_FAR_OPPOSITE_SIDE",
                     )
                     rel_dist_stats = (
                         "count",

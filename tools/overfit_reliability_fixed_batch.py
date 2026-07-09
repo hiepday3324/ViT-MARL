@@ -363,21 +363,8 @@ def _make_fixed_batch(bundle: RolloutBundle) -> FixedBatch:
         ),
         ask_raw_orders=traj.info["world"].get("obs_ask_raw_orders", None),
         bid_raw_orders=traj.info["world"].get("obs_bid_raw_orders", None),
-        survival_target_book_source=config.get("survival_target_book_source", "vision_topk"),
-        survival_fullbook_match_mode=config.get(
-            "survival_fullbook_match_mode",
-            "same_side",
-        ),
         num_steps=config["NUM_STEPS"],
         episode_done=traj.info["agent"]["done"],
-        survival_target_mode=config.get(
-            "survival_target_mode", "actionability_weighted_min_horizon"
-        ),
-        is_sell_task=is_sell_task,
-        actionability_mode=config.get("actionability_mode", "passive_limit"),
-        actionability_eta=config.get("actionability_eta", 0.1),
-        actionability_depth=config.get("actionability_depth", 3),
-        actionability_far_level_weight=config.get("actionability_far_level_weight", 0.25),
     )
     return FixedBatch(
         train_state=bundle.train_states[exec_idx],
@@ -408,11 +395,11 @@ def _safe_corr(score, target, mask, eps=1e-8):
     return cov / jnp.maximum(jnp.sqrt(score_var * target_var), eps)
 
 
-def _group_masks(labels, mask, is_sell_task, actionability_depth=3):
+def _group_masks(labels, mask, is_sell_task, rank_depth=3):
     time_steps, batch_size, levels, sides = labels.shape
     level_ids = jnp.arange(levels)[None, None, :, None]
-    top = jnp.broadcast_to(level_ids < actionability_depth, labels.shape)
-    far = jnp.broadcast_to(level_ids >= actionability_depth, labels.shape)
+    top = jnp.broadcast_to(level_ids < rank_depth, labels.shape)
+    far = jnp.broadcast_to(level_ids >= rank_depth, labels.shape)
     is_sell_task = jnp.asarray(is_sell_task, dtype=jnp.bool_)[:, :, None]
     ask_actionable = jnp.broadcast_to(is_sell_task, (time_steps, batch_size, levels))
     bid_actionable = jnp.broadcast_to(~is_sell_task, (time_steps, batch_size, levels))
@@ -420,10 +407,10 @@ def _group_masks(labels, mask, is_sell_task, actionability_depth=3):
     nonactionable = ~actionable
     valid = mask > 0.0
     return {
-        "TOP3_ACTIONABLE": valid & top & actionable,
-        "TOP3_NONACTIONABLE": valid & top & nonactionable,
-        "FAR_ACTIONABLE": valid & far & actionable,
-        "FAR_NONACTIONABLE": valid & far & nonactionable,
+        "CURRENT_RANK_TOP3_TASK_SIDE": valid & top & actionable,
+        "CURRENT_RANK_TOP3_OPPOSITE_SIDE": valid & top & nonactionable,
+        "CURRENT_RANK_FAR_TASK_SIDE": valid & far & actionable,
+        "CURRENT_RANK_FAR_OPPOSITE_SIDE": valid & far & nonactionable,
     }
 
 
@@ -516,7 +503,6 @@ def _print_diagnostics(step, loss, diag, grads, batch: FixedBatch):
         labels,
         mask,
         batch.is_sell_task,
-        actionability_depth=int(batch.config.get("actionability_depth", 3)),
     )
     for group_name, group_mask in groups.items():
         abs_error = jnp.abs(score - labels)
@@ -597,7 +583,8 @@ def main(argv: list[str] | None = None):
         f"num_envs={config['NUM_ENVS']}",
         f"num_steps={config['NUM_STEPS']}",
         f"survival_delta_steps={config.get('survival_delta_steps', 10)}",
-        f"book_source={config.get('survival_target_book_source', 'vision_topk')}",
+        "book_source=fullbook_raw_orders",
+        "fullbook_match=absolute_price_sum",
         f"use_h_prev_in_reliability={str(config.get('use_h_prev_in_reliability', True)).lower()}",
     )
     bundle = _collect_rollout(config)

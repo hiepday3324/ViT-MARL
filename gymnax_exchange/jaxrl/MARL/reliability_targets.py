@@ -46,7 +46,7 @@ def resolve_rollout_is_sell_task(
     """Resolve a ``(time, batch)`` task-side tensor from rollout info or config.
 
     A random execution task must carry the sampled task direction in rollout
-    info. Falling back to a guessed side would corrupt the side-aware target.
+    info. Falling back to a guessed side would corrupt task-side diagnostics.
     """
     if agent_info is not None and "is_sell_task" in agent_info:
         is_sell_task = jnp.asarray(agent_info["is_sell_task"], dtype=jnp.float32)
@@ -57,7 +57,7 @@ def resolve_rollout_is_sell_task(
     elif task == "random":
         raise ValueError(
             "Execution task='random' requires rollout info['agent']['is_sell_task'] "
-            "to build actionability-weighted reliability targets."
+            "to build task-side reliability diagnostics."
         )
     else:
         raise ValueError(
@@ -108,14 +108,6 @@ def resolve_rollout_is_sell_task(
         )
 
     return (is_sell_task > 0).astype(jnp.float32)
-
-
-def _matched_future_volumes(current_key, future_key, future_volume):
-    matches = future_key[..., None, :] == current_key[..., :, None]
-    return jnp.max(
-        jnp.where(matches, future_volume[..., None, :], 0.0),
-        axis=-1,
-    )
 
 
 def _broadcast_raw_orders(raw_orders, *, required_steps, batch_size, name):
@@ -215,54 +207,22 @@ def build_liquidity_survival_targets(
     survival_ratio,
     num_steps,
     episode_done=None,
-    survival_target_mode="actionability_weighted_min_horizon",
-    is_sell_task=None,
-    actionability_mode="passive_limit",
-    actionability_eta=0.1,
-    actionability_depth=3,
-    actionability_far_level_weight=0.25,
     survival_availability_temperature=0.15,
     ask_raw_orders=None,
     bid_raw_orders=None,
-    survival_target_book_source="vision_topk",
-    survival_fullbook_match_mode="same_side",
     eps=1e-8,
 ):
-    """Build side-aware liquidity targets from normalized LOB vision frames.
+    """Build side-aware robust liquidity targets from normalized LOB frames.
 
     Inputs use the existing LOB contract ``(time, batch, levels, features,
     sides)``. Outputs are ``(time, batch, levels, sides)`` with side order
     ``[Ask, Bid]``. ``episode_done`` is an optional post-step, actor-aligned
     done flag; any done in the inclusive interval ``[t, t + Delta]`` masks
     that target from the reliability loss without changing its label value.
-    The actionability-weighted mode uses an availability-weighted mean
-    volume-survival target, attenuating less executable sides and far levels.
+    Targets always use full raw-book absolute-price matching:
+    future volume at price ``p`` is future Ask volume at ``p`` plus future Bid
+    volume at ``p``. The label is ``mean_survival * availability``.
     """
-    valid_modes = {
-        "final_step_binary",
-        "min_horizon_soft",
-        "actionability_weighted_min_horizon",
-    }
-    if survival_target_mode not in valid_modes:
-        raise ValueError(
-            f"Unknown survival_target_mode: {survival_target_mode}. "
-            f"Expected one of {sorted(valid_modes)}."
-        )
-    valid_book_sources = {"vision_topk", "fullbook"}
-    if survival_target_book_source not in valid_book_sources:
-        raise ValueError(
-            f"Unknown survival_target_book_source: {survival_target_book_source}. "
-            f"Expected one of {sorted(valid_book_sources)}."
-        )
-    valid_fullbook_match_modes = {"same_side", "absolute_price_sum"}
-    if (
-        survival_target_book_source == "fullbook"
-        and survival_fullbook_match_mode not in valid_fullbook_match_modes
-    ):
-        raise ValueError(
-            f"Unknown survival_fullbook_match_mode: {survival_fullbook_match_mode}. "
-            f"Expected one of {sorted(valid_fullbook_match_modes)}."
-        )
     if survival_delta_steps < 1:
         raise ValueError("survival_delta_steps must be at least one.")
 
@@ -302,73 +262,52 @@ def build_liquidity_survival_targets(
     bid_key = jnp.rint((current_mid - bid_gap * tick_size) / tick_size)
     ask_mask = ask_volume >= survival_min_volume
     bid_mask = bid_volume >= survival_min_volume
-    if survival_target_book_source == "fullbook":
-        if ask_raw_orders is None or bid_raw_orders is None:
-            raise ValueError(
-                "ask_raw_orders and bid_raw_orders are required when "
-                "survival_target_book_source='fullbook'."
-            )
-        ask_raw_orders = _broadcast_raw_orders(
-            ask_raw_orders,
-            required_steps=required_steps,
-            batch_size=vision_obs.shape[1],
-            name="ask_raw_orders",
+    if ask_raw_orders is None or bid_raw_orders is None:
+        raise ValueError(
+            "ask_raw_orders and bid_raw_orders are required to build "
+            "fullbook absolute-price reliability targets."
         )
-        bid_raw_orders = _broadcast_raw_orders(
-            bid_raw_orders,
-            required_steps=required_steps,
-            batch_size=vision_obs.shape[1],
-            name="bid_raw_orders",
-        )
+    ask_raw_orders = _broadcast_raw_orders(
+        ask_raw_orders,
+        required_steps=required_steps,
+        batch_size=vision_obs.shape[1],
+        name="ask_raw_orders",
+    )
+    bid_raw_orders = _broadcast_raw_orders(
+        bid_raw_orders,
+        required_steps=required_steps,
+        batch_size=vision_obs.shape[1],
+        name="bid_raw_orders",
+    )
 
     future_ratios = []
-    final_matched_ask_volume = None
-    final_matched_bid_volume = None
     for tau in range(1, survival_delta_steps + 1):
-        if survival_target_book_source == "fullbook":
-            future_ask_at_ask_key = _fullbook_volume_at_key(
-                ask_raw_orders[tau:tau + num_steps],
-                ask_key,
-                tick_size,
-            )
-            future_bid_at_bid_key = _fullbook_volume_at_key(
-                bid_raw_orders[tau:tau + num_steps],
-                bid_key,
-                tick_size,
-            )
-            if survival_fullbook_match_mode == "absolute_price_sum":
-                future_bid_at_ask_key = _fullbook_volume_at_key(
-                    bid_raw_orders[tau:tau + num_steps],
-                    ask_key,
-                    tick_size,
-                )
-                future_ask_at_bid_key = _fullbook_volume_at_key(
-                    ask_raw_orders[tau:tau + num_steps],
-                    bid_key,
-                    tick_size,
-                )
-                matched_ask_volume = future_ask_at_ask_key + future_bid_at_ask_key
-                matched_bid_volume = future_ask_at_bid_key + future_bid_at_bid_key
-            else:
-                matched_ask_volume = future_ask_at_ask_key
-                matched_bid_volume = future_bid_at_bid_key
-        else:
-            future_obs = vision_obs[tau:tau + num_steps]
-            future_mid = mid_prices[tau:tau + num_steps, :, None]
-            future_ask_gap = future_obs[..., 0, 0]
-            future_bid_gap = future_obs[..., 0, 1]
-            future_ask_volume = jnp.expm1(future_obs[..., 1, 0])
-            future_bid_volume = jnp.expm1(future_obs[..., 1, 1])
-            future_ask_key = jnp.rint((future_mid + future_ask_gap * tick_size) / tick_size)
-            future_bid_key = jnp.rint((future_mid - future_bid_gap * tick_size) / tick_size)
+        future_ask_at_ask_key = _fullbook_volume_at_key(
+            ask_raw_orders[tau:tau + num_steps],
+            ask_key,
+            tick_size,
+        )
+        future_bid_at_ask_key = _fullbook_volume_at_key(
+            bid_raw_orders[tau:tau + num_steps],
+            ask_key,
+            tick_size,
+        )
+        matched_ask_volume = future_ask_at_ask_key + future_bid_at_ask_key
 
-            matched_ask_volume = _matched_future_volumes(ask_key, future_ask_key, future_ask_volume)
-            matched_bid_volume = _matched_future_volumes(bid_key, future_bid_key, future_bid_volume)
+        future_ask_at_bid_key = _fullbook_volume_at_key(
+            ask_raw_orders[tau:tau + num_steps],
+            bid_key,
+            tick_size,
+        )
+        future_bid_at_bid_key = _fullbook_volume_at_key(
+            bid_raw_orders[tau:tau + num_steps],
+            bid_key,
+            tick_size,
+        )
+        matched_bid_volume = future_ask_at_bid_key + future_bid_at_bid_key
         ask_ratio = jnp.clip(matched_ask_volume / (ask_volume + eps), 0.0, 1.0)
         bid_ratio = jnp.clip(matched_bid_volume / (bid_volume + eps), 0.0, 1.0)
         future_ratios.append(jnp.stack([ask_ratio, bid_ratio], axis=-1))
-        final_matched_ask_volume = matched_ask_volume
-        final_matched_bid_volume = matched_bid_volume
 
     episode_done = _normalize_episode_done(
         episode_done,
@@ -382,36 +321,8 @@ def build_liquidity_survival_targets(
     )
     side_mask = jnp.stack([ask_mask, bid_mask], axis=-1)
     side_mask = side_mask & valid_horizon[:, :, None, None]
-    if survival_target_mode == "final_step_binary":
-        ask_label = final_matched_ask_volume >= survival_ratio * ask_volume
-        bid_label = final_matched_bid_volume >= survival_ratio * bid_volume
-        target = jnp.stack([ask_label & ask_mask, bid_label & bid_mask], axis=-1)
-        return target.astype(jnp.float32), side_mask.astype(jnp.float32)
 
     ratios = jnp.stack(future_ratios, axis=0)
-    min_survival = jnp.min(ratios, axis=0)
-    if survival_target_mode == "min_horizon_soft":
-        return min_survival.astype(jnp.float32), side_mask.astype(jnp.float32)
-
-    if is_sell_task is None:
-        raise ValueError(
-            "is_sell_task is required for survival_target_mode="
-            "'actionability_weighted_min_horizon'."
-        )
-    if actionability_mode != "passive_limit":
-        raise ValueError(
-            f"Unknown actionability_mode: {actionability_mode}. Expected 'passive_limit'."
-        )
-
-    is_sell_task = jnp.asarray(is_sell_task, dtype=jnp.bool_)
-    expected_task_shape = (num_steps, vision_obs.shape[1])
-    if is_sell_task.shape != expected_task_shape:
-        raise ValueError(
-            "is_sell_task must have shape "
-            f"{expected_task_shape}, got {is_sell_task.shape}."
-        )
-
-    del actionability_eta, actionability_depth, actionability_far_level_weight
     mean_survival = jnp.mean(ratios, axis=0)
     availability_temperature = jnp.maximum(
         jnp.asarray(survival_availability_temperature, dtype=jnp.float32),

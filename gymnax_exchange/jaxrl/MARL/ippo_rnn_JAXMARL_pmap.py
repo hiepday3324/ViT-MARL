@@ -69,7 +69,6 @@ from gymnax_exchange.networks.vision_agent import VisionAgent, supervised_contra
 from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     build_liquidity_survival_targets,
     masked_reliability_loss,
-    resolve_rollout_is_sell_task,
 )
 import wandb
 import functools
@@ -656,20 +655,6 @@ def make_train(config):
                     and isinstance(traj_batch_padded[i].obs, dict)
                     and "vision_obs" in traj_batch_padded[i].obs
                 ):
-                    survival_target_mode = config.get(
-                        "survival_target_mode",
-                        "actionability_weighted_min_horizon",
-                    )
-                    if survival_target_mode == "actionability_weighted_min_horizon":
-                        execution_task = getattr(env.list_of_agents_configs[i], "task", None)
-                        is_sell_task = resolve_rollout_is_sell_task(
-                            traj_batch_padded[i].info["agent"],
-                            task=execution_task,
-                            num_steps=config["NUM_STEPS"],
-                            batch_size=traj_batch_padded[i].obs["vision_obs"].shape[1],
-                        )
-                    else:
-                        is_sell_task = None
                     surv_label, surv_mask = build_liquidity_survival_targets(
                         traj_batch_padded[i].obs["vision_obs"],
                         mid_prices,
@@ -683,25 +668,8 @@ def make_train(config):
                         ),
                         ask_raw_orders=obs_ask_raw_orders,
                         bid_raw_orders=obs_bid_raw_orders,
-                        survival_target_book_source=config.get(
-                            "survival_target_book_source",
-                            "vision_topk",
-                        ),
-                        survival_fullbook_match_mode=config.get(
-                            "survival_fullbook_match_mode",
-                            "same_side",
-                        ),
                         num_steps=config["NUM_STEPS"],
                         episode_done=traj_batch_padded[i].info["agent"]["done"],
-                        survival_target_mode=survival_target_mode,
-                        is_sell_task=is_sell_task,
-                        actionability_mode=config.get("actionability_mode", "passive_limit"),
-                        actionability_eta=config.get("actionability_eta", 0.1),
-                        actionability_depth=config.get("actionability_depth", 3),
-                        actionability_far_level_weight=config.get(
-                            "actionability_far_level_weight",
-                            0.25,
-                        ),
                         eps=config.get("survival_eps", 1e-8),
                     )
                 else:
