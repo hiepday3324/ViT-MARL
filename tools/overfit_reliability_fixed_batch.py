@@ -49,6 +49,7 @@ from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     masked_reliability_loss,
     resolve_rollout_is_sell_task,
 )
+from gymnax_exchange.networks.vision_agent import supervised_contrastive_loss
 
 
 LOG_STEPS_DEFAULT = (0, 1, 5, 10, 25, 50, 100, 200, 300)
@@ -70,6 +71,7 @@ class FixedBatch:
     done: jax.Array
     labels: jax.Array
     mask: jax.Array
+    vol_labels: jax.Array
     is_sell_task: jax.Array
     config: Dict[str, Any]
 
@@ -109,6 +111,28 @@ def _load_config(argv: list[str]) -> Dict[str, Any]:
     config["overfit_steps"] = int(config.get("overfit_steps", 300))
     config["overfit_lr"] = float(config.get("overfit_lr", 1e-3))
     config["overfit_mode"] = config.get("overfit_mode", "all_params")
+    config["overfit_use_supcon"] = _to_bool(
+        config.get("overfit_use_supcon", config.get("use_supcon_loss", False))
+    )
+    config["overfit_lambda_supcon"] = float(
+        config.get("overfit_lambda_supcon", config.get("lambda_supcon", 0.0))
+    )
+    config["overfit_supcon_temperature"] = float(
+        config.get("overfit_supcon_temperature", 0.1)
+    )
+    config["VOL_LOW"] = float(config.get("VOL_LOW", 0.005))
+    config["VOL_HIGH"] = float(config.get("VOL_HIGH", 0.02))
+    survival_delta_steps = max(1, int(config.get("survival_delta_steps", 10)))
+    requested_vol_window = int(
+        config.get(
+            "overfit_vol_window",
+            config.get("SUPCON_VOL_WINDOW", survival_delta_steps),
+        )
+    )
+    config["overfit_vol_window"] = max(
+        1,
+        min(requested_vol_window, survival_delta_steps),
+    )
 
     # Reliability overfit requires the dict observation path. Keep this local to
     # the diagnostic script so normal training defaults remain untouched.
@@ -317,6 +341,59 @@ def _slice_obs(obs, num_steps):
     return jax.tree_util.tree_map(lambda x: x[:num_steps], obs)
 
 
+def _broadcast_mid_prices_to_batch(mid_prices, *, batch_size):
+    mid_prices = jnp.asarray(mid_prices, dtype=jnp.float32)
+    while mid_prices.ndim > 2 and mid_prices.shape[-1] == 1:
+        mid_prices = jnp.squeeze(mid_prices, axis=-1)
+    if mid_prices.ndim == 1:
+        mid_prices = mid_prices[:, None]
+    if mid_prices.ndim != 2:
+        raise ValueError(
+            "mid_prices for volatility labels must be shaped (time,), "
+            f"(time, batch), or (time, batch, 1); got {mid_prices.shape}."
+        )
+    if mid_prices.shape[1] != batch_size:
+        if batch_size % mid_prices.shape[1] != 0:
+            raise ValueError(
+                "Cannot broadcast mid_prices to actor batch for volatility labels: "
+                f"mid batch={mid_prices.shape[1]}, actor batch={batch_size}."
+            )
+        mid_prices = jnp.repeat(mid_prices, batch_size // mid_prices.shape[1], axis=1)
+    return mid_prices
+
+
+def _make_volatility_labels(traj: Transition, config: Dict[str, Any]) -> jax.Array:
+    batch_size = traj.obs["vision_obs"].shape[1]
+    window_size = int(config["overfit_vol_window"])
+    required_steps = int(config["NUM_STEPS"]) + window_size
+    mid_prices = _broadcast_mid_prices_to_batch(
+        traj.info["world"]["end_mid_price"],
+        batch_size=batch_size,
+    )
+    if mid_prices.shape[0] < required_steps:
+        raise ValueError(
+            "end_mid_price must include enough padded future frames for SupCon "
+            f"volatility labels: need {required_steps}, got {mid_prices.shape[0]}."
+        )
+
+    def calc_future_std(t):
+        future_window = jax.lax.dynamic_slice_in_dim(
+            mid_prices,
+            t + 1,
+            window_size,
+            axis=0,
+        )
+        return jnp.std(future_window, axis=0)
+
+    timesteps = jnp.arange(config["NUM_STEPS"])
+    future_vol = jax.vmap(calc_future_std)(timesteps)
+    return jnp.where(
+        future_vol > config["VOL_HIGH"],
+        2,
+        jnp.where(future_vol > config["VOL_LOW"], 1, 0),
+    ).astype(jnp.int32)
+
+
 def _make_fixed_batch(bundle: RolloutBundle) -> FixedBatch:
     config = bundle.config
     env = bundle.env
@@ -366,6 +443,7 @@ def _make_fixed_batch(bundle: RolloutBundle) -> FixedBatch:
         num_steps=config["NUM_STEPS"],
         episode_done=traj.info["agent"]["done"],
     )
+    vol_labels = _make_volatility_labels(traj, config)
     return FixedBatch(
         train_state=bundle.train_states[exec_idx],
         init_hstate=bundle.initial_hstates[exec_idx],
@@ -373,6 +451,7 @@ def _make_fixed_batch(bundle: RolloutBundle) -> FixedBatch:
         done=traj.done[: config["NUM_STEPS"]],
         labels=labels,
         mask=mask,
+        vol_labels=vol_labels,
         is_sell_task=is_sell_task,
         config=config,
     )
@@ -448,25 +527,47 @@ def _filtered_grad_norm(grads, token):
 
 def _make_loss_fn(batch: FixedBatch):
     config = batch.config
+    overfit_use_supcon = bool(config.get("overfit_use_supcon", False))
+    overfit_lambda_supcon = float(config.get("overfit_lambda_supcon", 0.0))
+    overfit_supcon_temperature = float(config.get("overfit_supcon_temperature", 0.1))
 
     def loss_fn(params):
-        _hidden, _pi, _value, _z_vision, aux_info = batch.train_state.apply_fn(
+        hidden, pi, value, z_vision, aux_info = batch.train_state.apply_fn(
             params,
             batch.init_hstate,
             (batch.obs, batch.done),
         )
+        del hidden, pi, value
         scores = aux_info["reliability_scores"]
-        loss = masked_reliability_loss(
+        reliability_loss = masked_reliability_loss(
             scores,
             batch.labels,
             batch.mask,
             loss_type=config.get("reliability_loss_type", "bce"),
             eps=config.get("survival_eps", 1e-8),
         )
+        if overfit_use_supcon and overfit_lambda_supcon != 0.0:
+            z_flat = z_vision.reshape(-1, z_vision.shape[-1])
+            labels_flat = batch.vol_labels.reshape(-1)
+            supcon_loss = supervised_contrastive_loss(
+                z_flat,
+                labels_flat,
+                temperature=overfit_supcon_temperature,
+            )
+        else:
+            supcon_loss = jnp.array(0.0, dtype=jnp.float32)
+        weighted_supcon_loss = overfit_lambda_supcon * supcon_loss
+        total_loss = reliability_loss + weighted_supcon_loss
         aligned_scores = jnp.squeeze(scores, axis=-1) if scores.ndim == 5 else scores
+        z_norm = jnp.linalg.norm(z_vision, axis=-1)
         diag = {
             "score": aligned_scores,
-            "loss": loss,
+            "total_loss": total_loss,
+            "reliability_loss": reliability_loss,
+            "supcon_loss": supcon_loss,
+            "weighted_supcon_loss": weighted_supcon_loss,
+            "lambda_supcon": jnp.asarray(overfit_lambda_supcon, dtype=jnp.float32),
+            "use_supcon_loss": jnp.asarray(float(overfit_use_supcon), dtype=jnp.float32),
             "mae": _safe_mean(jnp.abs(aligned_scores - batch.labels), batch.mask),
             "corr": _safe_corr(aligned_scores, batch.labels, batch.mask),
             "score_mean": _safe_mean(aligned_scores, batch.mask),
@@ -477,8 +578,13 @@ def _make_loss_fn(batch: FixedBatch):
             "target_std": jnp.sqrt(
                 _safe_mean(jnp.square(batch.labels - _safe_mean(batch.labels, batch.mask)), batch.mask)
             ),
+            "z_vision_norm_mean": jnp.mean(z_norm),
+            "z_vision_norm_std": jnp.std(z_norm),
+            "vol_label_count_0": jnp.sum(batch.vol_labels == 0),
+            "vol_label_count_1": jnp.sum(batch.vol_labels == 1),
+            "vol_label_count_2": jnp.sum(batch.vol_labels == 2),
         }
-        return loss, diag
+        return total_loss, diag
 
     return loss_fn
 
@@ -490,13 +596,23 @@ def _print_diagnostics(step, loss, diag, grads, batch: FixedBatch):
     print(
         "OVERFIT_DIAG",
         f"step={step}",
-        f"loss={_float(loss):.6g}",
+        f"total_loss={_float(diag['total_loss']):.6g}",
+        f"reliability_loss={_float(diag['reliability_loss']):.6g}",
+        f"supcon_loss={_float(diag['supcon_loss']):.6g}",
+        f"weighted_supcon_loss={_float(diag['weighted_supcon_loss']):.6g}",
+        f"lambda_supcon={_float(diag['lambda_supcon']):.6g}",
+        f"use_supcon={str(bool(_float(diag['use_supcon_loss']))).lower()}",
         f"mae={_float(diag['mae']):.6g}",
         f"corr_score_target={_float(diag['corr']):.6g}",
         f"score_mean={_float(diag['score_mean']):.6g}",
         f"target_mean={_float(diag['target_mean']):.6g}",
         f"score_std={_float(diag['score_std']):.6g}",
         f"target_std={_float(diag['target_std']):.6g}",
+        f"z_vision_norm_mean={_float(diag['z_vision_norm_mean']):.6g}",
+        f"z_vision_norm_std={_float(diag['z_vision_norm_std']):.6g}",
+        f"vol_label_count_0={int(_float(diag['vol_label_count_0']))}",
+        f"vol_label_count_1={int(_float(diag['vol_label_count_1']))}",
+        f"vol_label_count_2={int(_float(diag['vol_label_count_2']))}",
     )
 
     groups = _group_masks(
@@ -583,6 +699,10 @@ def main(argv: list[str] | None = None):
         f"num_envs={config['NUM_ENVS']}",
         f"num_steps={config['NUM_STEPS']}",
         f"survival_delta_steps={config.get('survival_delta_steps', 10)}",
+        f"overfit_use_supcon={str(config.get('overfit_use_supcon', False)).lower()}",
+        f"overfit_lambda_supcon={config.get('overfit_lambda_supcon', 0.0)}",
+        f"overfit_supcon_temperature={config.get('overfit_supcon_temperature', 0.1)}",
+        f"overfit_vol_window={config.get('overfit_vol_window', config.get('survival_delta_steps', 10))}",
         "book_source=fullbook_raw_orders",
         "fullbook_match=absolute_price_sum",
         f"use_h_prev_in_reliability={str(config.get('use_h_prev_in_reliability', True)).lower()}",
