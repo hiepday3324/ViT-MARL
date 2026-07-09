@@ -142,6 +142,56 @@ class ReliabilityTargetTest(unittest.TestCase):
         )
         self.assertEqual(float(mask[0, 0, 0, 0]), 1.0)
 
+    def test_fullbook_alignment_does_not_swap_ask_bid(self):
+        vision_obs = self._make_vision_obs(time_steps=2, levels=1, volume=100.0)
+        ask_raw_orders = self._make_raw_orders(time_steps=2)
+        bid_raw_orders = self._make_raw_orders(time_steps=2)
+        ask_raw_orders = ask_raw_orders.at[1, 0, 0, 0].set(10_100.0)
+        ask_raw_orders = ask_raw_orders.at[1, 0, 0, 1].set(80.0)
+
+        labels, _ = self._build_targets(
+            vision_obs,
+            mode="actionability_weighted_min_horizon",
+            is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
+            delta=1,
+            actionability_depth=1,
+            survival_target_book_source="fullbook",
+            ask_raw_orders=ask_raw_orders,
+            bid_raw_orders=bid_raw_orders,
+        )
+
+        self.assertAlmostEqual(
+            float(labels[0, 0, 0, 0]),
+            self._expected_robust_survival([0.8]),
+            places=5,
+        )
+        self.assertLess(float(labels[0, 0, 0, 1]), 1e-6)
+
+    def test_fullbook_alignment_does_not_swap_levels(self):
+        vision_obs = self._make_vision_obs(time_steps=2, levels=2, volume=100.0)
+        ask_raw_orders = self._make_raw_orders(time_steps=2)
+        bid_raw_orders = self._make_raw_orders(time_steps=2)
+        ask_raw_orders = ask_raw_orders.at[1, 0, 0, 0].set(10_200.0)
+        ask_raw_orders = ask_raw_orders.at[1, 0, 0, 1].set(80.0)
+
+        labels, _ = self._build_targets(
+            vision_obs,
+            mode="actionability_weighted_min_horizon",
+            is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
+            delta=1,
+            actionability_depth=2,
+            survival_target_book_source="fullbook",
+            ask_raw_orders=ask_raw_orders,
+            bid_raw_orders=bid_raw_orders,
+        )
+
+        self.assertLess(float(labels[0, 0, 0, 0]), 1e-6)
+        self.assertAlmostEqual(
+            float(labels[0, 0, 1, 0]),
+            self._expected_robust_survival([0.8]),
+            places=5,
+        )
+
     def test_fullbook_zero_when_price_missing_from_raw_book(self):
         vision_obs = self._make_vision_obs(time_steps=2, levels=1, volume=100.0)
         vision_obs = vision_obs.at[1, 0, 0, 0, 0].set(10.0)
@@ -183,7 +233,7 @@ class ReliabilityTargetTest(unittest.TestCase):
                 survival_target_book_source="unknown",
             )
 
-    def test_passive_limit_actionability_respects_side_and_depth(self):
+    def test_actionability_side_weight_no_longer_affects_label(self):
         vision_obs = self._make_vision_obs(time_steps=2)
         common_kwargs = {
             "delta": 1,
@@ -199,10 +249,10 @@ class ReliabilityTargetTest(unittest.TestCase):
             **common_kwargs,
         )
         full_ratio_target = self._expected_robust_survival([1.0])
-        self.assertAlmostEqual(float(buy_labels[0, 0, 0, 0]), 0.1 * full_ratio_target, places=5)
+        self.assertAlmostEqual(float(buy_labels[0, 0, 0, 0]), full_ratio_target, places=5)
         self.assertAlmostEqual(float(buy_labels[0, 0, 0, 1]), full_ratio_target, places=5)
-        self.assertAlmostEqual(float(buy_labels[0, 0, 3, 0]), 0.025 * full_ratio_target, places=5)
-        self.assertAlmostEqual(float(buy_labels[0, 0, 3, 1]), 0.25 * full_ratio_target, places=5)
+        self.assertAlmostEqual(float(buy_labels[0, 0, 3, 0]), full_ratio_target, places=5)
+        self.assertAlmostEqual(float(buy_labels[0, 0, 3, 1]), full_ratio_target, places=5)
 
         sell_labels, _ = self._build_targets(
             vision_obs,
@@ -211,7 +261,47 @@ class ReliabilityTargetTest(unittest.TestCase):
             **common_kwargs,
         )
         self.assertAlmostEqual(float(sell_labels[0, 0, 0, 0]), full_ratio_target, places=5)
-        self.assertAlmostEqual(float(sell_labels[0, 0, 0, 1]), 0.1 * full_ratio_target, places=5)
+        self.assertAlmostEqual(float(sell_labels[0, 0, 0, 1]), full_ratio_target, places=5)
+        self.assertAlmostEqual(float(sell_labels[0, 0, 3, 0]), full_ratio_target, places=5)
+        self.assertAlmostEqual(float(sell_labels[0, 0, 3, 1]), full_ratio_target, places=5)
+        self.assertTrue(bool(jnp.allclose(buy_labels, sell_labels)))
+
+    def test_actionability_level_weight_no_longer_affects_label(self):
+        vision_obs = self._make_vision_obs(time_steps=2, levels=6)
+        full_ratio_target = self._expected_robust_survival([1.0])
+
+        labels, _ = self._build_targets(
+            vision_obs,
+            mode="actionability_weighted_min_horizon",
+            is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
+            delta=1,
+            actionability_eta=0.1,
+            actionability_depth=3,
+            actionability_far_level_weight=0.25,
+        )
+
+        self.assertAlmostEqual(float(labels[0, 0, 0, 0]), full_ratio_target, places=5)
+        self.assertAlmostEqual(float(labels[0, 0, 5, 0]), full_ratio_target, places=5)
+        self.assertAlmostEqual(float(labels[0, 0, 5, 1]), full_ratio_target, places=5)
+        self.assertGreater(float(labels[0, 0, 5, 0]), 0.9)
+        self.assertNotAlmostEqual(float(labels[0, 0, 5, 0]), 0.25 * full_ratio_target, places=4)
+
+    def test_actionability_weighted_target_equals_rho_robust_on_valid_mask(self):
+        ratios = [0.8, 0.7, 0.9]
+        vision_obs = self._make_ratio_vision_obs(ratios)
+        labels, mask = self._build_targets(
+            vision_obs,
+            mode="actionability_weighted_min_horizon",
+            is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
+            delta=len(ratios),
+            actionability_eta=0.1,
+            actionability_depth=1,
+            actionability_far_level_weight=0.25,
+        )
+        expected_target = self._expected_robust_survival(ratios)
+        valid_labels = labels[mask > 0.0]
+
+        self.assertTrue(bool(jnp.allclose(valid_labels, expected_target, atol=1e-6)))
 
     def test_actionability_weighted_target_uses_sigmoid_availability(self):
         cases = [
@@ -292,14 +382,31 @@ class ReliabilityTargetTest(unittest.TestCase):
         scores = jnp.array([[[[[0.2], [0.8]], [[0.5], [0.4]]]]], dtype=jnp.float32)
         labels = jnp.array([[[[0.1, 0.9], [0.3, 0.7]]]], dtype=jnp.float32)
         mask = jnp.ones_like(labels)
+        scores_without_trailing_singleton = jnp.squeeze(scores, axis=-1)
 
         bce = masked_reliability_loss(scores, labels, mask, loss_type="bce")
         mse = masked_reliability_loss(scores, labels, mask, loss_type="mse")
+        bce_same_shape = masked_reliability_loss(
+            scores_without_trailing_singleton,
+            labels,
+            mask,
+            loss_type="bce",
+        )
 
         self.assertEqual(bce.shape, ())
         self.assertEqual(mse.shape, ())
+        self.assertEqual(bce_same_shape.shape, ())
         self.assertTrue(bool(jnp.isfinite(bce)))
         self.assertTrue(bool(jnp.isfinite(mse)))
+        self.assertTrue(bool(jnp.isfinite(bce_same_shape)))
+
+    def test_masked_reliability_loss_rejects_side_axis_broadcast(self):
+        scores = jnp.ones((1, 1, 2, 1), dtype=jnp.float32)
+        labels = jnp.ones((1, 1, 2, 2), dtype=jnp.float32)
+        mask = jnp.ones_like(labels)
+
+        with self.assertRaisesRegex(ValueError, "reliability_scores must match labels"):
+            masked_reliability_loss(scores, labels, mask, loss_type="bce")
 
     def test_resolve_rollout_is_sell_task_accepts_padded_rollout(self):
         padded = jnp.zeros((42, 2), dtype=jnp.float32)

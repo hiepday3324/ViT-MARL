@@ -1754,17 +1754,40 @@ class ExecutionAgent():
         
         vision_obs = self._get_obs_vision(world_state=world_state,
                                         normalize=normalize)
-        tick_shift = self._compute_tick_shift(world_state.mid_price, old_mid_price)
+        mid_context = self._get_mid_context(
+            world_state=world_state,
+            agent_state=agent_state,
+            old_mid_price=old_mid_price,
+        )
         return {'exec_obs': exec_obs,
                 'vision_obs': vision_obs,
-                'tick_shift': tick_shift}
+                'mid_context': mid_context}
 
-    def _compute_tick_shift(self, anchor_price: jax.Array, previous_anchor_price: jax.Array) -> jax.Array:
-        """Return anchor frame shift in ticks between the current and previous obs."""
-        return jnp.asarray(
-            (anchor_price - previous_anchor_price) / self.world_config.tick_size,
-            dtype=jnp.float32,
-        ).reshape(1)
+    def _get_mid_context(self, world_state: WorldState, agent_state: ExecEnvState, old_mid_price: jax.Array) -> jax.Array:
+        """Return compact mid-price context for the reliability head.
+
+        There is no rolling mid-price history in the current state, so
+        ``mid_volatility_ticks`` uses ``abs(mid_delta_ticks)`` as a v1 proxy.
+        """
+        tick_size = jnp.asarray(self.world_config.tick_size, dtype=jnp.float32)
+        mid_price = jnp.asarray(world_state.mid_price, dtype=jnp.float32)
+        init_price = jnp.asarray(agent_state.init_price, dtype=jnp.float32)
+        best_ask = jnp.asarray(world_state.best_asks[-1, 0], dtype=jnp.float32)
+        best_bid = jnp.asarray(world_state.best_bids[-1, 0], dtype=jnp.float32)
+        previous_mid_price = jnp.asarray(old_mid_price, dtype=jnp.float32)
+
+        mid_return_from_init = (mid_price - init_price) / tick_size
+        spread_ticks = (best_ask - best_bid) / tick_size
+        mid_delta_ticks = (mid_price - previous_mid_price) / tick_size
+        mid_volatility_ticks = jnp.abs(mid_delta_ticks)
+        return jnp.stack(
+            [
+                mid_return_from_init,
+                spread_ticks,
+                mid_delta_ticks,
+                mid_volatility_ticks,
+            ]
+        ).astype(jnp.float32)
 
 
 
@@ -3074,17 +3097,16 @@ class ExecutionAgent():
             shape=(10, 3, 2),  # Levels, Features, Channels
             dtype=jnp.float32,
         )
-        tick_shift_shape = spaces.Box(
+        mid_context_shape = spaces.Box(
             low=-1000000,
             high=1000000,
-            shape=(1,),
+            shape=(4,),
             dtype=jnp.float32,
         )
-
         return spaces.Dict({
             "exec_obs": exec_space,
             "vision_obs": vision_shape,
-            "tick_shift": tick_shift_shape,
+            "mid_context": mid_context_shape,
         })
 
     def state_space(self, params: ExecEnvParams) -> spaces.Dict:

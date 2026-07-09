@@ -9,8 +9,18 @@ import jax.numpy as jnp
 
 def masked_reliability_loss(reliability_scores, labels, mask, loss_type="bce", eps=1e-8):
     """Compute a masked reliability loss for binary or soft survival targets."""
-    if reliability_scores.ndim == labels.ndim + 1:
+    if reliability_scores.shape == labels.shape + (1,):
         reliability_scores = jnp.squeeze(reliability_scores, axis=-1)
+    elif reliability_scores.shape != labels.shape:
+        raise ValueError(
+            "reliability_scores must match labels exactly or have one trailing "
+            f"singleton dimension; got scores={reliability_scores.shape}, "
+            f"labels={labels.shape}."
+        )
+    if mask.shape != labels.shape:
+        raise ValueError(
+            f"mask must match labels shape; got mask={mask.shape}, labels={labels.shape}."
+        )
 
     r = jnp.clip(reliability_scores, eps, 1.0 - eps)
     y = labels.astype(jnp.float32)
@@ -375,16 +385,7 @@ def build_liquidity_survival_targets(
             f"{expected_task_shape}, got {is_sell_task.shape}."
         )
 
-    ask_weight = jnp.where(is_sell_task, 1.0, actionability_eta)
-    bid_weight = jnp.where(is_sell_task, actionability_eta, 1.0)
-    side_weight = jnp.stack([ask_weight, bid_weight], axis=-1)
-    level_ids = jnp.arange(vision_obs.shape[2])
-    level_weight = jnp.where(
-        level_ids < actionability_depth,
-        1.0,
-        actionability_far_level_weight,
-    )
-    actionability = side_weight[:, :, None, :] * level_weight[None, None, :, None]
+    del actionability_eta, actionability_depth, actionability_far_level_weight
     mean_survival = jnp.mean(ratios, axis=0)
     availability_temperature = jnp.maximum(
         jnp.asarray(survival_availability_temperature, dtype=jnp.float32),
@@ -395,5 +396,5 @@ def build_liquidity_survival_targets(
         axis=0,
     )
     robust_survival = mean_survival * availability
-    target = robust_survival * actionability
+    target = robust_survival
     return target.astype(jnp.float32), side_mask.astype(jnp.float32)

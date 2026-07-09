@@ -1,4 +1,5 @@
 import unittest
+import inspect
 
 import jax
 import jax.numpy as jnp
@@ -11,7 +12,7 @@ project_root = os.path.abspath(os.path.join(current_dir, ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 from gymnax_exchange.networks.gate_fusion import EMASmoothing, StableGatedCrossAttention
-from gymnax_exchange.networks.reliability_head import LevelWiseReliabilityHead
+from gymnax_exchange.networks.reliability_head import LevelWiseReliabilityHead, build_side_id_from_tokens
 from gymnax_exchange.networks.vision_agent import VisionAgent, supervised_contrastive_loss
 
 
@@ -49,27 +50,32 @@ class VisionPipelineShapeTest(unittest.TestCase):
         self.assertEqual(legacy_fused.shape, (time_steps, batch_size, embed_dim // 2))
 
         reliability = LevelWiseReliabilityHead(hidden_dim=64)
+        self.assertNotIn("tick_shift", inspect.signature(reliability.__call__).parameters)
+        self.assertNotIn("obs_exec", inspect.signature(reliability.__call__).parameters)
         h_prev = jnp.ones((batch_size, embed_dim), dtype=jnp.float32)
-        tick_shift = jnp.ones((time_steps, batch_size, 1), dtype=jnp.float32)
+        side_id = build_side_id_from_tokens(tokens)
+        mid_context = jnp.ones((time_steps, batch_size, 4), dtype=jnp.float32)
         reliability_params = reliability.init(
             rng,
             z_tokens=tokens,
-            obs_exec=exec_obs,
+            side_id=side_id,
+            mid_context=mid_context,
             h_prev=h_prev,
-            tick_shift=tick_shift,
         )
         flat_params = flatten_dict(reliability_params["params"])
         param_names = ["/".join(key) for key in flat_params]
         self.assertFalse(any("level_embed" in name for name in param_names))
         self.assertFalse(any("level_proj" in name for name in param_names))
         self.assertFalse(any("side_embed" in name for name in param_names))
-        self.assertFalse(any("side_proj" in name for name in param_names))
+        self.assertFalse(any("shift_proj" in name for name in param_names))
+        self.assertTrue(any("side_proj" in name for name in param_names))
+        self.assertTrue(any("mid_proj" in name for name in param_names))
         reliability_scores, filtered_tokens = reliability.apply(
             reliability_params,
             z_tokens=tokens,
-            obs_exec=exec_obs,
+            side_id=side_id,
+            mid_context=mid_context,
             h_prev=h_prev,
-            tick_shift=tick_shift,
         )
         self.assertEqual(reliability_scores.shape, (time_steps, batch_size, 10, 2, 1))
         self.assertEqual(filtered_tokens.shape, tokens.shape)
@@ -82,9 +88,9 @@ class VisionPipelineShapeTest(unittest.TestCase):
         single_scores, single_filtered = reliability.apply(
             reliability_params,
             z_tokens=tokens[0],
-            obs_exec=exec_obs[0],
+            side_id=side_id[0],
+            mid_context=mid_context[0],
             h_prev=h_prev,
-            tick_shift=tick_shift[0],
         )
         self.assertEqual(single_scores.shape, (batch_size, 10, 2, 1))
         self.assertEqual(single_filtered.shape, tokens[0].shape)
@@ -95,6 +101,49 @@ class VisionPipelineShapeTest(unittest.TestCase):
         loss = supervised_contrastive_loss(pooled.reshape(-1, embed_dim), labels.reshape(-1))
         self.assertEqual(loss.shape, ())
         self.assertTrue(bool(jnp.isfinite(loss)))
+
+    def test_reliability_head_accepts_mid_context_side_id(self):
+        rng = jax.random.PRNGKey(1)
+        time_steps = 2
+        batch_size = 3
+        n_levels = 10
+        n_sides = 2
+        embed_dim = 64
+        z_tokens = jnp.ones((time_steps, batch_size, n_levels, n_sides, embed_dim), dtype=jnp.float32)
+        side_id = build_side_id_from_tokens(z_tokens)
+        mid_context = jnp.ones((time_steps, batch_size, 4), dtype=jnp.float32)
+        h_prev = jnp.ones((batch_size, embed_dim), dtype=jnp.float32)
+        reliability = LevelWiseReliabilityHead(hidden_dim=32)
+
+        params = reliability.init(
+            rng,
+            z_tokens=z_tokens,
+            side_id=side_id,
+            mid_context=mid_context,
+            h_prev=h_prev,
+        )
+        scores, filtered = reliability.apply(
+            params,
+            z_tokens=z_tokens,
+            side_id=side_id,
+            mid_context=mid_context,
+            h_prev=h_prev,
+        )
+
+        self.assertEqual(scores.shape, (time_steps, batch_size, n_levels, n_sides, 1))
+        self.assertEqual(filtered.shape, z_tokens.shape)
+
+    def test_side_id_order(self):
+        z_tokens = jnp.ones((2, 3, 10, 2, 64), dtype=jnp.float32)
+        side_id = build_side_id_from_tokens(z_tokens)
+
+        self.assertTrue(bool(jnp.all(side_id[..., 0, :] == 1.0)))
+        self.assertTrue(bool(jnp.all(side_id[..., 1, :] == -1.0)))
+
+    def test_obs_exec_not_used_in_reliability(self):
+        params = inspect.signature(LevelWiseReliabilityHead().__call__).parameters
+
+        self.assertNotIn("obs_exec", params)
 
 
 if __name__ == "__main__":

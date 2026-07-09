@@ -47,7 +47,7 @@ from gymnax_exchange.jaxen.marl_env import MARLEnv
 from gymnax.environments import spaces
 from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig,Execution_EnvironmentConfig, World_EnvironmentConfig,MarketMaking_EnvironmentConfig
 from gymnax_exchange.networks.gate_fusion import EMASmoothing, StableGatedCrossAttention
-from gymnax_exchange.networks.reliability_head import LevelWiseReliabilityHead
+from gymnax_exchange.networks.reliability_head import LevelWiseReliabilityHead, build_side_id_from_tokens
 from gymnax_exchange.networks.vision_agent import VisionAgent, supervised_contrastive_loss
 from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     build_liquidity_survival_targets,
@@ -100,8 +100,9 @@ class ReliabilityFusionRNN(nn.Module):
     )
     @nn.compact
     def __call__(self, carry, x):
-        obs_exec_t, obs_exec_smoothed_t, z_tokens_t, done_t, tick_shift_t = x
+        obs_exec_t, obs_exec_smoothed_t, z_tokens_t, mid_context_t, done_t = x
         rnn_state = jnp.where(done_t[:, jnp.newaxis], jnp.zeros_like(carry), carry)
+        side_id_t = build_side_id_from_tokens(z_tokens_t)
 
         reliability = LevelWiseReliabilityHead(
             hidden_dim=self.config.get("reliability_hidden_dim", self.config["FC_DIM_SIZE"]),
@@ -109,9 +110,9 @@ class ReliabilityFusionRNN(nn.Module):
         )
         reliability_scores_t, filtered_tokens_t = reliability(
             z_tokens=z_tokens_t,
-            obs_exec=obs_exec_t,
+            side_id=side_id_t,
+            mid_context=mid_context_t,
             h_prev=rnn_state,
-            tick_shift=tick_shift_t,
         )
 
         fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
@@ -129,6 +130,10 @@ class ReliabilityFusionRNN(nn.Module):
             "filtered_tokens_norm": jnp.linalg.norm(filtered_tokens_t, axis=-1),
             "fusion_output_norm": jnp.linalg.norm(fused_t, axis=-1),
             "pre_rnn_embedding_norm": jnp.linalg.norm(embedding_t, axis=-1),
+            "mid_return_from_init": mid_context_t[..., 0],
+            "spread_ticks": mid_context_t[..., 1],
+            "mid_delta_ticks": mid_context_t[..., 2],
+            "mid_volatility_ticks": mid_context_t[..., 3],
         }
         return new_rnn_state, (y_t, reliability_scores_t, rvd_diag_t)
 
@@ -144,6 +149,7 @@ class ActorCriticRNN(nn.Module):
         if isinstance(obs, dict):
             obs_exec = obs['exec_obs']
             obs_vision = obs['vision_obs']
+            mid_context = obs['mid_context']
 
             vision_encoder = VisionAgent(embed_dim=self.config["FC_DIM_SIZE"])
             z_tokens = vision_encoder(obs_vision, return_tokens=True)
@@ -154,14 +160,9 @@ class ActorCriticRNN(nn.Module):
 
             use_reliability_head = self.config.get("use_reliability_head", False)
             if use_reliability_head:
-                use_tick_shift = self.config.get("use_tick_shift", False)
-                tick_shift = obs.get("tick_shift", None) if use_tick_shift else None
-                if tick_shift is None:
-                    tick_shift = jnp.zeros((*obs_exec.shape[:2], 1), dtype=obs_exec.dtype)
-
                 hidden, (embedding, reliability_scores, rvd_diag) = ReliabilityFusionRNN(config=self.config)(
                     hidden,
-                    (obs_exec, obs_exec_smoothed, z_tokens, dones, tick_shift),
+                    (obs_exec, obs_exec_smoothed, z_tokens, mid_context, dones),
                 )
                 aux_info = {
                     "reliability_scores": reliability_scores,
@@ -190,6 +191,13 @@ class ActorCriticRNN(nn.Module):
                 "exec_obs_norm": jnp.linalg.norm(obs_exec, axis=-1),
                 "vision_token_pooled_norm": jnp.linalg.norm(z_vision, axis=-1),
                 "actor_input_norm": jnp.linalg.norm(embedding, axis=-1),
+                "rel_z_shape": jnp.asarray(z_tokens.shape, dtype=jnp.float32),
+                "rel_side_id_shape": jnp.asarray(z_tokens.shape[:-1] + (1,), dtype=jnp.float32),
+                "rel_mid_context_shape": jnp.asarray(mid_context.shape, dtype=jnp.float32),
+                "mid_return_from_init": mid_context[..., 0],
+                "spread_ticks": mid_context[..., 1],
+                "mid_delta_ticks": mid_context[..., 2],
+                "mid_volatility_ticks": mid_context[..., 3],
             })
         else:
             fused_obs = obs
@@ -407,14 +415,14 @@ def make_train(config):
                 init_obs = {
                     'exec_obs': jnp.zeros((1, config["NUM_ENVS"], obs_shape)), 
                     'vision_obs': jnp.zeros((1, config["NUM_ENVS"], 10, 3, 2)), # Shape của LOB
-                    'tick_shift': jnp.zeros((1, config["NUM_ENVS"], 1)),
+                    'mid_context': jnp.zeros((1, config["NUM_ENVS"], 4)),
                 }
             elif isinstance(env.observation_spaces[i], dict):
                 obs_shape = env.observation_spaces[i]['exec_obs'].shape[0]
                 init_obs = {
                     'exec_obs': jnp.zeros((1, config["NUM_ENVS"], obs_shape)), 
                     'vision_obs': jnp.zeros((1, config["NUM_ENVS"], 10, 3, 2)), # Shape của LOB
-                    'tick_shift': jnp.zeros((1, config["NUM_ENVS"], 1)),
+                    'mid_context': jnp.zeros((1, config["NUM_ENVS"], 4)),
                 }
             else:
                 init_obs = jnp.zeros((1, config["NUM_ENVS"], env.observation_spaces[i].shape[0]))
@@ -677,6 +685,9 @@ def make_train(config):
             def _surv_dist_key(component_name, group_name, stat_name):
                 return f"dist_{component_name}_{group_name}_{stat_name}"
 
+            def _rel_dist_key(component_name, group_name, stat_name):
+                return f"rel_dist_{component_name}_{group_name}_{stat_name}"
+
             def _zero_mid_diag():
                 diag = {
                     "obs_mid_available": jnp.array(0.0, dtype=jnp.float32),
@@ -698,6 +709,14 @@ def make_train(config):
                     "bid_ratio_nonzero_rate": jnp.array(0.0, dtype=jnp.float32),
                     "ask_ratio_mean": jnp.array(0.0, dtype=jnp.float32),
                     "bid_ratio_mean": jnp.array(0.0, dtype=jnp.float32),
+                    "ask_key_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
+                    "bid_key_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
+                    "ask_vol_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
+                    "bid_vol_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
+                    "matched_ask_volume_tau1_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
+                    "matched_bid_volume_tau1_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
+                    "matched_ask_volume_taud_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
+                    "matched_bid_volume_taud_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
                     "mean_survival_ask": jnp.zeros((10,), dtype=jnp.float32),
                     "mean_survival_bid": jnp.zeros((10,), dtype=jnp.float32),
                     "availability_ask": jnp.zeros((10,), dtype=jnp.float32),
@@ -717,6 +736,32 @@ def make_train(config):
                     for group_name in _surv_dist_groups:
                         for stat_name in _surv_dist_stats:
                             diag[_surv_dist_key(component_name, group_name, stat_name)] = jnp.array(
+                                0.0,
+                                dtype=jnp.float32,
+                            )
+                return diag
+
+            def _zero_reliability_alignment_diag():
+                diag = {
+                    "score_shape_ok": jnp.array(0.0, dtype=jnp.float32),
+                    "mask_shape_ok": jnp.array(0.0, dtype=jnp.float32),
+                    "score_ndim": jnp.array(0.0, dtype=jnp.float32),
+                    "label_ndim": jnp.array(0.0, dtype=jnp.float32),
+                    "mask_ndim": jnp.array(0.0, dtype=jnp.float32),
+                    "score_t0_b0_ask": jnp.zeros((10,), dtype=jnp.float32),
+                    "score_t0_b0_bid": jnp.zeros((10,), dtype=jnp.float32),
+                    "target_t0_b0_ask": jnp.zeros((10,), dtype=jnp.float32),
+                    "target_t0_b0_bid": jnp.zeros((10,), dtype=jnp.float32),
+                    "mask_t0_b0_ask": jnp.zeros((10,), dtype=jnp.float32),
+                    "mask_t0_b0_bid": jnp.zeros((10,), dtype=jnp.float32),
+                }
+                for prefix in ("score", "label", "mask"):
+                    for axis in range(5):
+                        diag[f"{prefix}_dim{axis}"] = jnp.array(-1.0, dtype=jnp.float32)
+                for component_name in ("score", "target", "abs_error", "signed_error"):
+                    for group_name in _surv_dist_groups:
+                        for stat_name in _surv_dist_stats:
+                            diag[_rel_dist_key(component_name, group_name, stat_name)] = jnp.array(
                                 0.0,
                                 dtype=jnp.float32,
                             )
@@ -772,7 +817,17 @@ def make_train(config):
                 bid_ratio_nonzero = []
                 ask_ratio_values = []
                 bid_ratio_values = []
+                zero_sample = jnp.zeros((10,), dtype=jnp.float32)
+                matched_ask_tau1_sample = zero_sample
+                matched_bid_tau1_sample = zero_sample
+                matched_ask_taud_sample = zero_sample
+                matched_bid_taud_sample = zero_sample
                 eps = config.get("survival_eps", 1e-8)
+
+                def _sample_t0_b0(x):
+                    vals = jnp.asarray(x[0, 0, :10], dtype=jnp.float32)
+                    return jnp.pad(vals, (0, 10 - vals.shape[0]), constant_values=0.0)
+
                 for tau in range(1, survival_delta_steps + 1):
                     if book_source == "fullbook":
                         matched_ask_volume = _fullbook_volume_at_key(
@@ -804,6 +859,12 @@ def make_train(config):
                             jnp.where(bid_matches, future_bid_volume[..., None, :], 0.0),
                             axis=-1,
                         )
+                    if tau == 1:
+                        matched_ask_tau1_sample = _sample_t0_b0(matched_ask_volume)
+                        matched_bid_tau1_sample = _sample_t0_b0(matched_bid_volume)
+                    if tau == survival_delta_steps:
+                        matched_ask_taud_sample = _sample_t0_b0(matched_ask_volume)
+                        matched_bid_taud_sample = _sample_t0_b0(matched_bid_volume)
                     ask_ratio = jnp.clip(matched_ask_volume / (ask_volume + eps), 0.0, 1.0)
                     bid_ratio = jnp.clip(matched_bid_volume / (bid_volume + eps), 0.0, 1.0)
                     future_ratios.append(jnp.stack([ask_ratio, bid_ratio], axis=-1))
@@ -858,32 +919,30 @@ def make_train(config):
                     "bid_ratio_nonzero_rate": jnp.mean(jnp.stack(bid_ratio_nonzero, axis=0)),
                     "ask_ratio_mean": jnp.mean(jnp.stack(ask_ratio_values, axis=0)),
                     "bid_ratio_mean": jnp.mean(jnp.stack(bid_ratio_values, axis=0)),
+                    "ask_key_t0_b0": _sample_t0_b0(ask_key),
+                    "bid_key_t0_b0": _sample_t0_b0(bid_key),
+                    "ask_vol_t0_b0": _sample_t0_b0(ask_volume),
+                    "bid_vol_t0_b0": _sample_t0_b0(bid_volume),
+                    "matched_ask_volume_tau1_t0_b0": matched_ask_tau1_sample,
+                    "matched_bid_volume_tau1_t0_b0": matched_bid_tau1_sample,
+                    "matched_ask_volume_taud_t0_b0": matched_ask_taud_sample,
+                    "matched_bid_volume_taud_t0_b0": matched_bid_taud_sample,
                 }
                 if is_sell_task is None:
                     side_weight = jnp.ones(robust_survival.shape[:2] + (2,), dtype=jnp.float32)
-                    level_weight = jnp.ones((vision_obs.shape[2],), dtype=jnp.float32)
                 else:
                     is_sell_task_bool = jnp.asarray(is_sell_task, dtype=jnp.bool_)
                     ask_weight = jnp.where(is_sell_task_bool, 1.0, config.get("actionability_eta", 0.1))
                     bid_weight = jnp.where(is_sell_task_bool, config.get("actionability_eta", 0.1), 1.0)
                     side_weight = jnp.stack([ask_weight, bid_weight], axis=-1).astype(jnp.float32)
-                    level_ids = jnp.arange(vision_obs.shape[2])
-                    level_weight = jnp.where(
-                        level_ids < config.get("actionability_depth", 3),
-                        1.0,
-                        config.get("actionability_far_level_weight", 0.25),
-                    ).astype(jnp.float32)
                 a_side_component = jnp.broadcast_to(
                     side_weight[:, :, None, :],
                     robust_survival.shape,
                 )
-                a_level_component = jnp.broadcast_to(
-                    level_weight[None, None, :, None],
-                    robust_survival.shape,
-                )
-                actionability = a_side_component * a_level_component
-                y_rel = robust_survival * actionability
-                product = robust_survival * a_side_component * a_level_component
+                a_level_component = jnp.ones_like(robust_survival, dtype=jnp.float32)
+                actionability = a_side_component
+                y_rel = robust_survival
+                product = robust_survival
                 formula_diff = jnp.abs(y_rel - product)
                 if surv_mask is None:
                     component_mask = jnp.ones_like(robust_survival, dtype=jnp.float32)
@@ -1032,6 +1091,145 @@ def make_train(config):
                                 stat_name
                             ]
                 return robust_survival.astype(jnp.float32), actionability.astype(jnp.float32), mid_diag
+
+            def _build_reliability_alignment_diag(
+                reliability_scores,
+                surv_labels,
+                surv_mask,
+                surv_actionability,
+            ):
+                score_shape = reliability_scores.shape
+                label_shape = surv_labels.shape
+                mask_shape = surv_mask.shape
+                if score_shape == label_shape + (1,):
+                    aligned_scores = jnp.squeeze(reliability_scores, axis=-1)
+                elif score_shape == label_shape:
+                    aligned_scores = reliability_scores
+                else:
+                    raise ValueError(
+                        "Reliability/target shape mismatch in diagnostics: "
+                        f"scores={score_shape}, labels={label_shape}."
+                    )
+                if mask_shape != label_shape:
+                    raise ValueError(
+                        "Reliability mask/target shape mismatch in diagnostics: "
+                        f"mask={mask_shape}, labels={label_shape}."
+                    )
+
+                def _shape_dim(shape, axis):
+                    return jnp.array(shape[axis] if axis < len(shape) else -1, dtype=jnp.float32)
+
+                def _sample_t0_b0_side(x, side):
+                    vals = jnp.asarray(x[0, 0, :10, side], dtype=jnp.float32)
+                    return jnp.pad(vals, (0, 10 - vals.shape[0]), constant_values=0.0)
+
+                def _masked_stats(x, mask, eps_value=1e-8):
+                    x = jnp.asarray(x, dtype=jnp.float32)
+                    mask = jnp.asarray(mask, dtype=jnp.float32)
+                    count = jnp.sum(mask)
+                    safe_count = jnp.maximum(count, eps_value)
+                    mean = jnp.sum(x * mask) / safe_count
+                    centered = (x - mean) * mask
+                    std = jnp.sqrt(jnp.sum(jnp.square(centered)) / safe_count)
+                    flat_x = jnp.reshape(x, (-1,))
+                    flat_mask = jnp.reshape(mask > 0, (-1,))
+                    sorted_vals = jnp.sort(jnp.where(flat_mask, flat_x, jnp.inf))
+                    count_int = jnp.maximum(count.astype(jnp.int32), 1)
+                    has_values = count > 0
+
+                    def _percentile(q):
+                        idx = jnp.floor(q * (count_int.astype(jnp.float32) - 1.0)).astype(jnp.int32)
+                        return jnp.take(sorted_vals, idx)
+
+                    min_val = jnp.min(jnp.where(flat_mask, flat_x, jnp.inf))
+                    max_val = jnp.max(jnp.where(flat_mask, flat_x, -jnp.inf))
+                    zero_rate = jnp.sum(((x <= 1e-6).astype(jnp.float32)) * mask) / safe_count
+                    pos_rate_0p1 = jnp.sum(((x > 0.1).astype(jnp.float32)) * mask) / safe_count
+                    pos_rate_0p3 = jnp.sum(((x > 0.3).astype(jnp.float32)) * mask) / safe_count
+                    pos_rate_0p5 = jnp.sum(((x > 0.5).astype(jnp.float32)) * mask) / safe_count
+                    pos_rate_0p7 = jnp.sum(((x > 0.7).astype(jnp.float32)) * mask) / safe_count
+                    return {
+                        "count": count,
+                        "mean": jnp.where(has_values, mean, 0.0),
+                        "std": jnp.where(has_values, std, 0.0),
+                        "min": jnp.where(has_values, min_val, 0.0),
+                        "p10": jnp.where(has_values, _percentile(0.10), 0.0),
+                        "p25": jnp.where(has_values, _percentile(0.25), 0.0),
+                        "p50": jnp.where(has_values, _percentile(0.50), 0.0),
+                        "p75": jnp.where(has_values, _percentile(0.75), 0.0),
+                        "p90": jnp.where(has_values, _percentile(0.90), 0.0),
+                        "p95": jnp.where(has_values, _percentile(0.95), 0.0),
+                        "p99": jnp.where(has_values, _percentile(0.99), 0.0),
+                        "max": jnp.where(has_values, max_val, 0.0),
+                        "zero_rate": jnp.where(has_values, zero_rate, 0.0),
+                        "pos_rate_0p1": jnp.where(has_values, pos_rate_0p1, 0.0),
+                        "pos_rate_0p3": jnp.where(has_values, pos_rate_0p3, 0.0),
+                        "pos_rate_0p5": jnp.where(has_values, pos_rate_0p5, 0.0),
+                        "pos_rate_0p7": jnp.where(has_values, pos_rate_0p7, 0.0),
+                    }
+
+                component_mask = jnp.asarray(surv_mask, dtype=jnp.float32)
+                base_mask = component_mask > 0
+                level_ids_for_diag = jnp.arange(surv_labels.shape[2])
+                top_level_mask = (level_ids_for_diag < config.get("actionability_depth", 3))[
+                    None,
+                    None,
+                    :,
+                    None,
+                ]
+                far_level_mask = (level_ids_for_diag >= config.get("actionability_depth", 3))[
+                    None,
+                    None,
+                    :,
+                    None,
+                ]
+                side_actionability = surv_actionability
+                midpoint = (1.0 + config.get("actionability_eta", 0.1)) / 2.0
+                actionable_mask = side_actionability > midpoint
+                nonactionable_mask = side_actionability <= midpoint
+                group_masks = {
+                    "TOP3_ACTIONABLE": base_mask & top_level_mask & actionable_mask,
+                    "TOP3_NONACTIONABLE": base_mask & top_level_mask & nonactionable_mask,
+                    "FAR_ACTIONABLE": base_mask & far_level_mask & actionable_mask,
+                    "FAR_NONACTIONABLE": base_mask & far_level_mask & nonactionable_mask,
+                }
+                rel_components = {
+                    "score": aligned_scores,
+                    "target": surv_labels,
+                    "abs_error": jnp.abs(aligned_scores - surv_labels),
+                    "signed_error": aligned_scores - surv_labels,
+                }
+
+                diag = {
+                    "score_shape_ok": jnp.array(1.0, dtype=jnp.float32),
+                    "mask_shape_ok": jnp.array(1.0, dtype=jnp.float32),
+                    "score_ndim": jnp.array(len(score_shape), dtype=jnp.float32),
+                    "label_ndim": jnp.array(len(label_shape), dtype=jnp.float32),
+                    "mask_ndim": jnp.array(len(mask_shape), dtype=jnp.float32),
+                    "score_t0_b0_ask": _sample_t0_b0_side(aligned_scores, 0),
+                    "score_t0_b0_bid": _sample_t0_b0_side(aligned_scores, 1),
+                    "target_t0_b0_ask": _sample_t0_b0_side(surv_labels, 0),
+                    "target_t0_b0_bid": _sample_t0_b0_side(surv_labels, 1),
+                    "mask_t0_b0_ask": _sample_t0_b0_side(component_mask, 0),
+                    "mask_t0_b0_bid": _sample_t0_b0_side(component_mask, 1),
+                }
+                for prefix, shape in (
+                    ("score", score_shape),
+                    ("label", label_shape),
+                    ("mask", mask_shape),
+                ):
+                    for axis in range(5):
+                        diag[f"{prefix}_dim{axis}"] = _shape_dim(shape, axis)
+
+                for component_name in ("score", "target", "abs_error", "signed_error"):
+                    for group_name in _surv_dist_groups:
+                        stats = _masked_stats(rel_components[component_name], group_masks[group_name])
+                        for stat_name in _surv_dist_stats:
+                            diag[_rel_dist_key(component_name, group_name, stat_name)] = stats[
+                                stat_name
+                            ]
+                return diag
+
 
             for i in range(len(stashed_runner_state[0])): # Lặp qua train_states
                 end_mid_prices = traj_batch_padded[i].info["world"]["end_mid_price"]
@@ -1323,6 +1521,13 @@ def make_train(config):
                             fusion_output_norm_mean = jnp.mean(aux_info["fusion_output_norm"])
                             pre_rnn_embedding_norm_mean = jnp.mean(aux_info["pre_rnn_embedding_norm"])
                             actor_input_norm_mean = jnp.mean(aux_info["actor_input_norm"])
+                            rel_z_shape = aux_info.get("rel_z_shape", jnp.full((5,), -1.0, dtype=jnp.float32))
+                            rel_side_id_shape = aux_info.get("rel_side_id_shape", jnp.full((5,), -1.0, dtype=jnp.float32))
+                            rel_mid_context_shape = aux_info.get("rel_mid_context_shape", jnp.full((3,), -1.0, dtype=jnp.float32))
+                            mid_return_from_init_mean = jnp.mean(aux_info.get("mid_return_from_init", jnp.array(0.0, dtype=jnp.float32)))
+                            spread_ticks_mean = jnp.mean(aux_info.get("spread_ticks", jnp.array(0.0, dtype=jnp.float32)))
+                            mid_delta_ticks_mean = jnp.mean(aux_info.get("mid_delta_ticks", jnp.array(0.0, dtype=jnp.float32)))
+                            mid_volatility_ticks_mean = jnp.mean(aux_info.get("mid_volatility_ticks", jnp.array(0.0, dtype=jnp.float32)))
 
                             # LOSS CUỐI CÙNG (Cộng PPO và SupCon có hệ số)
                             if (
@@ -1331,6 +1536,19 @@ def make_train(config):
                                 and isinstance(traj_batch.obs, dict)
                             ):
                                 # Soft targets use the same auxiliary slot as the legacy survival loss.
+                                if not (
+                                    reliability_scores.shape == surv_labels.shape
+                                    or reliability_scores.shape == surv_labels.shape + (1,)
+                                ):
+                                    raise ValueError(
+                                        "Reliability scores and survival labels are not aligned: "
+                                        f"scores={reliability_scores.shape}, labels={surv_labels.shape}."
+                                    )
+                                if surv_mask.shape != surv_labels.shape:
+                                    raise ValueError(
+                                        "Survival mask and labels are not aligned: "
+                                        f"mask={surv_mask.shape}, labels={surv_labels.shape}."
+                                    )
                                 survival_loss = masked_reliability_loss(
                                     reliability_scores,
                                     surv_labels,
@@ -1399,6 +1617,13 @@ def make_train(config):
                                 fusion_output_norm_mean,
                                 pre_rnn_embedding_norm_mean,
                                 actor_input_norm_mean,
+                                rel_z_shape,
+                                rel_side_id_shape,
+                                rel_mid_context_shape,
+                                mid_return_from_init_mean,
+                                spread_ticks_mean,
+                                mid_delta_ticks_mean,
+                                mid_volatility_ticks_mean,
                             )
                         grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                         total_loss, grads = grad_fn(
@@ -1501,6 +1726,30 @@ def make_train(config):
                 train_states[i] = update_state[0]
                 loss_infos.append(loss_info)
 
+            reliability_alignment_diags = []
+            for i, train_state in enumerate(train_states):
+                if (
+                    config.get("use_survival_loss", False)
+                    and config.get("use_reliability_head", False)
+                    and isinstance(traj_batch[i].obs, dict)
+                    and "vision_obs" in traj_batch[i].obs
+                ):
+                    _, _, _, _, diag_aux_info = train_state.apply_fn(
+                        train_state.params,
+                        initial_hstates[i],
+                        (traj_batch[i].obs, traj_batch[i].done),
+                    )
+                    reliability_alignment_diags.append(
+                        _build_reliability_alignment_diag(
+                            diag_aux_info["reliability_scores"],
+                            survival_labels[i],
+                            survival_masks[i],
+                            survival_actionability_weights[i],
+                        )
+                    )
+                else:
+                    reliability_alignment_diags.append(_zero_reliability_alignment_diag())
+
 
             metrics= {}
             metrics['agents'] = [jax.tree.map(
@@ -1510,6 +1759,7 @@ def make_train(config):
                 trjbtch.info['agent']) for i, trjbtch in enumerate(traj_batch)]
             metrics['world'] = [traj_batch.info['world'] for i, traj_batch in enumerate(traj_batch)]
             metrics["survival_mid_diag"] = survival_mid_diags
+            metrics["reliability_alignment_diag"] = reliability_alignment_diags
             metrics["loss"]=[]
             for i,loss_info in enumerate(loss_infos):
                 ratio_0 = loss_info[1][3].at[0,0].get().mean()
@@ -1561,6 +1811,13 @@ def make_train(config):
                     "fusion_output_norm_mean": loss_info[1][38],
                     "pre_rnn_embedding_norm_mean": loss_info[1][39],
                     "actor_input_norm_mean": loss_info[1][40],
+                    "rel_z_shape": loss_info[1][41],
+                    "rel_side_id_shape": loss_info[1][42],
+                    "rel_mid_context_shape": loss_info[1][43],
+                    "mid_return_from_init_mean": loss_info[1][44],
+                    "spread_ticks_mean": loss_info[1][45],
+                    "mid_delta_ticks_mean": loss_info[1][46],
+                    "mid_volatility_ticks_mean": loss_info[1][47],
                     "total_loss_with_aux": loss_info[0],
                     "weighted_entropy_loss": loss_info[1][2] * config["ENT_COEF"][i],
                     "lambda_supcon": jnp.array(
@@ -1782,6 +2039,7 @@ def make_train(config):
                         f"reliability_max={_loss_value(exe_loss_metrics, 'reliability_max'):.6g}",
                         f"reliability_side0_mean={_loss_value(exe_loss_metrics, 'reliability_side0_mean'):.6g}",
                         f"reliability_side1_mean={_loss_value(exe_loss_metrics, 'reliability_side1_mean'):.6g}",
+                        "tick_shift_removed=true",
                     ]))
                     print(
                         "RVD_DIAG_LEVELS "
@@ -1805,6 +2063,26 @@ def make_train(config):
                         f"fusion_output_norm_mean={_loss_value(exe_loss_metrics, 'fusion_output_norm_mean'):.6g}",
                         f"pre_rnn_embedding_norm_mean={_loss_value(exe_loss_metrics, 'pre_rnn_embedding_norm_mean'):.6g}",
                         f"actor_input_norm_mean={_loss_value(exe_loss_metrics, 'actor_input_norm_mean'):.6g}",
+                    ]))
+                    exe_actor_count = config["NUM_ENVS"]
+                    if "NUM_ACTORS_PERTYPE" in config and exe_agent_index is not None:
+                        exe_actor_count = config["NUM_ACTORS_PERTYPE"][exe_agent_index]
+                    z_tokens_shape = f"({config['NUM_STEPS']},{exe_actor_count},10,2,{config['FC_DIM_SIZE']})"
+                    side_id_shape = f"({config['NUM_STEPS']},{exe_actor_count},10,2,1)"
+                    mid_context_shape = f"({config['NUM_STEPS']},{exe_actor_count},4)"
+                    print(" ".join([
+                        "REL_INPUT_DIAG",
+                        f"update={update_idx}",
+                        f"z_tokens_shape={z_tokens_shape}",
+                        f"side_id_shape={side_id_shape}",
+                        "side_id_order=[Ask:+1,Bid:-1]",
+                        f"mid_context_shape={mid_context_shape}",
+                        f"mid_return_from_init_mean={_loss_value(exe_loss_metrics, 'mid_return_from_init_mean'):.6g}",
+                        f"spread_ticks_mean={_loss_value(exe_loss_metrics, 'spread_ticks_mean'):.6g}",
+                        f"mid_delta_ticks_mean={_loss_value(exe_loss_metrics, 'mid_delta_ticks_mean'):.6g}",
+                        f"mid_volatility_ticks_mean={_loss_value(exe_loss_metrics, 'mid_volatility_ticks_mean'):.6g}",
+                        "obs_exec_used_in_reliability=false",
+                        "tick_shift_removed=true",
                     ]))
                 else:
                     print(f"RVD_DIAG update={update_idx} status=no_execution_loss_metrics")
@@ -1856,6 +2134,14 @@ def make_train(config):
                         f"bid_key_min={_mid_value('bid_key_min'):.6g}",
                         f"bid_key_max={_mid_value('bid_key_max'):.6g}",
                     ]))
+                    print(
+                        "SURV_PRICE_KEYS "
+                        f"update={update_idx} "
+                        f"ask_key_t0_b0={_fmt_values(_mid_values('ask_key_t0_b0'))} "
+                        f"bid_key_t0_b0={_fmt_values(_mid_values('bid_key_t0_b0'))} "
+                        f"ask_vol_t0_b0={_fmt_values(_mid_values('ask_vol_t0_b0'))} "
+                        f"bid_vol_t0_b0={_fmt_values(_mid_values('bid_vol_t0_b0'))}"
+                    )
                     print(" ".join([
                         "FUTURE_MATCH_DIAG",
                         f"update={update_idx}",
@@ -1866,14 +2152,35 @@ def make_train(config):
                         f"ask_ratio_mean={_mid_value('ask_ratio_mean'):.6g}",
                         f"bid_ratio_mean={_mid_value('bid_ratio_mean'):.6g}",
                     ]))
+                    print(
+                        "SURV_FULLBOOK_MATCH_SAMPLE "
+                        f"update={update_idx} "
+                        "tau=1 "
+                        f"ask_key_t0_b0={_fmt_values(_mid_values('ask_key_t0_b0'))} "
+                        f"matched_ask_volume_t0_b0={_fmt_values(_mid_values('matched_ask_volume_tau1_t0_b0'))} "
+                        f"bid_key_t0_b0={_fmt_values(_mid_values('bid_key_t0_b0'))} "
+                        f"matched_bid_volume_t0_b0={_fmt_values(_mid_values('matched_bid_volume_tau1_t0_b0'))}"
+                    )
+                    print(
+                        "SURV_FULLBOOK_MATCH_SAMPLE "
+                        f"update={update_idx} "
+                        f"tau={config.get('survival_delta_steps', 10)} "
+                        f"ask_key_t0_b0={_fmt_values(_mid_values('ask_key_t0_b0'))} "
+                        f"matched_ask_volume_t0_b0={_fmt_values(_mid_values('matched_ask_volume_taud_t0_b0'))} "
+                        f"bid_key_t0_b0={_fmt_values(_mid_values('bid_key_t0_b0'))} "
+                        f"matched_bid_volume_t0_b0={_fmt_values(_mid_values('matched_bid_volume_taud_t0_b0'))}"
+                    )
                     print(" ".join([
                         "SURV_FORMULA_COMPONENTS",
                         f"update={update_idx}",
-                        'formula="availability=mean(sigmoid((ratio-gamma)/temperature)); rho_robust=mean_survival*availability; y_rel=rho_robust*a_side*a_level"',
+                        'formula="availability=mean(sigmoid((ratio-gamma)/temperature)); rho_robust=mean_survival*availability; y_rel=rho_robust"',
                         f"book_source={config.get('survival_target_book_source', 'vision_topk')}",
                         f"gamma={config.get('survival_ratio', 0.5)}",
                         f"temperature={config.get('survival_availability_temperature', 0.15)}",
                         f"delta={config.get('survival_delta_steps', 10)}",
+                        "a_side_removed_from_label=true",
+                        "a_level_removed_from_label=true",
+                        "actionability_far_level_weight_ignored=true",
                         "side_order=[Ask,Bid]",
                         "level_order=[0,1,2,3,4,5,6,7,8,9]",
                     ]))
@@ -1916,6 +2223,7 @@ def make_train(config):
                     print(" ".join([
                         "SURV_FORMULA_CHECK",
                         f"update={update_idx}",
+                        "expected_product=rho_robust",
                         f"max_abs_yrel_minus_product={_mid_value('max_abs_yrel_minus_product'):.6g}",
                         f"mean_abs_yrel_minus_product={_mid_value('mean_abs_yrel_minus_product'):.6g}",
                     ]))
@@ -1963,6 +2271,125 @@ def make_train(config):
                             fields.extend(
                                 f"{stat_name}={_mid_value(f'dist_{component_name}_{group_name}_{stat_name}'):.6g}"
                                 for stat_name in surv_dist_stats
+                            )
+                            print(" ".join(fields))
+
+                if exe_agent_index is not None and "reliability_alignment_diag" in metric:
+                    exe_rel_diag = metric["reliability_alignment_diag"][exe_agent_index]
+
+                    def _rel_value(key, default=0.0):
+                        if key in exe_rel_diag:
+                            return float(np.nanmean(np.array(exe_rel_diag[key])))
+                        return float(default)
+
+                    def _rel_values(key):
+                        if key in exe_rel_diag:
+                            values = np.array(exe_rel_diag[key]).reshape(-1)
+                        else:
+                            values = np.zeros((10,), dtype=np.float32)
+                        if values.size < 10:
+                            values = np.pad(values, (0, 10 - values.size), constant_values=0.0)
+                        return values[:10]
+
+                    def _shape_text(prefix):
+                        ndim = int(_rel_value(f"{prefix}_ndim", 0))
+                        dims = [
+                            int(_rel_value(f"{prefix}_dim{axis}", -1))
+                            for axis in range(max(ndim, 0))
+                        ]
+                        return "(" + ",".join(str(dim) for dim in dims) + ")"
+
+                    print("[RELIABILITY ALIGNMENT]")
+                    print(
+                        "SURV_LOSS_SCORE_SHAPE "
+                        f"update={update_idx} "
+                        f"shape={_shape_text('score')} "
+                        f"shape_ok={bool(_rel_value('score_shape_ok') >= 0.5)}"
+                    )
+                    print(
+                        "SURV_LOSS_LABEL_SHAPE "
+                        f"update={update_idx} "
+                        f"shape={_shape_text('label')}"
+                    )
+                    print(
+                        "SURV_LOSS_MASK_SHAPE "
+                        f"update={update_idx} "
+                        f"shape={_shape_text('mask')} "
+                        f"shape_ok={bool(_rel_value('mask_shape_ok') >= 0.5)}"
+                    )
+                    if exe_agent_index is not None and "survival_mid_diag" in metric:
+                        exe_mid_diag_for_rel = metric["survival_mid_diag"][exe_agent_index]
+
+                        def _rel_mid_values(key):
+                            if key in exe_mid_diag_for_rel:
+                                values = np.array(exe_mid_diag_for_rel[key]).reshape(-1)
+                            else:
+                                values = np.zeros((10,), dtype=np.float32)
+                            if values.size < 10:
+                                values = np.pad(values, (0, 10 - values.size), constant_values=0.0)
+                            return values[:10]
+                    else:
+                        def _rel_mid_values(_key):
+                            return np.zeros((10,), dtype=np.float32)
+
+                    print(
+                        "REL_ALIGNMENT_SAMPLE "
+                        f"update={update_idx} t=0 b=0 side=Ask "
+                        f"price_key={_fmt_values(_rel_mid_values('ask_key_t0_b0'))} "
+                        f"target={_fmt_values(_rel_values('target_t0_b0_ask'))} "
+                        f"score={_fmt_values(_rel_values('score_t0_b0_ask'))} "
+                        f"mask={_fmt_values(_rel_values('mask_t0_b0_ask'))}"
+                    )
+                    print(
+                        "REL_ALIGNMENT_SAMPLE "
+                        f"update={update_idx} t=0 b=0 side=Bid "
+                        f"price_key={_fmt_values(_rel_mid_values('bid_key_t0_b0'))} "
+                        f"target={_fmt_values(_rel_values('target_t0_b0_bid'))} "
+                        f"score={_fmt_values(_rel_values('score_t0_b0_bid'))} "
+                        f"mask={_fmt_values(_rel_values('mask_t0_b0_bid'))}"
+                    )
+                    rel_dist_components = (
+                        "score",
+                        "target",
+                        "abs_error",
+                        "signed_error",
+                    )
+                    rel_dist_groups = (
+                        "TOP3_ACTIONABLE",
+                        "TOP3_NONACTIONABLE",
+                        "FAR_ACTIONABLE",
+                        "FAR_NONACTIONABLE",
+                    )
+                    rel_dist_stats = (
+                        "count",
+                        "mean",
+                        "std",
+                        "min",
+                        "p10",
+                        "p25",
+                        "p50",
+                        "p75",
+                        "p90",
+                        "p95",
+                        "p99",
+                        "max",
+                        "zero_rate",
+                        "pos_rate_0p1",
+                        "pos_rate_0p3",
+                        "pos_rate_0p5",
+                        "pos_rate_0p7",
+                    )
+                    for component_name in rel_dist_components:
+                        for group_name in rel_dist_groups:
+                            fields = [
+                                "REL_DIST",
+                                f"update={update_idx}",
+                                f"component={component_name}",
+                                f"group={group_name}",
+                            ]
+                            fields.extend(
+                                f"{stat_name}={_rel_value(f'rel_dist_{component_name}_{group_name}_{stat_name}'):.6g}"
+                                for stat_name in rel_dist_stats
                             )
                             print(" ".join(fields))
 

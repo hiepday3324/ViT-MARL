@@ -60,7 +60,7 @@ from gymnax_exchange.jaxen.marl_env import MARLEnv
 from gymnax.environments import spaces
 from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig,Execution_EnvironmentConfig, World_EnvironmentConfig,MarketMaking_EnvironmentConfig
 from gymnax_exchange.networks.gate_fusion import EMASmoothing, StableGatedCrossAttention
-from gymnax_exchange.networks.reliability_head import LevelWiseReliabilityHead
+from gymnax_exchange.networks.reliability_head import LevelWiseReliabilityHead, build_side_id_from_tokens
 from gymnax_exchange.networks.vision_agent import VisionAgent, supervised_contrastive_loss
 from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     build_liquidity_survival_targets,
@@ -113,8 +113,9 @@ class ReliabilityFusionRNN(nn.Module):
     )
     @nn.compact
     def __call__(self, carry, x):
-        obs_exec_t, obs_exec_smoothed_t, z_tokens_t, done_t, tick_shift_t = x
+        obs_exec_t, obs_exec_smoothed_t, z_tokens_t, mid_context_t, done_t = x
         rnn_state = jnp.where(done_t[:, jnp.newaxis], jnp.zeros_like(carry), carry)
+        side_id_t = build_side_id_from_tokens(z_tokens_t)
 
         reliability = LevelWiseReliabilityHead(
             hidden_dim=self.config.get("reliability_hidden_dim", self.config["FC_DIM_SIZE"]),
@@ -122,9 +123,9 @@ class ReliabilityFusionRNN(nn.Module):
         )
         reliability_scores_t, filtered_tokens_t = reliability(
             z_tokens=z_tokens_t,
-            obs_exec=obs_exec_t,
+            side_id=side_id_t,
+            mid_context=mid_context_t,
             h_prev=rnn_state,
-            tick_shift=tick_shift_t,
         )
 
         fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
@@ -151,6 +152,7 @@ class ActorCriticRNN(nn.Module):
         if isinstance(obs, dict):
             obs_exec = obs['exec_obs']
             obs_vision = obs['vision_obs']
+            mid_context = obs['mid_context']
 
             vision_encoder = VisionAgent(embed_dim=self.config["FC_DIM_SIZE"])
             z_tokens = vision_encoder(obs_vision, return_tokens=True)
@@ -161,14 +163,9 @@ class ActorCriticRNN(nn.Module):
 
             use_reliability_head = self.config.get("use_reliability_head", False)
             if use_reliability_head:
-                use_tick_shift = self.config.get("use_tick_shift", False)
-                tick_shift = obs.get("tick_shift", None) if use_tick_shift else None
-                if tick_shift is None:
-                    tick_shift = jnp.zeros((*obs_exec.shape[:2], 1), dtype=obs_exec.dtype)
-
                 hidden, (embedding, reliability_scores) = ReliabilityFusionRNN(config=self.config)(
                     hidden,
-                    (obs_exec, obs_exec_smoothed, z_tokens, dones, tick_shift),
+                    (obs_exec, obs_exec_smoothed, z_tokens, mid_context, dones),
                 )
                 aux_info = {"reliability_scores": reliability_scores}
             else:
@@ -406,14 +403,14 @@ def make_train(config):
                 init_obs = {
                     'exec_obs': jnp.zeros((1, config["NUM_ENVS"], obs_shape)), 
                     'vision_obs': jnp.zeros((1, config["NUM_ENVS"], 10, 3, 2)), # Shape của LOB
-                    'tick_shift': jnp.zeros((1, config["NUM_ENVS"], 1)),
+                    'mid_context': jnp.zeros((1, config["NUM_ENVS"], 4)),
                 }
             elif isinstance(env.observation_spaces[i], dict):
                 obs_shape = env.observation_spaces[i]['exec_obs'].shape[0]
                 init_obs = {
                     'exec_obs': jnp.zeros((1, config["NUM_ENVS"], obs_shape)), 
                     'vision_obs': jnp.zeros((1, config["NUM_ENVS"], 10, 3, 2)), # Shape của LOB
-                    'tick_shift': jnp.zeros((1, config["NUM_ENVS"], 1)),
+                    'mid_context': jnp.zeros((1, config["NUM_ENVS"], 4)),
                 }
             else:
                 init_obs = jnp.zeros((1, config["NUM_ENVS"], env.observation_spaces[i].shape[0]))
