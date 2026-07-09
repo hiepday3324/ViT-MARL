@@ -167,6 +167,77 @@ class ReliabilityTargetTest(unittest.TestCase):
         )
         self.assertLess(float(labels[0, 0, 0, 1]), 1e-6)
 
+    def test_fullbook_same_side_does_not_sum_opposite_side_price(self):
+        vision_obs = self._make_vision_obs(time_steps=2, levels=1, volume=100.0)
+        ask_raw_orders = self._make_raw_orders(time_steps=2)
+        bid_raw_orders = self._make_raw_orders(time_steps=2)
+
+        # Current Ask price is 10_100. same_side must use only future Ask volume.
+        ask_raw_orders = ask_raw_orders.at[1, 0, 0, 0].set(10_100.0)
+        ask_raw_orders = ask_raw_orders.at[1, 0, 0, 1].set(30.0)
+        bid_raw_orders = bid_raw_orders.at[1, 0, 0, 0].set(10_100.0)
+        bid_raw_orders = bid_raw_orders.at[1, 0, 0, 1].set(70.0)
+
+        # Current Bid price is 9_900. same_side must use only future Bid volume.
+        ask_raw_orders = ask_raw_orders.at[1, 0, 1, 0].set(9_900.0)
+        ask_raw_orders = ask_raw_orders.at[1, 0, 1, 1].set(80.0)
+        bid_raw_orders = bid_raw_orders.at[1, 0, 1, 0].set(9_900.0)
+        bid_raw_orders = bid_raw_orders.at[1, 0, 1, 1].set(20.0)
+
+        labels, _ = self._build_targets(
+            vision_obs,
+            mode="actionability_weighted_min_horizon",
+            is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
+            delta=1,
+            actionability_depth=1,
+            survival_target_book_source="fullbook",
+            survival_fullbook_match_mode="same_side",
+            ask_raw_orders=ask_raw_orders,
+            bid_raw_orders=bid_raw_orders,
+        )
+
+        self.assertAlmostEqual(
+            float(labels[0, 0, 0, 0]),
+            self._expected_robust_survival([0.3]),
+            places=5,
+        )
+        self.assertAlmostEqual(
+            float(labels[0, 0, 0, 1]),
+            self._expected_robust_survival([0.2]),
+            places=5,
+        )
+
+    def test_fullbook_absolute_price_sum_matches_both_sides_at_token_price(self):
+        vision_obs = self._make_vision_obs(time_steps=2, levels=1, volume=100.0)
+        ask_raw_orders = self._make_raw_orders(time_steps=2)
+        bid_raw_orders = self._make_raw_orders(time_steps=2)
+
+        ask_raw_orders = ask_raw_orders.at[1, 0, 0, 0].set(10_100.0)
+        ask_raw_orders = ask_raw_orders.at[1, 0, 0, 1].set(20.0)
+        bid_raw_orders = bid_raw_orders.at[1, 0, 0, 0].set(10_100.0)
+        bid_raw_orders = bid_raw_orders.at[1, 0, 0, 1].set(60.0)
+
+        ask_raw_orders = ask_raw_orders.at[1, 0, 1, 0].set(9_900.0)
+        ask_raw_orders = ask_raw_orders.at[1, 0, 1, 1].set(30.0)
+        bid_raw_orders = bid_raw_orders.at[1, 0, 1, 0].set(9_900.0)
+        bid_raw_orders = bid_raw_orders.at[1, 0, 1, 1].set(50.0)
+
+        labels, _ = self._build_targets(
+            vision_obs,
+            mode="actionability_weighted_min_horizon",
+            is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
+            delta=1,
+            actionability_depth=1,
+            survival_target_book_source="fullbook",
+            survival_fullbook_match_mode="absolute_price_sum",
+            ask_raw_orders=ask_raw_orders,
+            bid_raw_orders=bid_raw_orders,
+        )
+        expected = self._expected_robust_survival([0.8])
+
+        self.assertAlmostEqual(float(labels[0, 0, 0, 0]), expected, places=5)
+        self.assertAlmostEqual(float(labels[0, 0, 0, 1]), expected, places=5)
+
     def test_fullbook_alignment_does_not_swap_levels(self):
         vision_obs = self._make_vision_obs(time_steps=2, levels=2, volume=100.0)
         ask_raw_orders = self._make_raw_orders(time_steps=2)
@@ -233,6 +304,57 @@ class ReliabilityTargetTest(unittest.TestCase):
                 survival_target_book_source="unknown",
             )
 
+        with self.assertRaisesRegex(ValueError, "Unknown survival_fullbook_match_mode"):
+            self._build_targets(
+                vision_obs,
+                mode="actionability_weighted_min_horizon",
+                is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
+                delta=1,
+                actionability_depth=1,
+                survival_target_book_source="fullbook",
+                survival_fullbook_match_mode="bad_mode",
+                ask_raw_orders=self._make_raw_orders(time_steps=2),
+                bid_raw_orders=self._make_raw_orders(time_steps=2),
+            )
+
+    def test_fullbook_absolute_price_sum_keeps_rho_robust_formula_without_discounts(self):
+        levels = 4
+        vision_obs = self._make_vision_obs(time_steps=2, levels=levels, volume=100.0)
+        ask_raw_orders = self._make_raw_orders(time_steps=2, n_orders=levels * 2)
+        bid_raw_orders = self._make_raw_orders(time_steps=2, n_orders=levels * 2)
+        for level in range(levels):
+            ask_price = 10_000.0 + (level + 1) * self.tick_size
+            bid_price = 10_000.0 - (level + 1) * self.tick_size
+            ask_raw_orders = ask_raw_orders.at[1, 0, level, 0].set(ask_price)
+            ask_raw_orders = ask_raw_orders.at[1, 0, level, 1].set(20.0)
+            bid_raw_orders = bid_raw_orders.at[1, 0, level, 0].set(ask_price)
+            bid_raw_orders = bid_raw_orders.at[1, 0, level, 1].set(60.0)
+
+            bid_slot = level + levels
+            ask_raw_orders = ask_raw_orders.at[1, 0, bid_slot, 0].set(bid_price)
+            ask_raw_orders = ask_raw_orders.at[1, 0, bid_slot, 1].set(30.0)
+            bid_raw_orders = bid_raw_orders.at[1, 0, bid_slot, 0].set(bid_price)
+            bid_raw_orders = bid_raw_orders.at[1, 0, bid_slot, 1].set(50.0)
+
+        labels, mask = self._build_targets(
+            vision_obs,
+            mode="actionability_weighted_min_horizon",
+            is_sell_task=jnp.zeros((1, 1), dtype=jnp.float32),
+            delta=1,
+            actionability_depth=1,
+            actionability_far_level_weight=0.25,
+            survival_target_book_source="fullbook",
+            survival_fullbook_match_mode="absolute_price_sum",
+            ask_raw_orders=ask_raw_orders,
+            bid_raw_orders=bid_raw_orders,
+        )
+        expected = self._expected_robust_survival([0.8])
+        valid_labels = labels[mask > 0.0]
+
+        self.assertTrue(bool(jnp.allclose(valid_labels, expected, atol=1e-6)))
+        self.assertAlmostEqual(float(labels[0, 0, 3, 0]), expected, places=5)
+        self.assertAlmostEqual(float(labels[0, 0, 3, 1]), expected, places=5)
+
     def test_actionability_side_weight_no_longer_affects_label(self):
         vision_obs = self._make_vision_obs(time_steps=2)
         common_kwargs = {
@@ -293,6 +415,23 @@ class ReliabilityTargetTest(unittest.TestCase):
             vision_obs,
             mode="actionability_weighted_min_horizon",
             is_sell_task=jnp.ones((1, 1), dtype=jnp.float32),
+            delta=len(ratios),
+            actionability_eta=0.1,
+            actionability_depth=1,
+            actionability_far_level_weight=0.25,
+        )
+        expected_target = self._expected_robust_survival(ratios)
+        valid_labels = labels[mask > 0.0]
+
+        self.assertTrue(bool(jnp.allclose(valid_labels, expected_target, atol=1e-6)))
+
+    def test_no_target_formula_change(self):
+        ratios = [0.2, 0.6, 1.0]
+        vision_obs = self._make_ratio_vision_obs(ratios)
+        labels, mask = self._build_targets(
+            vision_obs,
+            mode="actionability_weighted_min_horizon",
+            is_sell_task=jnp.zeros((1, 1), dtype=jnp.float32),
             delta=len(ratios),
             actionability_eta=0.1,
             actionability_depth=1,

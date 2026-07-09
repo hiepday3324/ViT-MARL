@@ -25,6 +25,14 @@ def build_side_id_from_tokens(z_tokens):
     return jnp.broadcast_to(side_values.reshape(side_shape), z_tokens.shape[:-1] + (1,))
 
 
+def select_h_prev_for_reliability(h_prev, use_h_prev_in_reliability=True):
+    """Optionally zero previous RNN state before Reliability Head input."""
+    h_prev = jnp.asarray(h_prev, dtype=jnp.float32)
+    if bool(use_h_prev_in_reliability):
+        return h_prev
+    return jnp.zeros_like(h_prev)
+
+
 class LevelWiseReliabilityHead(nn.Module):
     """Estimate side-aware liquidity reliability ``r_{t,k,s}``.
 

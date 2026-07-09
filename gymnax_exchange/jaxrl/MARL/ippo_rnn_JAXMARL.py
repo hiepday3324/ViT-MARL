@@ -47,7 +47,11 @@ from gymnax_exchange.jaxen.marl_env import MARLEnv
 from gymnax.environments import spaces
 from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig,Execution_EnvironmentConfig, World_EnvironmentConfig,MarketMaking_EnvironmentConfig
 from gymnax_exchange.networks.gate_fusion import EMASmoothing, StableGatedCrossAttention
-from gymnax_exchange.networks.reliability_head import LevelWiseReliabilityHead, build_side_id_from_tokens
+from gymnax_exchange.networks.reliability_head import (
+    LevelWiseReliabilityHead,
+    build_side_id_from_tokens,
+    select_h_prev_for_reliability,
+)
 from gymnax_exchange.networks.vision_agent import VisionAgent, supervised_contrastive_loss
 from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     build_liquidity_survival_targets,
@@ -103,6 +107,11 @@ class ReliabilityFusionRNN(nn.Module):
         obs_exec_t, obs_exec_smoothed_t, z_tokens_t, mid_context_t, done_t = x
         rnn_state = jnp.where(done_t[:, jnp.newaxis], jnp.zeros_like(carry), carry)
         side_id_t = build_side_id_from_tokens(z_tokens_t)
+        use_h_prev_in_reliability = self.config.get("use_h_prev_in_reliability", True)
+        h_prev_for_reliability = select_h_prev_for_reliability(
+            rnn_state,
+            use_h_prev_in_reliability=use_h_prev_in_reliability,
+        )
 
         reliability = LevelWiseReliabilityHead(
             hidden_dim=self.config.get("reliability_hidden_dim", self.config["FC_DIM_SIZE"]),
@@ -112,7 +121,7 @@ class ReliabilityFusionRNN(nn.Module):
             z_tokens=z_tokens_t,
             side_id=side_id_t,
             mid_context=mid_context_t,
-            h_prev=rnn_state,
+            h_prev=h_prev_for_reliability,
         )
 
         fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
@@ -134,6 +143,22 @@ class ReliabilityFusionRNN(nn.Module):
             "spread_ticks": mid_context_t[..., 1],
             "mid_delta_ticks": mid_context_t[..., 2],
             "mid_volatility_ticks": mid_context_t[..., 3],
+            "h_prev_reliability_norm": jnp.linalg.norm(h_prev_for_reliability, axis=-1),
+            "use_h_prev_in_reliability": jnp.full(
+                done_t.shape,
+                float(bool(use_h_prev_in_reliability)),
+                dtype=jnp.float32,
+            ),
+            "h_prev_used_in_reliability": jnp.full(
+                done_t.shape,
+                float(bool(use_h_prev_in_reliability)),
+                dtype=jnp.float32,
+            ),
+            "h_prev_reliability_zeroed": jnp.full(
+                done_t.shape,
+                float(not bool(use_h_prev_in_reliability)),
+                dtype=jnp.float32,
+            ),
         }
         return new_rnn_state, (y_t, reliability_scores_t, rvd_diag_t)
 
@@ -717,6 +742,14 @@ def make_train(config):
                     "matched_bid_volume_tau1_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
                     "matched_ask_volume_taud_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
                     "matched_bid_volume_taud_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
+                    "future_ask_at_ask_key_tau1_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
+                    "future_bid_at_ask_key_tau1_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
+                    "future_ask_at_bid_key_tau1_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
+                    "future_bid_at_bid_key_tau1_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
+                    "future_ask_at_ask_key_taud_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
+                    "future_bid_at_ask_key_taud_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
+                    "future_ask_at_bid_key_taud_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
+                    "future_bid_at_bid_key_taud_t0_b0": jnp.zeros((10,), dtype=jnp.float32),
                     "mean_survival_ask": jnp.zeros((10,), dtype=jnp.float32),
                     "mean_survival_bid": jnp.zeros((10,), dtype=jnp.float32),
                     "availability_ask": jnp.zeros((10,), dtype=jnp.float32),
@@ -776,6 +809,7 @@ def make_train(config):
                 ask_raw_orders=None,
                 bid_raw_orders=None,
                 book_source="vision_topk",
+                fullbook_match_mode="same_side",
             ):
                 vision_obs = jnp.asarray(vision_obs, dtype=jnp.float32)
                 mid_prices = _broadcast_mid_prices(mid_prices, vision_obs.shape[1])
@@ -822,6 +856,14 @@ def make_train(config):
                 matched_bid_tau1_sample = zero_sample
                 matched_ask_taud_sample = zero_sample
                 matched_bid_taud_sample = zero_sample
+                future_ask_at_ask_tau1_sample = zero_sample
+                future_bid_at_ask_tau1_sample = zero_sample
+                future_ask_at_bid_tau1_sample = zero_sample
+                future_bid_at_bid_tau1_sample = zero_sample
+                future_ask_at_ask_taud_sample = zero_sample
+                future_bid_at_ask_taud_sample = zero_sample
+                future_ask_at_bid_taud_sample = zero_sample
+                future_bid_at_bid_taud_sample = zero_sample
                 eps = config.get("survival_eps", 1e-8)
 
                 def _sample_t0_b0(x):
@@ -830,16 +872,34 @@ def make_train(config):
 
                 for tau in range(1, survival_delta_steps + 1):
                     if book_source == "fullbook":
-                        matched_ask_volume = _fullbook_volume_at_key(
+                        future_ask_at_ask_key = _fullbook_volume_at_key(
                             ask_raw_orders[tau:tau + config["NUM_STEPS"]],
                             ask_key,
                             tick_size_arr,
                         )
-                        matched_bid_volume = _fullbook_volume_at_key(
+                        future_bid_at_bid_key = _fullbook_volume_at_key(
                             bid_raw_orders[tau:tau + config["NUM_STEPS"]],
                             bid_key,
                             tick_size_arr,
                         )
+                        if fullbook_match_mode == "absolute_price_sum":
+                            future_bid_at_ask_key = _fullbook_volume_at_key(
+                                bid_raw_orders[tau:tau + config["NUM_STEPS"]],
+                                ask_key,
+                                tick_size_arr,
+                            )
+                            future_ask_at_bid_key = _fullbook_volume_at_key(
+                                ask_raw_orders[tau:tau + config["NUM_STEPS"]],
+                                bid_key,
+                                tick_size_arr,
+                            )
+                            matched_ask_volume = future_ask_at_ask_key + future_bid_at_ask_key
+                            matched_bid_volume = future_ask_at_bid_key + future_bid_at_bid_key
+                        else:
+                            future_bid_at_ask_key = jnp.zeros_like(future_ask_at_ask_key)
+                            future_ask_at_bid_key = jnp.zeros_like(future_bid_at_bid_key)
+                            matched_ask_volume = future_ask_at_ask_key
+                            matched_bid_volume = future_bid_at_bid_key
                     else:
                         future_obs = vision_obs[tau:tau + config["NUM_STEPS"]]
                         future_mid = mid_prices[tau:tau + config["NUM_STEPS"], :, None]
@@ -862,9 +922,19 @@ def make_train(config):
                     if tau == 1:
                         matched_ask_tau1_sample = _sample_t0_b0(matched_ask_volume)
                         matched_bid_tau1_sample = _sample_t0_b0(matched_bid_volume)
+                        if book_source == "fullbook":
+                            future_ask_at_ask_tau1_sample = _sample_t0_b0(future_ask_at_ask_key)
+                            future_bid_at_ask_tau1_sample = _sample_t0_b0(future_bid_at_ask_key)
+                            future_ask_at_bid_tau1_sample = _sample_t0_b0(future_ask_at_bid_key)
+                            future_bid_at_bid_tau1_sample = _sample_t0_b0(future_bid_at_bid_key)
                     if tau == survival_delta_steps:
                         matched_ask_taud_sample = _sample_t0_b0(matched_ask_volume)
                         matched_bid_taud_sample = _sample_t0_b0(matched_bid_volume)
+                        if book_source == "fullbook":
+                            future_ask_at_ask_taud_sample = _sample_t0_b0(future_ask_at_ask_key)
+                            future_bid_at_ask_taud_sample = _sample_t0_b0(future_bid_at_ask_key)
+                            future_ask_at_bid_taud_sample = _sample_t0_b0(future_ask_at_bid_key)
+                            future_bid_at_bid_taud_sample = _sample_t0_b0(future_bid_at_bid_key)
                     ask_ratio = jnp.clip(matched_ask_volume / (ask_volume + eps), 0.0, 1.0)
                     bid_ratio = jnp.clip(matched_bid_volume / (bid_volume + eps), 0.0, 1.0)
                     future_ratios.append(jnp.stack([ask_ratio, bid_ratio], axis=-1))
@@ -927,6 +997,14 @@ def make_train(config):
                     "matched_bid_volume_tau1_t0_b0": matched_bid_tau1_sample,
                     "matched_ask_volume_taud_t0_b0": matched_ask_taud_sample,
                     "matched_bid_volume_taud_t0_b0": matched_bid_taud_sample,
+                    "future_ask_at_ask_key_tau1_t0_b0": future_ask_at_ask_tau1_sample,
+                    "future_bid_at_ask_key_tau1_t0_b0": future_bid_at_ask_tau1_sample,
+                    "future_ask_at_bid_key_tau1_t0_b0": future_ask_at_bid_tau1_sample,
+                    "future_bid_at_bid_key_tau1_t0_b0": future_bid_at_bid_tau1_sample,
+                    "future_ask_at_ask_key_taud_t0_b0": future_ask_at_ask_taud_sample,
+                    "future_bid_at_ask_key_taud_t0_b0": future_bid_at_ask_taud_sample,
+                    "future_ask_at_bid_key_taud_t0_b0": future_ask_at_bid_taud_sample,
+                    "future_bid_at_bid_key_taud_t0_b0": future_bid_at_bid_taud_sample,
                 }
                 if is_sell_task is None:
                     side_weight = jnp.ones(robust_survival.shape[:2] + (2,), dtype=jnp.float32)
@@ -1288,6 +1366,10 @@ def make_train(config):
                             "survival_target_book_source",
                             "vision_topk",
                         ),
+                        survival_fullbook_match_mode=config.get(
+                            "survival_fullbook_match_mode",
+                            "same_side",
+                        ),
                         num_steps=config["NUM_STEPS"],
                         episode_done=traj_batch_padded[i].info["agent"]["done"],
                         survival_target_mode=survival_target_mode,
@@ -1311,6 +1393,10 @@ def make_train(config):
                             ask_raw_orders=obs_ask_raw_orders,
                             bid_raw_orders=obs_bid_raw_orders,
                             book_source=config.get("survival_target_book_source", "vision_topk"),
+                            fullbook_match_mode=config.get(
+                                "survival_fullbook_match_mode",
+                                "same_side",
+                            ),
                         )
                     else:
                         surv_raw_ratio = surv_label
@@ -1324,6 +1410,10 @@ def make_train(config):
                             ask_raw_orders=obs_ask_raw_orders,
                             bid_raw_orders=obs_bid_raw_orders,
                             book_source=config.get("survival_target_book_source", "vision_topk"),
+                            fullbook_match_mode=config.get(
+                                "survival_fullbook_match_mode",
+                                "same_side",
+                            ),
                         )
                 else:
                     reward_shape = traj_batch_padded[i].reward.shape
@@ -1528,6 +1618,39 @@ def make_train(config):
                             spread_ticks_mean = jnp.mean(aux_info.get("spread_ticks", jnp.array(0.0, dtype=jnp.float32)))
                             mid_delta_ticks_mean = jnp.mean(aux_info.get("mid_delta_ticks", jnp.array(0.0, dtype=jnp.float32)))
                             mid_volatility_ticks_mean = jnp.mean(aux_info.get("mid_volatility_ticks", jnp.array(0.0, dtype=jnp.float32)))
+                            h_prev_reliability_norm_mean = jnp.mean(
+                                aux_info.get(
+                                    "h_prev_reliability_norm",
+                                    jnp.array(0.0, dtype=jnp.float32),
+                                )
+                            )
+                            use_h_prev_in_reliability_value = jnp.mean(
+                                aux_info.get(
+                                    "use_h_prev_in_reliability",
+                                    jnp.array(
+                                        float(config.get("use_h_prev_in_reliability", True)),
+                                        dtype=jnp.float32,
+                                    ),
+                                )
+                            )
+                            h_prev_used_in_reliability_value = jnp.mean(
+                                aux_info.get(
+                                    "h_prev_used_in_reliability",
+                                    jnp.array(
+                                        float(config.get("use_h_prev_in_reliability", True)),
+                                        dtype=jnp.float32,
+                                    ),
+                                )
+                            )
+                            h_prev_reliability_zeroed_value = jnp.mean(
+                                aux_info.get(
+                                    "h_prev_reliability_zeroed",
+                                    jnp.array(
+                                        float(not config.get("use_h_prev_in_reliability", True)),
+                                        dtype=jnp.float32,
+                                    ),
+                                )
+                            )
 
                             # LOSS CUỐI CÙNG (Cộng PPO và SupCon có hệ số)
                             if (
@@ -1624,6 +1747,10 @@ def make_train(config):
                                 spread_ticks_mean,
                                 mid_delta_ticks_mean,
                                 mid_volatility_ticks_mean,
+                                h_prev_reliability_norm_mean,
+                                use_h_prev_in_reliability_value,
+                                h_prev_used_in_reliability_value,
+                                h_prev_reliability_zeroed_value,
                             )
                         grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                         total_loss, grads = grad_fn(
@@ -1818,6 +1945,10 @@ def make_train(config):
                     "spread_ticks_mean": loss_info[1][45],
                     "mid_delta_ticks_mean": loss_info[1][46],
                     "mid_volatility_ticks_mean": loss_info[1][47],
+                    "h_prev_reliability_norm_mean": loss_info[1][48],
+                    "use_h_prev_in_reliability": loss_info[1][49],
+                    "h_prev_used_in_reliability": loss_info[1][50],
+                    "h_prev_reliability_zeroed": loss_info[1][51],
                     "total_loss_with_aux": loss_info[0],
                     "weighted_entropy_loss": loss_info[1][2] * config["ENT_COEF"][i],
                     "lambda_supcon": jnp.array(
@@ -2070,6 +2201,9 @@ def make_train(config):
                     z_tokens_shape = f"({config['NUM_STEPS']},{exe_actor_count},10,2,{config['FC_DIM_SIZE']})"
                     side_id_shape = f"({config['NUM_STEPS']},{exe_actor_count},10,2,1)"
                     mid_context_shape = f"({config['NUM_STEPS']},{exe_actor_count},4)"
+                    use_h_prev_flag = _loss_value(exe_loss_metrics, "use_h_prev_in_reliability") >= 0.5
+                    h_prev_used_flag = _loss_value(exe_loss_metrics, "h_prev_used_in_reliability") >= 0.5
+                    h_prev_zeroed_flag = _loss_value(exe_loss_metrics, "h_prev_reliability_zeroed") >= 0.5
                     print(" ".join([
                         "REL_INPUT_DIAG",
                         f"update={update_idx}",
@@ -2081,6 +2215,10 @@ def make_train(config):
                         f"spread_ticks_mean={_loss_value(exe_loss_metrics, 'spread_ticks_mean'):.6g}",
                         f"mid_delta_ticks_mean={_loss_value(exe_loss_metrics, 'mid_delta_ticks_mean'):.6g}",
                         f"mid_volatility_ticks_mean={_loss_value(exe_loss_metrics, 'mid_volatility_ticks_mean'):.6g}",
+                        f"use_h_prev_in_reliability={str(use_h_prev_flag).lower()}",
+                        f"h_prev_used_in_reliability={str(h_prev_used_flag).lower()}",
+                        f"h_prev_reliability_norm_mean={_loss_value(exe_loss_metrics, 'h_prev_reliability_norm_mean'):.6g}",
+                        f"h_prev_reliability_zeroed={str(h_prev_zeroed_flag).lower()}",
                         "obs_exec_used_in_reliability=false",
                         "tick_shift_removed=true",
                     ]))
@@ -2156,18 +2294,30 @@ def make_train(config):
                         "SURV_FULLBOOK_MATCH_SAMPLE "
                         f"update={update_idx} "
                         "tau=1 "
+                        f"match_mode={config.get('survival_fullbook_match_mode', 'same_side')} "
+                        f"absprice_sum_enabled={str(config.get('survival_target_book_source', 'vision_topk') == 'fullbook' and config.get('survival_fullbook_match_mode', 'same_side') == 'absolute_price_sum').lower()} "
                         f"ask_key_t0_b0={_fmt_values(_mid_values('ask_key_t0_b0'))} "
+                        f"future_ask_at_ask_key={_fmt_values(_mid_values('future_ask_at_ask_key_tau1_t0_b0'))} "
+                        f"future_bid_at_ask_key={_fmt_values(_mid_values('future_bid_at_ask_key_tau1_t0_b0'))} "
                         f"matched_ask_volume_t0_b0={_fmt_values(_mid_values('matched_ask_volume_tau1_t0_b0'))} "
                         f"bid_key_t0_b0={_fmt_values(_mid_values('bid_key_t0_b0'))} "
+                        f"future_ask_at_bid_key={_fmt_values(_mid_values('future_ask_at_bid_key_tau1_t0_b0'))} "
+                        f"future_bid_at_bid_key={_fmt_values(_mid_values('future_bid_at_bid_key_tau1_t0_b0'))} "
                         f"matched_bid_volume_t0_b0={_fmt_values(_mid_values('matched_bid_volume_tau1_t0_b0'))}"
                     )
                     print(
                         "SURV_FULLBOOK_MATCH_SAMPLE "
                         f"update={update_idx} "
                         f"tau={config.get('survival_delta_steps', 10)} "
+                        f"match_mode={config.get('survival_fullbook_match_mode', 'same_side')} "
+                        f"absprice_sum_enabled={str(config.get('survival_target_book_source', 'vision_topk') == 'fullbook' and config.get('survival_fullbook_match_mode', 'same_side') == 'absolute_price_sum').lower()} "
                         f"ask_key_t0_b0={_fmt_values(_mid_values('ask_key_t0_b0'))} "
+                        f"future_ask_at_ask_key={_fmt_values(_mid_values('future_ask_at_ask_key_taud_t0_b0'))} "
+                        f"future_bid_at_ask_key={_fmt_values(_mid_values('future_bid_at_ask_key_taud_t0_b0'))} "
                         f"matched_ask_volume_t0_b0={_fmt_values(_mid_values('matched_ask_volume_taud_t0_b0'))} "
                         f"bid_key_t0_b0={_fmt_values(_mid_values('bid_key_t0_b0'))} "
+                        f"future_ask_at_bid_key={_fmt_values(_mid_values('future_ask_at_bid_key_taud_t0_b0'))} "
+                        f"future_bid_at_bid_key={_fmt_values(_mid_values('future_bid_at_bid_key_taud_t0_b0'))} "
                         f"matched_bid_volume_t0_b0={_fmt_values(_mid_values('matched_bid_volume_taud_t0_b0'))}"
                     )
                     print(" ".join([
@@ -2175,6 +2325,10 @@ def make_train(config):
                         f"update={update_idx}",
                         'formula="availability=mean(sigmoid((ratio-gamma)/temperature)); rho_robust=mean_survival*availability; y_rel=rho_robust"',
                         f"book_source={config.get('survival_target_book_source', 'vision_topk')}",
+                        f"fullbook_match_mode={config.get('survival_fullbook_match_mode', 'same_side')}",
+                        f"absprice_sum_enabled={str(config.get('survival_target_book_source', 'vision_topk') == 'fullbook' and config.get('survival_fullbook_match_mode', 'same_side') == 'absolute_price_sum').lower()}",
+                        f"future_numerator={'future_ask_plus_future_bid_at_current_price' if config.get('survival_target_book_source', 'vision_topk') == 'fullbook' and config.get('survival_fullbook_match_mode', 'same_side') == 'absolute_price_sum' else 'future_same_side_volume_at_current_price'}",
+                        "current_denominator=current_token_volume",
                         f"gamma={config.get('survival_ratio', 0.5)}",
                         f"temperature={config.get('survival_availability_temperature', 0.15)}",
                         f"delta={config.get('survival_delta_steps', 10)}",

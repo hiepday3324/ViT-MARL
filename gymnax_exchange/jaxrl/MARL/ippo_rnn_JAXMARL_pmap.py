@@ -60,7 +60,11 @@ from gymnax_exchange.jaxen.marl_env import MARLEnv
 from gymnax.environments import spaces
 from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig,Execution_EnvironmentConfig, World_EnvironmentConfig,MarketMaking_EnvironmentConfig
 from gymnax_exchange.networks.gate_fusion import EMASmoothing, StableGatedCrossAttention
-from gymnax_exchange.networks.reliability_head import LevelWiseReliabilityHead, build_side_id_from_tokens
+from gymnax_exchange.networks.reliability_head import (
+    LevelWiseReliabilityHead,
+    build_side_id_from_tokens,
+    select_h_prev_for_reliability,
+)
 from gymnax_exchange.networks.vision_agent import VisionAgent, supervised_contrastive_loss
 from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     build_liquidity_survival_targets,
@@ -116,6 +120,11 @@ class ReliabilityFusionRNN(nn.Module):
         obs_exec_t, obs_exec_smoothed_t, z_tokens_t, mid_context_t, done_t = x
         rnn_state = jnp.where(done_t[:, jnp.newaxis], jnp.zeros_like(carry), carry)
         side_id_t = build_side_id_from_tokens(z_tokens_t)
+        use_h_prev_in_reliability = self.config.get("use_h_prev_in_reliability", True)
+        h_prev_for_reliability = select_h_prev_for_reliability(
+            rnn_state,
+            use_h_prev_in_reliability=use_h_prev_in_reliability,
+        )
 
         reliability = LevelWiseReliabilityHead(
             hidden_dim=self.config.get("reliability_hidden_dim", self.config["FC_DIM_SIZE"]),
@@ -125,7 +134,7 @@ class ReliabilityFusionRNN(nn.Module):
             z_tokens=z_tokens_t,
             side_id=side_id_t,
             mid_context=mid_context_t,
-            h_prev=rnn_state,
+            h_prev=h_prev_for_reliability,
         )
 
         fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
@@ -677,6 +686,10 @@ def make_train(config):
                         survival_target_book_source=config.get(
                             "survival_target_book_source",
                             "vision_topk",
+                        ),
+                        survival_fullbook_match_mode=config.get(
+                            "survival_fullbook_match_mode",
+                            "same_side",
                         ),
                         num_steps=config["NUM_STEPS"],
                         episode_done=traj_batch_padded[i].info["agent"]["done"],

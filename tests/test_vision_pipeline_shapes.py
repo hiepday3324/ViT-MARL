@@ -12,7 +12,11 @@ project_root = os.path.abspath(os.path.join(current_dir, ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 from gymnax_exchange.networks.gate_fusion import EMASmoothing, StableGatedCrossAttention
-from gymnax_exchange.networks.reliability_head import LevelWiseReliabilityHead, build_side_id_from_tokens
+from gymnax_exchange.networks.reliability_head import (
+    LevelWiseReliabilityHead,
+    build_side_id_from_tokens,
+    select_h_prev_for_reliability,
+)
 from gymnax_exchange.networks.vision_agent import VisionAgent, supervised_contrastive_loss
 
 
@@ -144,6 +148,51 @@ class VisionPipelineShapeTest(unittest.TestCase):
         params = inspect.signature(LevelWiseReliabilityHead().__call__).parameters
 
         self.assertNotIn("obs_exec", params)
+
+    def test_h_prev_reliability_default_true(self):
+        h_prev = jnp.arange(12, dtype=jnp.float32).reshape(3, 4)
+
+        selected = select_h_prev_for_reliability(h_prev)
+
+        self.assertTrue(bool(jnp.allclose(selected, h_prev)))
+
+    def test_h_prev_reliability_false_zeroes_h_prev(self):
+        rng = jax.random.PRNGKey(2)
+        time_steps = 2
+        batch_size = 3
+        n_levels = 10
+        n_sides = 2
+        embed_dim = 64
+        z_tokens = jnp.ones((time_steps, batch_size, n_levels, n_sides, embed_dim), dtype=jnp.float32)
+        side_id = build_side_id_from_tokens(z_tokens)
+        mid_context = jnp.ones((time_steps, batch_size, 4), dtype=jnp.float32)
+        h_prev = jnp.ones((batch_size, embed_dim), dtype=jnp.float32)
+
+        selected = select_h_prev_for_reliability(
+            h_prev,
+            use_h_prev_in_reliability=False,
+        )
+
+        self.assertTrue(bool(jnp.allclose(selected, jnp.zeros_like(h_prev))))
+
+        reliability = LevelWiseReliabilityHead(hidden_dim=32)
+        params = reliability.init(
+            rng,
+            z_tokens=z_tokens,
+            side_id=side_id,
+            mid_context=mid_context,
+            h_prev=selected,
+        )
+        scores, filtered = reliability.apply(
+            params,
+            z_tokens=z_tokens,
+            side_id=side_id,
+            mid_context=mid_context,
+            h_prev=selected,
+        )
+
+        self.assertEqual(scores.shape, (time_steps, batch_size, n_levels, n_sides, 1))
+        self.assertEqual(filtered.shape, z_tokens.shape)
 
 
 if __name__ == "__main__":

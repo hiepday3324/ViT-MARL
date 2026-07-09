@@ -9,6 +9,7 @@
 "GRU_HIDDEN_DIM": 128
 "FC_DIM_SIZE": 128
 "use_reliability_head": False
+"use_h_prev_in_reliability": True
 "use_tick_shift": True
 "reliability_hidden_dim": 128
 "use_survival_loss": False
@@ -19,6 +20,7 @@
 "survival_min_volume": 1.0
 "survival_ratio": 0.5
 "survival_target_mode": "actionability_weighted_min_horizon"
+"survival_fullbook_match_mode": "same_side"
 "actionability_mode": "passive_limit"
 "actionability_eta": 0.1
 "actionability_depth": 3

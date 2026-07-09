@@ -225,6 +225,7 @@ def build_liquidity_survival_targets(
     ask_raw_orders=None,
     bid_raw_orders=None,
     survival_target_book_source="vision_topk",
+    survival_fullbook_match_mode="same_side",
     eps=1e-8,
 ):
     """Build side-aware liquidity targets from normalized LOB vision frames.
@@ -252,6 +253,15 @@ def build_liquidity_survival_targets(
         raise ValueError(
             f"Unknown survival_target_book_source: {survival_target_book_source}. "
             f"Expected one of {sorted(valid_book_sources)}."
+        )
+    valid_fullbook_match_modes = {"same_side", "absolute_price_sum"}
+    if (
+        survival_target_book_source == "fullbook"
+        and survival_fullbook_match_mode not in valid_fullbook_match_modes
+    ):
+        raise ValueError(
+            f"Unknown survival_fullbook_match_mode: {survival_fullbook_match_mode}. "
+            f"Expected one of {sorted(valid_fullbook_match_modes)}."
         )
     if survival_delta_steps < 1:
         raise ValueError("survival_delta_steps must be at least one.")
@@ -316,16 +326,32 @@ def build_liquidity_survival_targets(
     final_matched_bid_volume = None
     for tau in range(1, survival_delta_steps + 1):
         if survival_target_book_source == "fullbook":
-            matched_ask_volume = _fullbook_volume_at_key(
+            future_ask_at_ask_key = _fullbook_volume_at_key(
                 ask_raw_orders[tau:tau + num_steps],
                 ask_key,
                 tick_size,
             )
-            matched_bid_volume = _fullbook_volume_at_key(
+            future_bid_at_bid_key = _fullbook_volume_at_key(
                 bid_raw_orders[tau:tau + num_steps],
                 bid_key,
                 tick_size,
             )
+            if survival_fullbook_match_mode == "absolute_price_sum":
+                future_bid_at_ask_key = _fullbook_volume_at_key(
+                    bid_raw_orders[tau:tau + num_steps],
+                    ask_key,
+                    tick_size,
+                )
+                future_ask_at_bid_key = _fullbook_volume_at_key(
+                    ask_raw_orders[tau:tau + num_steps],
+                    bid_key,
+                    tick_size,
+                )
+                matched_ask_volume = future_ask_at_ask_key + future_bid_at_ask_key
+                matched_bid_volume = future_ask_at_bid_key + future_bid_at_bid_key
+            else:
+                matched_ask_volume = future_ask_at_ask_key
+                matched_bid_volume = future_bid_at_bid_key
         else:
             future_obs = vision_obs[tau:tau + num_steps]
             future_mid = mid_prices[tau:tau + num_steps, :, None]
