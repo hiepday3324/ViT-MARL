@@ -65,7 +65,7 @@ from gymnax_exchange.networks.reliability_head import (
     build_side_id_from_tokens,
     select_h_prev_for_reliability,
 )
-from gymnax_exchange.networks.vision_agent import VisionAgent, supervised_contrastive_loss
+from gymnax_exchange.networks.vision_agent import VisionAgent
 from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     build_liquidity_survival_targets,
     masked_reliability_loss,
@@ -614,9 +614,8 @@ def make_train(config):
             )
 
             # ==========================================================
-            # [PHASE 2]: TRÍCH XUẤT NHÃN VOLATILITY TỪ 10 BƯỚC TƯƠNG LAI
+            # [PHASE 2]: BUILD LIQUIDITY RELIABILITY TARGETS
             # ==========================================================
-            volatility_labels = []
             survival_labels = []
             survival_masks = []
             if not hasattr(env.multi_agent_config.world_config, "tick_size"):
@@ -635,21 +634,6 @@ def make_train(config):
                 mid_prices = traj_batch_padded[i].info["world"].get("obs_mid_price", end_mid_prices)
                 obs_ask_raw_orders = traj_batch_padded[i].info["world"].get("obs_ask_raw_orders", None)
                 obs_bid_raw_orders = traj_batch_padded[i].info["world"].get("obs_bid_raw_orders", None)
-                
-                # Quét cửa sổ tương lai (Logic giữ nguyên, chạy thẳng trên mid_prices chuẩn)
-                def calc_future_std(t):
-                    future_window = jax.lax.dynamic_slice_in_dim(mid_prices, t + 1, window_size, axis=0)
-                    return jnp.std(future_window, axis=0)
-                
-                # Chỉ tính nhãn cho 128 bước đầu
-                timesteps = jnp.arange(config["NUM_STEPS"])
-                future_vol = jax.vmap(calc_future_std)(timesteps)
-                
-                # Gán nhãn
-                labels = jnp.where(future_vol > config.get("VOL_HIGH", 0.02), 2, 
-                         jnp.where(future_vol > config.get("VOL_LOW", 0.005), 1, 0))
-                volatility_labels.append(labels)
-
                 if (
                     config.get("use_survival_loss", False)
                     and isinstance(traj_batch_padded[i].obs, dict)
@@ -749,11 +733,11 @@ def make_train(config):
             for i, train_state in enumerate(train_states):
                 def _update_epoch(update_state, unused):
                     def _update_minbatch(train_state, batch_info):
-                        init_hstate, traj_batch, advantages, targets, vol_labels, surv_labels, surv_mask = batch_info
+                        init_hstate, traj_batch, advantages, targets, surv_labels, surv_mask = batch_info
 
-                        def _loss_fn(params, init_hstate, traj_batch, gae, targets, vol_labels, surv_labels, surv_mask):
+                        def _loss_fn(params, init_hstate, traj_batch, gae, targets, surv_labels, surv_mask):
                             # RERUN NETWORK
-                            _, pi, value, z_vision, aux_info = train_state.apply_fn(
+                            _, pi, value, _z_vision, aux_info = train_state.apply_fn(
                                 params,
                                 init_hstate.squeeze(),
                                 (traj_batch.obs, traj_batch.done),
@@ -797,17 +781,7 @@ def make_train(config):
                                 - config["ENT_COEF"][i] * entropy
                             )
 
-                            # TÍNH SUPCON LOSS CHO VISION AGENT
-                            use_supcon_loss = config.get("use_supcon_loss", True)
-                            lambda_supcon = config.get("lambda_supcon", config.get("SUPCON_ALPHA", 0.1))
-                            if use_supcon_loss and lambda_supcon != 0.0 and isinstance(traj_batch.obs, dict):
-                                z_flat = z_vision.reshape(-1, z_vision.shape[-1])
-                                labels_flat = vol_labels.reshape(-1)
-                                supcon_loss = supervised_contrastive_loss(z_flat, labels_flat, temperature=0.1)
-                            else:
-                                supcon_loss = jnp.array(0.0)
-
-                            # LOSS CUỐI CÙNG (Cộng PPO và SupCon có hệ số)
+                            # FINAL LOSS: PPO plus reliability survival auxiliary loss.
                             if (
                                 config.get("use_survival_loss", False)
                                 and config.get("use_reliability_head", False)
@@ -831,12 +805,8 @@ def make_train(config):
                                 survival_mask_ratio = jnp.array(0.0)
                                 reliability_mean = jnp.array(0.0)
 
-                            if use_supcon_loss and lambda_supcon != 0.0:
-                                weighted_supcon_loss = lambda_supcon * supcon_loss
-                            else:
-                                weighted_supcon_loss = jnp.array(0.0)
                             weighted_survival_loss = lambda_surv * survival_loss
-                            total_loss = ppo_loss + weighted_supcon_loss + weighted_survival_loss
+                            total_loss = ppo_loss + weighted_survival_loss
 
                             # debug
                             approx_kl = ((ratio - 1) - logratio).mean()
@@ -849,12 +819,10 @@ def make_train(config):
                                 ratio,
                                 approx_kl,
                                 clip_frac,
-                                supcon_loss,
                                 survival_loss,
                                 weighted_survival_loss,
                                 survival_mask_ratio,
                                 reliability_mean,
-                                weighted_supcon_loss,
                             )
                         grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                         total_loss, grads = grad_fn(
@@ -863,7 +831,6 @@ def make_train(config):
                             traj_batch,
                             advantages,
                             targets,
-                            vol_labels,
                             surv_labels,
                             surv_mask,
                         )
@@ -877,7 +844,6 @@ def make_train(config):
                         traj_batch,
                         advantages,
                         targets,
-                        vol_labels,
                         surv_labels,
                         surv_mask,
                         rng,
@@ -893,7 +859,6 @@ def make_train(config):
                         traj_batch,
                         advantages.squeeze(),
                         targets.squeeze(),
-                        vol_labels,
                         surv_labels,
                         surv_mask,
                     )
@@ -925,7 +890,6 @@ def make_train(config):
                         traj_batch,
                         advantages,
                         targets,
-                        vol_labels,
                         surv_labels,
                         surv_mask,
                         rng,
@@ -938,7 +902,6 @@ def make_train(config):
                     traj_batch[i],
                     advantages[i],
                     targets[i],
-                    volatility_labels[i],
                     survival_labels[i],
                     survival_masks[i],
                     rng,
@@ -970,12 +933,10 @@ def make_train(config):
                     "ratio_0": ratio_0,
                     "approx_kl": loss_info[1][4],
                     "clip_frac": loss_info[1][5],
-                    "supcon_loss": loss_info[1][6],
-                    "survival_loss": loss_info[1][7],
-                    "weighted_survival_loss": loss_info[1][8],
-                    "survival_mask_ratio": loss_info[1][9],
-                    "reliability_mean": loss_info[1][10],
-                    "weighted_supcon_loss": loss_info[1][11],
+                    "survival_loss": loss_info[1][6],
+                    "weighted_survival_loss": loss_info[1][7],
+                    "survival_mask_ratio": loss_info[1][8],
+                    "reliability_mean": loss_info[1][9],
                     "weighted_entropy_loss": loss_info[1][2] * config["ENT_COEF"][i],
                     "weighted_value_loss": loss_info[1][0] * config["VF_COEF"][i],
                 })

@@ -52,7 +52,7 @@ from gymnax_exchange.networks.reliability_head import (
     build_side_id_from_tokens,
     select_h_prev_for_reliability,
 )
-from gymnax_exchange.networks.vision_agent import VisionAgent, supervised_contrastive_loss
+from gymnax_exchange.networks.vision_agent import VisionAgent
 from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     build_liquidity_survival_targets,
     masked_reliability_loss,
@@ -621,9 +621,8 @@ def make_train(config):
             )
 
             # ==========================================================
-            # [PHASE 2]: TRÍCH XUẤT NHÃN VOLATILITY TỪ 10 BƯỚC TƯƠNG LAI
+            # [PHASE 2]: BUILD LIQUIDITY RELIABILITY TARGETS
             # ==========================================================
-            volatility_labels = []
             survival_labels = []
             survival_masks = []
             survival_raw_ratios = []
@@ -1259,21 +1258,12 @@ def make_train(config):
                 obs_mid_prices = traj_batch_padded[i].info["world"].get("obs_mid_price", end_mid_prices)
                 obs_ask_raw_orders = traj_batch_padded[i].info["world"].get("obs_ask_raw_orders", None)
                 obs_bid_raw_orders = traj_batch_padded[i].info["world"].get("obs_bid_raw_orders", None)
-                mid_prices = end_mid_prices
                 
                 # Quét cửa sổ tương lai (Logic giữ nguyên, chạy thẳng trên mid_prices chuẩn)
-                def calc_future_std(t):
-                    future_window = jax.lax.dynamic_slice_in_dim(mid_prices, t + 1, window_size, axis=0)
-                    return jnp.std(future_window, axis=0)
                 
                 # Chỉ tính nhãn cho 128 bước đầu
-                timesteps = jnp.arange(config["NUM_STEPS"])
-                future_vol = jax.vmap(calc_future_std)(timesteps)
                 
                 # Gán nhãn
-                labels = jnp.where(future_vol > config.get("VOL_HIGH", 0.02), 2, 
-                         jnp.where(future_vol > config.get("VOL_LOW", 0.005), 1, 0))
-                volatility_labels.append(labels)
 
                 if (
                     config.get("use_survival_loss", False)
@@ -1401,7 +1391,6 @@ def make_train(config):
                             traj_batch,
                             advantages,
                             targets,
-                            vol_labels,
                             surv_labels,
                             surv_mask,
                             surv_raw_ratio,
@@ -1414,14 +1403,13 @@ def make_train(config):
                             traj_batch,
                             gae,
                             targets,
-                            vol_labels,
                             surv_labels,
                             surv_mask,
                             surv_raw_ratio,
                             surv_task_side,
                         ):
                             # RERUN NETWORK
-                            _, pi, value, z_vision, aux_info = train_state.apply_fn(
+                            _, pi, value, _z_vision, aux_info = train_state.apply_fn(
                                 params,
                                 init_hstate.squeeze(),
                                 (traj_batch.obs, traj_batch.done),
@@ -1462,16 +1450,6 @@ def make_train(config):
                             weighted_value_loss = config["VF_COEF"][i] * value_loss
                             weighted_entropy_term = -config["ENT_COEF"][i] * entropy
                             ppo_loss = loss_actor + weighted_value_loss + weighted_entropy_term
-
-                            # TÍNH SUPCON LOSS CHO VISION AGENT
-                            use_supcon_loss = config.get("use_supcon_loss", True)
-                            lambda_supcon = config.get("lambda_supcon", config.get("SUPCON_ALPHA", 0.1))
-                            if use_supcon_loss and lambda_supcon != 0.0 and isinstance(traj_batch.obs, dict):
-                                z_flat = z_vision.reshape(-1, z_vision.shape[-1])
-                                labels_flat = vol_labels.reshape(-1)
-                                supcon_loss = supervised_contrastive_loss(z_flat, labels_flat, temperature=0.1)
-                            else:
-                                supcon_loss = jnp.array(0.0)
 
                             reliability_scores = aux_info["reliability_scores"]
                             if reliability_scores.ndim == 4:
@@ -1550,7 +1528,7 @@ def make_train(config):
                                 )
                             )
 
-                            # LOSS CUỐI CÙNG (Cộng PPO và SupCon có hệ số)
+                            # FINAL LOSS: PPO plus reliability survival auxiliary loss.
                             if (
                                 config.get("use_survival_loss", False)
                                 and config.get("use_reliability_head", False)
@@ -1584,12 +1562,8 @@ def make_train(config):
                                 lambda_surv = jnp.array(0.0)
                                 survival_mask_ratio = jnp.array(0.0)
 
-                            if use_supcon_loss and lambda_supcon != 0.0:
-                                weighted_supcon_loss = lambda_supcon * supcon_loss
-                            else:
-                                weighted_supcon_loss = jnp.array(0.0)
                             weighted_survival_loss = lambda_surv * survival_loss
-                            aux_loss = weighted_supcon_loss + weighted_survival_loss
+                            aux_loss = weighted_survival_loss
                             total_loss = ppo_loss + aux_loss
 
                             # debug
@@ -1603,7 +1577,6 @@ def make_train(config):
                                 ratio,
                                 approx_kl,
                                 clip_frac,
-                                supcon_loss,
                                 survival_loss,
                                 weighted_survival_loss,
                                 survival_mask_ratio,
@@ -1611,7 +1584,6 @@ def make_train(config):
                                 ppo_loss,
                                 weighted_value_loss,
                                 weighted_entropy_term,
-                                weighted_supcon_loss,
                                 aux_loss,
                                 reliability_std,
                                 reliability_min,
@@ -1657,7 +1629,6 @@ def make_train(config):
                             traj_batch,
                             advantages,
                             targets,
-                            vol_labels,
                             surv_labels,
                             surv_mask,
                             surv_raw_ratio,
@@ -1671,7 +1642,6 @@ def make_train(config):
                         traj_batch,
                         advantages,
                         targets,
-                        vol_labels,
                         surv_labels,
                         surv_mask,
                         surv_raw_ratio,
@@ -1689,7 +1659,6 @@ def make_train(config):
                         traj_batch,
                         advantages.squeeze(),
                         targets.squeeze(),
-                        vol_labels,
                         surv_labels,
                         surv_mask,
                         surv_raw_ratio,
@@ -1723,7 +1692,6 @@ def make_train(config):
                         traj_batch,
                         advantages,
                         targets,
-                        vol_labels,
                         surv_labels,
                         surv_mask,
                         surv_raw_ratio,
@@ -1738,7 +1706,6 @@ def make_train(config):
                     traj_batch[i],
                     advantages[i],
                     targets[i],
-                    volatility_labels[i],
                     survival_labels[i],
                     survival_masks[i],
                     survival_raw_ratios[i],
@@ -1800,63 +1767,53 @@ def make_train(config):
                     "ratio_0": ratio_0,
                     "approx_kl": loss_info[1][4],
                     "clip_frac": loss_info[1][5],
-                    "supcon_loss": loss_info[1][6],
-                    "survival_loss": loss_info[1][7],
-                    "reliability_loss": loss_info[1][7],
-                    "weighted_survival_loss": loss_info[1][8],
-                    "survival_mask_ratio": loss_info[1][9],
-                    "reliability_mean": loss_info[1][10],
-                    "ppo_loss": loss_info[1][11],
-                    "weighted_value_loss": loss_info[1][12],
-                    "weighted_entropy_term": loss_info[1][13],
-                    "weighted_supcon_loss": loss_info[1][14],
-                    "aux_loss": loss_info[1][15],
-                    "reliability_std": loss_info[1][16],
-                    "reliability_min": loss_info[1][17],
-                    "reliability_max": loss_info[1][18],
-                    "reliability_level_mean_0": loss_info[1][19],
-                    "reliability_level_mean_1": loss_info[1][20],
-                    "reliability_level_mean_2": loss_info[1][21],
-                    "reliability_level_mean_3": loss_info[1][22],
-                    "reliability_level_mean_4": loss_info[1][23],
-                    "reliability_level_mean_5": loss_info[1][24],
-                    "reliability_level_mean_6": loss_info[1][25],
-                    "reliability_level_mean_7": loss_info[1][26],
-                    "reliability_level_mean_8": loss_info[1][27],
-                    "reliability_level_mean_9": loss_info[1][28],
-                    "reliability_side0_mean": loss_info[1][29],
-                    "reliability_side1_mean": loss_info[1][30],
-                    "z_tokens_norm_mean": loss_info[1][31],
-                    "z_tokens_norm_std": loss_info[1][32],
-                    "filtered_tokens_norm_mean": loss_info[1][33],
-                    "filtered_tokens_norm_std": loss_info[1][34],
-                    "filtering_ratio": loss_info[1][35],
-                    "exec_obs_norm_mean": loss_info[1][36],
-                    "vision_token_pooled_norm_mean": loss_info[1][37],
-                    "fusion_output_norm_mean": loss_info[1][38],
-                    "pre_rnn_embedding_norm_mean": loss_info[1][39],
-                    "actor_input_norm_mean": loss_info[1][40],
-                    "rel_z_shape": loss_info[1][41],
-                    "rel_side_id_shape": loss_info[1][42],
-                    "rel_mid_context_shape": loss_info[1][43],
-                    "mid_return_from_init_mean": loss_info[1][44],
-                    "spread_ticks_mean": loss_info[1][45],
-                    "mid_delta_ticks_mean": loss_info[1][46],
-                    "mid_volatility_ticks_mean": loss_info[1][47],
-                    "h_prev_reliability_norm_mean": loss_info[1][48],
-                    "use_h_prev_in_reliability": loss_info[1][49],
-                    "h_prev_used_in_reliability": loss_info[1][50],
-                    "h_prev_reliability_zeroed": loss_info[1][51],
+                    "survival_loss": loss_info[1][6],
+                    "reliability_loss": loss_info[1][6],
+                    "weighted_survival_loss": loss_info[1][7],
+                    "survival_mask_ratio": loss_info[1][8],
+                    "reliability_mean": loss_info[1][9],
+                    "ppo_loss": loss_info[1][10],
+                    "weighted_value_loss": loss_info[1][11],
+                    "weighted_entropy_term": loss_info[1][12],
+                    "aux_loss": loss_info[1][13],
+                    "reliability_std": loss_info[1][14],
+                    "reliability_min": loss_info[1][15],
+                    "reliability_max": loss_info[1][16],
+                    "reliability_level_mean_0": loss_info[1][17],
+                    "reliability_level_mean_1": loss_info[1][18],
+                    "reliability_level_mean_2": loss_info[1][19],
+                    "reliability_level_mean_3": loss_info[1][20],
+                    "reliability_level_mean_4": loss_info[1][21],
+                    "reliability_level_mean_5": loss_info[1][22],
+                    "reliability_level_mean_6": loss_info[1][23],
+                    "reliability_level_mean_7": loss_info[1][24],
+                    "reliability_level_mean_8": loss_info[1][25],
+                    "reliability_level_mean_9": loss_info[1][26],
+                    "reliability_side0_mean": loss_info[1][27],
+                    "reliability_side1_mean": loss_info[1][28],
+                    "z_tokens_norm_mean": loss_info[1][29],
+                    "z_tokens_norm_std": loss_info[1][30],
+                    "filtered_tokens_norm_mean": loss_info[1][31],
+                    "filtered_tokens_norm_std": loss_info[1][32],
+                    "filtering_ratio": loss_info[1][33],
+                    "exec_obs_norm_mean": loss_info[1][34],
+                    "vision_token_pooled_norm_mean": loss_info[1][35],
+                    "fusion_output_norm_mean": loss_info[1][36],
+                    "pre_rnn_embedding_norm_mean": loss_info[1][37],
+                    "actor_input_norm_mean": loss_info[1][38],
+                    "rel_z_shape": loss_info[1][39],
+                    "rel_side_id_shape": loss_info[1][40],
+                    "rel_mid_context_shape": loss_info[1][41],
+                    "mid_return_from_init_mean": loss_info[1][42],
+                    "spread_ticks_mean": loss_info[1][43],
+                    "mid_delta_ticks_mean": loss_info[1][44],
+                    "mid_volatility_ticks_mean": loss_info[1][45],
+                    "h_prev_reliability_norm_mean": loss_info[1][46],
+                    "use_h_prev_in_reliability": loss_info[1][47],
+                    "h_prev_used_in_reliability": loss_info[1][48],
+                    "h_prev_reliability_zeroed": loss_info[1][49],
                     "total_loss_with_aux": loss_info[0],
                     "weighted_entropy_loss": loss_info[1][2] * config["ENT_COEF"][i],
-                    "lambda_supcon": jnp.array(
-                        config.get("lambda_supcon", config.get("SUPCON_ALPHA", 0.1)),
-                        dtype=jnp.float32,
-                    ),
-                    "use_supcon_loss": jnp.array(
-                        float(config.get("use_supcon_loss", True)),
-                        dtype=jnp.float32,
-                    ),
                     "lambda_surv": jnp.array(config.get("lambda_surv", 0.0), dtype=jnp.float32),
                     "use_survival_loss": jnp.array(
                         float(config.get("use_survival_loss", False)),
@@ -1870,7 +1827,6 @@ def make_train(config):
                     "abs_ppo_loss": abs_ppo_loss,
                     "abs_aux_loss": abs_aux_loss,
                     "aux_to_ppo_ratio": abs_aux_loss / (abs_ppo_loss + ratio_eps),
-                    "supcon_to_ppo_ratio": jnp.abs(loss_metrics["weighted_supcon_loss"]) / (abs_ppo_loss + ratio_eps),
                     "survival_to_ppo_ratio": jnp.abs(loss_metrics["weighted_survival_loss"]) / (abs_ppo_loss + ratio_eps),
                 })
                 metrics["loss"].append(loss_metrics)
@@ -2037,19 +1993,14 @@ def make_train(config):
                         "AUX_DIAG",
                         f"update={update_idx}",
                         f"agent={loss_agent_name}",
-                        f"{loss_agent_name}_lambda_supcon={_loss_value(loss_metrics, 'lambda_supcon'):.6g}",
-                        f"{loss_agent_name}_use_supcon_loss={_loss_bool(loss_metrics, 'use_supcon_loss')}",
                         f"{loss_agent_name}_lambda_surv={_loss_value(loss_metrics, 'lambda_surv'):.6g}",
                         f"{loss_agent_name}_use_survival_loss={_loss_bool(loss_metrics, 'use_survival_loss')}",
-                        f"{loss_agent_name}_supcon_loss={_loss_value(loss_metrics, 'supcon_loss'):.6g}",
-                        f"{loss_agent_name}_weighted_supcon_loss={_loss_value(loss_metrics, 'weighted_supcon_loss'):.6g}",
                         f"{loss_agent_name}_survival_loss={_loss_value(loss_metrics, 'survival_loss'):.6g}",
                         f"{loss_agent_name}_weighted_survival_loss={_loss_value(loss_metrics, 'weighted_survival_loss'):.6g}",
                         f"{loss_agent_name}_reliability_loss={_loss_value(loss_metrics, 'reliability_loss'):.6g}",
                         f"{loss_agent_name}_abs_ppo_loss={_loss_value(loss_metrics, 'abs_ppo_loss'):.6g}",
                         f"{loss_agent_name}_abs_aux_loss={_loss_value(loss_metrics, 'abs_aux_loss'):.6g}",
                         f"{loss_agent_name}_aux_to_ppo_ratio={_loss_value(loss_metrics, 'aux_to_ppo_ratio'):.6g}",
-                        f"{loss_agent_name}_supcon_to_ppo_ratio={_loss_value(loss_metrics, 'supcon_to_ppo_ratio'):.6g}",
                         f"{loss_agent_name}_survival_to_ppo_ratio={_loss_value(loss_metrics, 'survival_to_ppo_ratio'):.6g}",
                     ]))
 
