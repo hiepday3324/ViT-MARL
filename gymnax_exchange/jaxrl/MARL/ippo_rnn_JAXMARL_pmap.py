@@ -284,6 +284,10 @@ def unbatchify(x, num_envs, num_agents):
     return jax.tree_util.tree_map(_unbatchify, x)
 
 
+def _is_execution_agent(agent_config):
+    return isinstance(agent_config, Execution_EnvironmentConfig)
+
+
 def make_train(config):
     # scenario = map_name_to_scenario(config["MAP_NAME"])
     init_key = jax.random.PRNGKey(config["SEED"])
@@ -582,14 +586,11 @@ def make_train(config):
                 return runner_state, transitions
             initial_hstates = runner_state[-2]
 
-            window_size = 10
-            survival_delta_steps = int(config.get("survival_delta_steps", window_size))
-            if config.get("use_survival_loss", False) and survival_delta_steps > window_size:
-                raise ValueError(
-                    "survival_delta_steps must be <= rollout window_size. "
-                    f"Got survival_delta_steps={survival_delta_steps}, window_size={window_size}."
-                )
-            total_rollout_steps = config["NUM_STEPS"] + window_size
+            survival_delta_steps = int(config.get("survival_delta_steps", 10))
+            if survival_delta_steps < 1:
+                raise ValueError("survival_delta_steps must be at least one.")
+            reliability_future_padding = survival_delta_steps
+            total_rollout_steps = config["NUM_STEPS"] + reliability_future_padding
 
             def scan_body(carry, step_idx):
                 current_runner_state, stashed_runner_state = carry
@@ -636,6 +637,7 @@ def make_train(config):
                 obs_bid_raw_orders = traj_batch_padded[i].info["world"].get("obs_bid_raw_orders", None)
                 if (
                     config.get("use_survival_loss", False)
+                    and _is_execution_agent(env.list_of_agents_configs[i])
                     and isinstance(traj_batch_padded[i].obs, dict)
                     and "vision_obs" in traj_batch_padded[i].obs
                 ):
@@ -645,7 +647,7 @@ def make_train(config):
                         tick_size=tick_size,
                         survival_delta_steps=survival_delta_steps,
                         survival_min_volume=config.get("survival_min_volume", 1.0),
-                        survival_ratio=config.get("survival_ratio", 0.5),
+                        survival_ratio=config.get("survival_gamma", 0.5),
                         survival_availability_temperature=config.get(
                             "survival_availability_temperature",
                             0.15,
@@ -731,6 +733,8 @@ def make_train(config):
             # FIXME: APPLY VISION, GATED-FUSION
             loss_infos = []
             for i, train_state in enumerate(train_states):
+                agent_is_execution = _is_execution_agent(env.list_of_agents_configs[i])
+
                 def _update_epoch(update_state, unused):
                     def _update_minbatch(train_state, batch_info):
                         init_hstate, traj_batch, advantages, targets, surv_labels, surv_mask = batch_info
@@ -785,6 +789,7 @@ def make_train(config):
                             if (
                                 config.get("use_survival_loss", False)
                                 and config.get("use_reliability_head", False)
+                                and agent_is_execution
                                 and isinstance(traj_batch.obs, dict)
                             ):
                                 reliability_scores = aux_info["reliability_scores"]

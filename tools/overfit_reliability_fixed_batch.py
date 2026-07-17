@@ -356,7 +356,7 @@ def _make_fixed_batch(bundle: RolloutBundle) -> FixedBatch:
         tick_size=tick_size,
         survival_delta_steps=survival_delta_steps,
         survival_min_volume=config.get("survival_min_volume", 1.0),
-        survival_ratio=config.get("survival_ratio", 0.5),
+        survival_ratio=config.get("survival_gamma", 0.5),
         survival_availability_temperature=config.get(
             "survival_availability_temperature", 0.15
         ),
@@ -364,6 +364,7 @@ def _make_fixed_batch(bundle: RolloutBundle) -> FixedBatch:
         bid_raw_orders=traj.info["world"].get("obs_bid_raw_orders", None),
         num_steps=config["NUM_STEPS"],
         episode_done=traj.info["agent"]["done"],
+        eps=config.get("survival_eps", 1e-8),
     )
     return FixedBatch(
         train_state=bundle.train_states[exec_idx],
