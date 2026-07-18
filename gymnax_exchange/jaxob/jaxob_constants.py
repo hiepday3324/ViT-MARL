@@ -65,6 +65,12 @@ class CancelMode(Enum):
     CANCEL_UNIFORM=2  #Pick a random order at the right price level to cancel 
     CANCEL_UNIFORM_AND_LARGE=3 # Unused for now
 
+
+class Type4Interpretation(Enum):
+    IOC=0  # Match visible liquidity and discard any unmatched remainder.
+    LIM=1  # Match visible liquidity and rest any unmatched remainder.
+    MKT=2  # Reserved for market-price interpretation.
+
 SEED= 42 # the meaning of life. 
 
 #TODO: flag on behaviour of type market either limit or far touch. 

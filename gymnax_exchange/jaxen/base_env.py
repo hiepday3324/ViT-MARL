@@ -61,7 +61,10 @@ import chex
 from flax import struct
 import itertools
 from gymnax_exchange.jaxob import JaxOrderBookArrays as job
-from gymnax_exchange.jaxlobster.lobster_loader import LoadLOBSTER_resample
+from gymnax_exchange.jaxlobster.lobster_loader import (
+    LOBSTER_CACHE_SCHEMA_VERSION,
+    LoadLOBSTER_resample,
+)
 #from gymnax_exchange.jaxlobster.gen_loader import GenLoader
 from gymnax_exchange.utils.utils import *
 import pickle
@@ -71,6 +74,45 @@ import os
 #Config File:
 from gymnax_exchange.jaxob.jaxob_config import World_EnvironmentConfig
 from gymnax_exchange.jaxen.StatesandParams import LoadedEnvParams, LoadedEnvState, WorldState
+
+
+def build_initial_orders_from_l2(book_data, time, book_depth, init_id):
+    """Convert a depth-configured L2 snapshot into synthetic init messages."""
+    expected_features = int(book_depth) * 4
+    if book_data.shape[-1] != expected_features:
+        raise ValueError(
+            f"L2 snapshot has {book_data.shape[-1]} features, expected "
+            f"{expected_features} for book_depth={book_depth}."
+        )
+    data = jnp.asarray(book_data).reshape(int(book_depth) * 2, 2)
+    init_orders = jnp.zeros((int(book_depth) * 2, 8), dtype=jnp.int32)
+    return (
+        init_orders
+        .at[:, 3].set(data[:, 0])
+        .at[:, 2].set(data[:, 1])
+        .at[:, 0].set(1)
+        .at[0::2, 1].set(-1)
+        .at[1::2, 1].set(1)
+        .at[:, 4].set(init_id)
+        .at[:, 5].set(init_id - jnp.arange(0, int(book_depth) * 2))
+        .at[:, 6].set(time[0])
+        .at[:, 7].set(time[1])
+    )
+
+
+def pre_reset_cache_path(alphatrade_path, cfg):
+    filename = (
+        f"ResetState_cache_{LOBSTER_CACHE_SCHEMA_VERSION}"
+        f"_window_resolution_{cfg.start_resolution}"
+        f"_eptype_{cfg.ep_type}"
+        f"_depth_{cfg.book_depth}"
+        f"_stock_{cfg.stock}"
+        f"_windowidx_{cfg.window_selector}"
+        f"_nMsgPerStep_{cfg.n_data_msg_per_step}"
+        f"_episode_time_{cfg.episode_time}"
+        f"_TimePeriod_{cfg.timePeriod}.pkl"
+    )
+    return os.path.join(alphatrade_path, "pre_reset_states", filename)
 
 
 
@@ -243,31 +285,12 @@ class BaseLOBEnv(environment.Environment):
         time=jnp.array(first_message[-2:])
         #Get initial orders (2xNdepth)x6 based on the initial L2 orderbook for this window 
         def get_initial_orders(book_data,time):
-            orderbookLevels=10
-            initid=self.cfg.init_id
-            #jax.debug.print("\n=== Debug Order Book Initialization ===")
-            #jax.debug.print("Raw book_data shape: {}", book_data.shape)
-            #jax.debug.print("Raw book_data: {}", book_data)
-            data=jnp.array(book_data).reshape(int(10*2),2)
-            #jax.debug.print("\nReshaped data: {}", data)
-            newarr = jnp.zeros((int(orderbookLevels*2),8),dtype=jnp.int32)
-            initOB = newarr \
-                .at[:,3].set(data[:,0]) \
-                .at[:,2].set(data[:,1]) \
-                .at[:,0].set(1) \
-                .at[0:orderbookLevels*4:2,1].set(-1) \
-                .at[1:orderbookLevels*4:2,1].set(1) \
-                .at[:,4].set(initid) \
-                .at[:,5].set(initid-jnp.arange(0,orderbookLevels*2)) \
-                .at[:,6].set(time[0]) \
-                .at[:,7].set(time[1])
-            #jax.debug.print("\nFinal initOB array:")
-            #jax.debug.print("Shape: {}", initOB.shape)
-            #jax.debug.print("Content: {}", initOB)
-            #jax.debug.print("Side assignments (column 1): {}", initOB[:,1])
-            #jax.debug.print("Price assignments (column 3): {}", initOB[:,3])
-            #jax.debug.print("Quantity assignments (column 2): {}", initOB[:,2])
-            return initOB
+            return build_initial_orders_from_l2(
+                book_data,
+                time,
+                self.book_depth,
+                self.cfg.init_id,
+            )
         init_orders=get_initial_orders(book_data,time)
         #jax.debug.print("init_orders {}",init_orders)
         #Initialise both sides of the book as being empty
@@ -295,17 +318,7 @@ class BaseLOBEnv(environment.Environment):
     def _init_states(self,key,alphatradePath,starts):
         print("START:  pre-reset in the initialization")
         os.makedirs(alphatradePath + '/pre_reset_states/', exist_ok=True)
-        pkl_file_name = (alphatradePath + '/pre_reset_states/'
-                         + 'ResetState_window_resolution_' + str(self.cfg.start_resolution)
-                         + '_eptype_"' + str(self.cfg.ep_type)
-                         + '"_depth_' + str(self.cfg.book_depth)
-                         + "_stock_" + str(self.cfg.stock)
-                         + "_windowidx_"+str(self.cfg.window_selector)
-                         + "_nMsgPerStep_"+str(self.cfg.n_data_msg_per_step)
-                         + "_episode_time_"+str(self.cfg.episode_time)
-                         + "_TimePeriod_"+str(self.cfg.timePeriod)
-                         + '.pkl')
-        pkl_file_name = pkl_file_name.replace('"', '') #FIXME: đã sửa lỗi dấu ngoặc kép trong tên file
+        pkl_file_name = pre_reset_cache_path(alphatradePath, self.cfg)
         print("pre-reset will be saved to ", pkl_file_name)
         try:
             if self.cfg.use_pickles_for_init:

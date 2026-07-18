@@ -70,17 +70,25 @@ def add_order(orderside: chex.Array, msg: dict) -> chex.Array :
         Returns:
                 orderside (Array): Side of orderbook with added order 
     """
-    emptyidx=jnp.where(orderside==-1,size=1,fill_value=-1)[0]
-    orderside=orderside.at[emptyidx,:]\
-                        .set(jnp.array([
-                            msg['price'],
-                            jnp.maximum(0,msg['quantity']),
-                            msg['orderid'],
-                            msg['traderid'],
-                            msg['time'],
-                            msg['time_ns']]))\
-                        .astype(jnp.int32)
-    return _removeZeroNegQuant(orderside)
+    emptyidx = jnp.where(
+        orderside[:, cst.OrderSideFeat.P.value] == cst.EMPTY_SLOT,
+        size=1,
+        fill_value=-1,
+    )[0][0]
+    new_order = jnp.array([
+        msg['price'],
+        jnp.maximum(0,msg['quantity']),
+        msg['orderid'],
+        msg['traderid'],
+        msg['time'],
+        msg['time_ns'],
+    ], dtype=jnp.int32)
+
+    def insert(side):
+        return _removeZeroNegQuant(side.at[emptyidx, :].set(new_order))
+
+    can_insert = (emptyidx >= 0) & (msg['quantity'] > 0)
+    return jax.lax.cond(can_insert, insert, lambda side: side, orderside)
 
 @jax.jit
 def _removeZeroNegQuant(orderside):
@@ -113,8 +121,12 @@ def cancel_order(cfg:JAXLOB_Configuration,key:chex.PRNGKey,orderside, msg):
                         lambda a, b: idx,
                         orderside,
                         msg,)
-    orderside = orderside.at[idx, 1].set(orderside[idx, 1] - msg['quantity'])
-    return _removeZeroNegQuant(orderside)
+    def apply_cancel(side):
+        return _removeZeroNegQuant(
+            side.at[idx, 1].set(side[idx, 1] - msg['quantity'])
+        )
+
+    return jax.lax.cond(idx >= 0, apply_cancel, lambda side: side, orderside)
 
 
 @partial(jax.jit, static_argnums=(0,))
@@ -125,6 +137,7 @@ def get_init_id_match(cfg:JAXLOB_Configuration,key:chex.PRNGKey,orderside, msg):
     """
     init_id_match = ((orderside[:, 0] == msg['price']) 
                         & (orderside[:, 2] <= cfg.init_id)
+                        & (orderside[:, 2] >= cfg.init_id-(cfg.book_depth*2))
                         & (orderside[:,1]>=msg['quantity']))
     idx = jnp.where(init_id_match, size=1, fill_value=-1)[0][0]
     if cfg.cancel_mode==2 or cfg.cancel_mode==3:
@@ -353,6 +366,40 @@ def doNothing(msg,askside,bidside,trades):
                 trades (Array): Same as parameter, after processing
     """
     return askside,bidside,trades
+
+
+def _add_remainder_with_capacity(cfg, orderside, msg, is_bid):
+    """Rest a valid remainder, evicting the worst level only when full."""
+    type_four_may_rest = (
+        cfg.type_4_interpretation == cst.Type4Interpretation.LIM.value
+    )
+    should_rest = (
+        (msg["quantity"] > 0)
+        & ((msg["type"] != cst.MessageType.MATCH.value) | type_four_may_rest)
+    )
+
+    def make_space_and_add(side):
+        if not cfg.check_book_fill:
+            return add_order(side, msg)
+        prices = side[:, cst.OrderSideFeat.P.value]
+        full_book = jnp.all(prices != cst.EMPTY_SLOT)
+        worst_price = jnp.min(prices) if is_bid else jnp.max(prices)
+        remove_worst = full_book & (prices == worst_price)
+        side_with_space = jnp.where(
+            remove_worst[:, None],
+            jnp.full_like(side, cst.EMPTY_SLOT),
+            side,
+        )
+        return add_order(side_with_space, msg)
+
+    return jax.lax.cond(
+        should_rest,
+        make_space_and_add,
+        lambda side: side,
+        orderside,
+    )
+
+
 @partial(jax.jit,static_argnums=0)
 def bid_lim(cfg:JAXLOB_Configuration,msg,askside,bidside,trades):
     """Function for processing a limit order to bid. After attempting
@@ -387,7 +434,7 @@ def bid_lim(cfg:JAXLOB_Configuration,msg,askside,bidside,trades):
                                          msg["traderid"],
                                          msg['side'])
     msg["quantity"]=matchtuple[1] #Remaining quantity
-    bids=add_order(bidside,msg)
+    bids=_add_remainder_with_capacity(cfg,bidside,msg,is_bid=True)
     return matchtuple[0],bids,matchtuple[3]
 @partial(jax.jit,static_argnums=0)
 def bid_cancel(cfg:JAXLOB_Configuration,key,msg,askside,bidside,trades):
@@ -449,7 +496,7 @@ def ask_lim(cfg:JAXLOB_Configuration,msg,askside,bidside,trades):
                                          msg["traderid"],
                                          msg['side'])
     msg["quantity"]=matchtuple[1] #Remaining quantity
-    asks=add_order(askside,msg)
+    asks=_add_remainder_with_capacity(cfg,askside,msg,is_bid=False)
     return asks,matchtuple[0],matchtuple[3]
 
 @partial(jax.jit,static_argnums=0)
@@ -517,7 +564,7 @@ def cond_type_side(config : JAXLOB_Configuration,book_state, it_data):
     """
     (key,data)=it_data
     askside,bidside,trades=book_state
-    msg={'side':data[1],
+    msg={'side':jnp.where(data[0] == cst.MessageType.MATCH.value, -data[1], data[1]),
          'type':data[0],
          'price':data[3],
          'quantity':data[2],
@@ -531,8 +578,8 @@ def cond_type_side(config : JAXLOB_Configuration,book_state, it_data):
     if config.simulator_mode == cst.SimulatorMode.GENERAL_EXCHANGE.value:
         #Means the match orders (4) will be treated as limit orders of opposite side
         # and delete orders (3) will just be treated as cancel orders.
-        index = ((((s == -1) & (t == 1)) | ((s ==  1) & (t == 4))) * 0 
-                + (((s ==  1) & (t == 1)) | ((s == -1) & (t == 4))) * 1
+        index = (((s == -1) & ((t == 1) | (t == 4))) * 0
+                + ((s ==  1) & ((t == 1) | (t == 4))) * 1
                 + (((s == -1) & (t == 2)) | ((s == -1) & (t == 3))) * 2 
                 + (((s ==  1) & (t == 2)) | ((s ==  1) & (t == 3))) * 3
                 +((s==0)&(t==0))*4)
@@ -587,7 +634,7 @@ def cond_type_side_save_states(cfg:JAXLOB_Configuration,book_state,it_data):
     """
     (key,data)=it_data
     askside,bidside,trades=book_state
-    msg={'side':data[1],
+    msg={'side':jnp.where(data[0] == cst.MessageType.MATCH.value, -data[1], data[1]),
          'type':data[0],
          'price':data[3],
          'quantity':data[2],
@@ -598,8 +645,8 @@ def cond_type_side_save_states(cfg:JAXLOB_Configuration,book_state,it_data):
 
     s = msg["side"]
     t = msg["type"]
-    index = ((((s == -1) & (t == 1)) | ((s ==  1) & (t == 4))) * 0
-             + (((s ==  1) & (t == 1)) | ((s == -1) & (t == 4))) * 1 
+    index = (((s == -1) & ((t == 1) | (t == 4))) * 0
+             + ((s ==  1) & ((t == 1) | (t == 4))) * 1
              + (((s == -1) & (t == 2)) | ((s == -1) & (t == 3))) * 2
              + (((s ==  1) & (t == 2)) | ((s ==  1) & (t == 3))) * 3
              +((s==0)&(t==0))*4)
@@ -635,7 +682,7 @@ def cond_type_side_save_bidask(cfg:JAXLOB_Configuration,book_state,it_data):
     """
     (key,data)=it_data
     askside,bidside,trades=book_state
-    msg={'side':data[1],
+    msg={'side':jnp.where(data[0] == cst.MessageType.MATCH.value, -data[1], data[1]),
         'type':data[0],
         'price':data[3],
         'quantity':data[2],
@@ -646,8 +693,8 @@ def cond_type_side_save_bidask(cfg:JAXLOB_Configuration,book_state,it_data):
 
     s = msg["side"]
     t = msg["type"]
-    index = ((((s == -1) & (t == 1)) | ((s ==  1) & (t == 4))) * 0
-            + (((s ==  1) & (t == 1)) | ((s == -1) & (t == 4))) * 1 
+    index = (((s == -1) & ((t == 1) | (t == 4))) * 0
+            + ((s ==  1) & ((t == 1) | (t == 4))) * 1
             + (((s == -1) & (t == 2)) | ((s == -1) & (t == 3))) * 2
             + (((s ==  1) & (t == 2)) | ((s ==  1) & (t == 3))) * 3
             +((s==0)&(t==0))*4)

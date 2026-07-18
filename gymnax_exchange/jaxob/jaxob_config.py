@@ -18,13 +18,16 @@ _DEFAULT_DATA_PATH = os.environ.get("VIT_MARL_DATA_PATH", str(Path(_DEFAULT_ROOT
 class JAXLOB_Configuration:
     maxint : int = cst.MaxInt._64_Bit_Signed.value
     init_id :int = cst.INITID
+    book_depth: int = 10
     cancel_mode: int= cst.CancelMode.INCLUDE_INITS.value
+    type_4_interpretation: int = cst.Type4Interpretation.IOC.value
     seed: int =cst.SEED
     nTrades : int=cst.NTRADE_CAP
     nOrders : int =cst.NORDER_CAP
     simulator_mode=cst.SimulatorMode.GENERAL_EXCHANGE.value
     empty_slot_val=cst.EMPTY_SLOT
     debug_mode:bool=False
+    check_book_fill: bool = True
     start_resolution: int = 50  # Episodes from data start every n seconds.
     # alphatradePath: str = os.path.expanduser("~")
     # dataPath: str = os.path.expanduser("~")+"/data"
@@ -177,7 +180,6 @@ class World_EnvironmentConfig(JAXLOB_Configuration):
     day_end = 57600  # 16:00
     nOrdersPerSide=100 #100
     nTradesLogged=100
-    book_depth=10
     n_ticks_in_book = 10 # Depth of PP actions
     customIDCounter=0
     tick_size=100

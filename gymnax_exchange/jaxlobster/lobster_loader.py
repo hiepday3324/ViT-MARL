@@ -50,6 +50,33 @@ import numpy as np
 from glob import glob
 from functools import partial
 
+
+LOBSTER_CACHE_SCHEMA_VERSION = "upstream_p0_c9a64050_v1"
+
+
+def _lobster_file_identity(path, marker):
+    return os.path.basename(path).replace(marker, "_PAIR_").removesuffix(".csv")
+
+
+def validate_lobster_file_pair(message_file, book_file):
+    """Raise when message and orderbook filenames do not identify the same day."""
+    message_id = _lobster_file_identity(message_file, "_message_")
+    book_id = _lobster_file_identity(book_file, "_orderbook_")
+    if message_id != book_id:
+        raise ValueError(
+            f"Message and orderbook file mismatch: {message_file} vs {book_file}"
+        )
+
+
+def validate_orderbook_columns(orderbook_day, n_levels):
+    expected_columns = int(n_levels) * 4
+    actual_columns = int(orderbook_day.shape[1])
+    if actual_columns != expected_columns:
+        raise ValueError(
+            f"Orderbook has {actual_columns} columns, expected {expected_columns} "
+            f"for book_depth={n_levels}."
+        )
+
 class LoadLOBSTER():
     """
     Class which completes all of the loading from the lobster data
@@ -384,6 +411,16 @@ class LoadLOBSTER_resample():
         if os.path.exists(save_path):
             print(f"Loading cached arrays from {save_path}")
             data = np.load(save_path, allow_pickle=True)
+            cache_version = (
+                str(data["cache_schema_version"].item())
+                if "cache_schema_version" in data.files
+                else None
+            )
+            if cache_version != LOBSTER_CACHE_SCHEMA_VERSION:
+                raise ValueError(
+                    f"Cache schema mismatch at {save_path}: {cache_version!r} != "
+                    f"{LOBSTER_CACHE_SCHEMA_VERSION!r}. Regenerate this cache."
+                )
             msgs = data['msgs']
             starts = data['starts']
             ends = data['ends']
@@ -391,7 +428,15 @@ class LoadLOBSTER_resample():
             max_msgs_in_windows_arr = data['max_msgs_in_windows_arr']
         else:
 
-            msgs,starts,ends,obs = self._load_files()
+            results = self._load_files()
+            results.sort(key=lambda result: result[-1])
+            msgs, starts, ends, obs, _file_indices = map(list, zip(*results))
+
+            cumulative_offset = 0
+            for index in range(len(starts)):
+                starts[index] = np.asarray(starts[index]) + cumulative_offset
+                ends[index] = np.asarray(ends[index]) + cumulative_offset
+                cumulative_offset += msgs[index].shape[0]
 
             # jax.profiler.stop_trace()
 
@@ -418,7 +463,8 @@ class LoadLOBSTER_resample():
                 starts=starts,
                 ends=ends,
                 obs=obs,
-                max_msgs_in_windows_arr=max_msgs_in_windows_arr
+                max_msgs_in_windows_arr=max_msgs_in_windows_arr,
+                cache_schema_version=np.asarray(LOBSTER_CACHE_SCHEMA_VERSION),
             )
 
         return msgs,starts,ends,obs,max_msgs_in_windows_arr
@@ -426,6 +472,7 @@ class LoadLOBSTER_resample():
     def _get_save_filename(self):
         # Create a unique filename based on config parameters
         params = [
+            LOBSTER_CACHE_SCHEMA_VERSION,
             str(self.stock),
             str(self.time_period),
             str(self.n_Levels),
@@ -482,6 +529,12 @@ class LoadLOBSTER_resample():
         
         # Adaptive worker count based on file size and system resources
         total_files = len(self.message_files)
+        if total_files == 0:
+            raise FileNotFoundError(f"No LOBSTER message files found in {self.datapath}")
+        if total_files != len(self.book_files):
+            raise ValueError(
+                f"Found {total_files} message files but {len(self.book_files)} orderbook files"
+            )
         
         # Start with fewer workers and scale based on system performance
         # I/O bound tasks benefit from more workers, but too many cause contention
@@ -494,7 +547,8 @@ class LoadLOBSTER_resample():
         file_semaphore = Semaphore(n_workers * 2)  # Allow some buffering
 
         def read_pair(files):
-            message_file, book_file = files
+            message_file, book_file, file_index = files
+            validate_lobster_file_pair(message_file, book_file)
             if message_file[-3:] == "csv" and book_file[-3:] == "csv":
                 with file_semaphore:  # Limit concurrent disk access
                     try:
@@ -521,6 +575,7 @@ class LoadLOBSTER_resample():
                             na_filter=False,
                             skip_blank_lines=True
                         )
+                        validate_orderbook_columns(df_book, self.n_Levels)
                         
                         read_time = time.time() - start_time
                         
@@ -541,7 +596,7 @@ class LoadLOBSTER_resample():
                                   f"({file_size_mb:.1f}MB, {throughput:.1f}MB/s) "
                                   f"read:{read_time:.2f}s proc:{process_time:.2f}s total:{total_time:.2f}s")
                             
-                            return (message_day, index_s, index_e, init_OBs)
+                            return (message_day, index_s, index_e, init_OBs, file_index)
                         else:
                             if df_message.empty:
                                 print(f"⚠ Empty message file: {os.path.basename(message_file)}")
@@ -549,16 +604,17 @@ class LoadLOBSTER_resample():
                                 print(f"⚠ Empty orderbook file: {os.path.basename(book_file)}")
                     
                     except pd.errors.EmptyDataError:
-                        print(f"⚠ Truly empty file: {os.path.basename(message_file)}")
+                        raise ValueError(
+                            f"Empty LOBSTER file pair: {message_file} / {book_file}"
+                        )
                     except Exception as e:
-                        print(f"✗ Error processing {os.path.basename(message_file)}: {e}")
+                        raise RuntimeError(
+                            f"Failed to process LOBSTER pair {message_file} / {book_file}"
+                        ) from e
             return None
 
-        pairs = list(zip(self.message_files, self.book_files))
-        messageDays = []
-        startIndeces = []
-        endIndeces = []
-        initOrderboks = []
+        pairs = list(zip(self.message_files, self.book_files, range(total_files)))
+        results = []
 
         # Process files with better resource management
         start_total = time.time()
@@ -592,15 +648,11 @@ class LoadLOBSTER_resample():
                     try:
                         result = future.result()
                         if result is not None:
-                            message_day, index_s, index_e, init_OBs = result
-                            messageDays.append(message_day)
-                            startIndeces.append(index_s)
-                            endIndeces.append(index_e)
-                            initOrderboks.append(init_OBs)
+                            results.append(result)
                             completed_files += 1
                     except Exception as exc:
                         pair = future_to_pair[future]
-                        print(f'✗ Batch task {pair} failed: {exc}')
+                        raise RuntimeError(f"LOBSTER batch task {pair} failed") from exc
                 
                 batch_time = time.time() - batch_start_time
                 avg_time_per_file = batch_time / len(batch_pairs) if batch_pairs else 0
@@ -616,14 +668,21 @@ class LoadLOBSTER_resample():
         print(f"   Average time per file: {avg_time_per_file:.2f}s")
         print(f"   Effective throughput: {completed_files / total_time:.2f} files/s")
         
-        return messageDays, startIndeces, endIndeces, initOrderboks
+        if not results:
+            raise RuntimeError("No valid LOBSTER message/orderbook pairs were loaded")
+        return results
     
     def _pre_process_msg_ob(self,message_day,orderbook_day):
         """Adjust message_day data and orderbook_day data. 
         Splits time into two fields, drops unused message_day types,
-        transforms executions into limit orders and delete into cancel
-        orders, and adds the traderID field. 
+        merges visible executions, maps delete to cancel, and aligns each
+        processed message with its pre-message orderbook state.
         """
+        if message_day.shape[0] != orderbook_day.shape[0]:
+            raise ValueError(
+                "Raw LOBSTER message/orderbook row mismatch: "
+                f"{message_day.shape[0]} != {orderbook_day.shape[0]}"
+            )
         # Optimize pandas operations by avoiding unnecessary copies
         # and using vectorized operations where possible
         
@@ -646,41 +705,28 @@ class LoadLOBSTER_resample():
         # Filter message types more efficiently
         type_mask = message_day['type'].isin([1,2,3,4])
         message_day = message_day[type_mask].copy()  # Explicit copy to avoid warnings
+        message_day = merge_market_orders(message_day)
         valid_index = message_day.index.to_numpy()
         message_day.reset_index(inplace=True, drop=True)
 
-        # Turn executions into limit orders on the opposite book side
-        message_day.loc[message_day['type'] == 4, 'direction'] *= -1
-        message_day.loc[message_day['type'] == 4, 'type'] = 1
         #Turn delete into cancel orders
         message_day.loc[message_day['type'] == 3, 'type'] = 2
         #Add trader_id field (copy of order_id)
         warnings.filterwarnings('ignore', category=SettingWithCopyWarning)
         message_day['trader_id'] = message_day['order_id']
-        orderbook_day.iloc[valid_index,:].reset_index(inplace=True, drop=True)
-        return message_day,orderbook_day
-        
-        # Vectorized transformations (faster than loc operations)
-        execution_mask = message_day['type'] == 4
-        delete_mask = message_day['type'] == 3
-        
-        # Turn executions into limit orders on the opposite book side
-        message_day.loc[execution_mask, 'direction'] *= -1
-        message_day.loc[execution_mask, 'type'] = 1
-        
-        # Turn delete into cancel orders
-        message_day.loc[delete_mask, 'type'] = 2
-        
-        # Add trader_id field (copy of order_id) - faster assignment
-        message_day['trader_id'] = message_day['order_id'].values  # Use .values for speed
-        
-        # Filter orderbook efficiently
-        orderbook_day = orderbook_day.iloc[valid_index].copy()
-        orderbook_day.reset_index(inplace=True, drop=True)
-        
-        # Suppress pandas warnings
-        warnings.filterwarnings('ignore', category=SettingWithCopyWarning)
-        
+        orderbook_day = orderbook_day.iloc[valid_index, :].reset_index(drop=True)
+
+        # LOBSTER rows describe the state after their message. Pair message i+1
+        # with the post-i book so the cached book is the state before message i+1.
+        orderbook_day = orderbook_day.iloc[:-1, :].reset_index(drop=True)
+        message_day = message_day.iloc[1:, :].reset_index(drop=True)
+        if message_day.shape[0] != orderbook_day.shape[0]:
+            raise ValueError(
+                "Orderbook and message dataframe mismatch after preprocessing: "
+                f"{orderbook_day.shape[0]} != {message_day.shape[0]}"
+            )
+        if message_day.empty:
+            raise ValueError("No aligned LOBSTER messages remain after preprocessing")
         return message_day, orderbook_day
 
     
@@ -776,13 +822,39 @@ class LoadLOBSTER_resample():
                     print(f"  Warning: Window {i} has no data!")
 
         init_OBs=np.array(orderbook_day.iloc[np.array(index_s),:])
-        index_s=np.array(index_s)+np.ones_like(np.array(index_s))*self.index_offest
-        index_e=np.array(index_e)+np.ones_like(np.array(index_e))*self.index_offest
-        self.index_offest=self.index_offest+message_day.shape[0]
+        index_s=np.asarray(index_s)
+        index_e=np.asarray(index_e)
         columns = ['type','direction','qty','price',
                    'trader_id','order_id','time_s','time_ns']
         message_day=message_day[columns].to_numpy()
         return message_day,index_s,index_e,init_OBs
+
+
+def merge_market_orders(message_day: pd.DataFrame) -> pd.DataFrame:
+    """Merge visible executions sharing an exact timestamp and raw side."""
+    execution_mask = message_day["type"] == 4
+    if not execution_mask.any():
+        return message_day.copy()
+
+    result = message_day.copy()
+    indices_to_drop = []
+    executions = result[execution_mask]
+    for (_time_s, _time_ns, direction), group in executions.groupby(
+        ["time_s", "time_ns", "direction"]
+    ):
+        if len(group) <= 1:
+            continue
+        group_indices = group.index.tolist()
+        last_index = group_indices[-1]
+        indices_to_drop.extend(group_indices[:-1])
+        result.loc[last_index, "qty"] = group["qty"].sum()
+        result.loc[last_index, "price"] = (
+            group["price"].max() if direction == -1 else group["price"].min()
+        )
+
+    if indices_to_drop:
+        result = result.drop(indices_to_drop)
+    return result
     
 
 
