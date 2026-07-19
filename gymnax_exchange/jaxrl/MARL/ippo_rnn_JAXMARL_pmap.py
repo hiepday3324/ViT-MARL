@@ -129,7 +129,7 @@ class ReliabilityFusionRNN(nn.Module):
             hidden_dim=self.config.get("reliability_hidden_dim", self.config["FC_DIM_SIZE"]),
             gate_epsilon=self.config.get("reliability_gate_epsilon", 0.1),
         )
-        reliability_scores_t, filtered_tokens_t = reliability(
+        reliability_logits_t, reliability_scores_t, filtered_tokens_t = reliability(
             z_tokens=z_tokens_t,
             side_id=side_id_t,
             mid_context=mid_context_t,
@@ -146,7 +146,7 @@ class ReliabilityFusionRNN(nn.Module):
         embedding_t = nn.relu(embedding_t)
 
         new_rnn_state, y_t = nn.GRUCell(features=self.config["FC_DIM_SIZE"])(rnn_state, embedding_t)
-        return new_rnn_state, (y_t, reliability_scores_t)
+        return new_rnn_state, (y_t, reliability_logits_t, reliability_scores_t)
 
 # FIXME: APPLY VISION 
 class ActorCriticRNN(nn.Module):
@@ -171,11 +171,18 @@ class ActorCriticRNN(nn.Module):
 
             use_reliability_head = self.config.get("use_reliability_head", False)
             if use_reliability_head:
-                hidden, (embedding, reliability_scores) = ReliabilityFusionRNN(config=self.config)(
+                hidden, (embedding, reliability_logits, reliability_scores) = ReliabilityFusionRNN(config=self.config)(
                     hidden,
                     (obs_exec, obs_exec_smoothed, z_tokens, mid_context, dones),
                 )
-                aux_info = {"reliability_scores": reliability_scores}
+                aux_info = {
+                    "reliability_logits": reliability_logits,
+                    "reliability_scores": reliability_scores,
+                    "reliability_path_active": jnp.ones(
+                        reliability_scores.shape[:2],
+                        dtype=jnp.float32,
+                    ),
+                }
             else:
                 fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
                 fused_obs = fusion(obs_exec_smoothed, z_tokens)
@@ -188,7 +195,9 @@ class ActorCriticRNN(nn.Module):
 
                 hidden, embedding = ScannedRNN()(hidden, rnn_in)
                 aux_info = {
-                    "reliability_scores": jnp.zeros((*z_tokens.shape[:-1], 1), dtype=z_tokens.dtype)
+                    "reliability_logits": jnp.zeros((*z_tokens.shape[:-1], 1), dtype=z_tokens.dtype),
+                    "reliability_scores": jnp.zeros((*z_tokens.shape[:-1], 1), dtype=z_tokens.dtype),
+                    "reliability_path_active": jnp.zeros(z_tokens.shape[:2], dtype=jnp.float32),
                 }
         else:
             fused_obs = obs
@@ -202,7 +211,9 @@ class ActorCriticRNN(nn.Module):
 
             hidden, embedding = ScannedRNN()(hidden, rnn_in)
             aux_info = {
-                "reliability_scores": jnp.zeros((*embedding.shape[:-1], 1, 1), dtype=embedding.dtype)
+                "reliability_logits": jnp.zeros((*embedding.shape[:-1], 1, 1), dtype=embedding.dtype),
+                "reliability_scores": jnp.zeros((*embedding.shape[:-1], 1, 1), dtype=embedding.dtype),
+                "reliability_path_active": jnp.zeros(embedding.shape[:-1], dtype=jnp.float32),
             }
         actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
             embedding
@@ -654,8 +665,11 @@ def make_train(config):
                         ),
                         ask_raw_orders=obs_ask_raw_orders,
                         bid_raw_orders=obs_bid_raw_orders,
+                        new_trades=traj_batch_padded[i].info["world"]["new_trades"],
+                        trade_valid_mask=traj_batch_padded[i].info["world"]["trade_valid_mask"],
+                        trade_buffer_saturated=traj_batch_padded[i].info["world"]["trade_buffer_saturated"],
                         num_steps=config["NUM_STEPS"],
-                        episode_done=traj_batch_padded[i].info["agent"]["done"],
+                        episode_done=traj_batch_padded[i].global_done,
                         eps=config.get("survival_eps", 1e-8),
                     )
                 else:
@@ -793,6 +807,7 @@ def make_train(config):
                                 and isinstance(traj_batch.obs, dict)
                             ):
                                 reliability_scores = aux_info["reliability_scores"]
+                                reliability_logits = aux_info["reliability_logits"]
                                 # Soft targets use the same auxiliary slot as the legacy survival loss.
                                 survival_loss = masked_reliability_loss(
                                     reliability_scores,
@@ -800,6 +815,7 @@ def make_train(config):
                                     surv_mask,
                                     loss_type=config.get("reliability_loss_type", "bce"),
                                     eps=config.get("survival_eps", 1e-8),
+                                    reliability_logits=reliability_logits,
                                 )
                                 lambda_surv = config.get("lambda_surv", 0.0)
                                 survival_mask_ratio = jnp.mean(surv_mask.astype(jnp.float32))
@@ -918,13 +934,34 @@ def make_train(config):
                 loss_infos.append(loss_info)
 
 
+            callback_world_exclusions = {
+                "new_trades",
+                "trade_valid_mask",
+                "obs_ask_raw_orders",
+                "obs_bid_raw_orders",
+            }
+            callback_traj_batch = [
+                transition._replace(
+                    info={
+                        "world": {
+                            key: value
+                            for key, value in transition.info["world"].items()
+                            if key not in callback_world_exclusions
+                        },
+                        "agent": transition.info["agent"],
+                    }
+                )
+                for transition in traj_batch
+            ]
             metrics= {}
             metrics['agents'] = [jax.tree.map(
                 lambda x: x.reshape(
                     (config["NUM_STEPS"], local_num_envs, config["NUM_AGENTS_PER_TYPE"][i])
                 ),
                 trjbtch.info['agent']) for i, trjbtch in enumerate(traj_batch)]
-            metrics['world'] = [traj_batch.info['world'] for i, traj_batch in enumerate(traj_batch)]
+            metrics['world'] = [
+                transition.info['world'] for transition in callback_traj_batch
+            ]
             metrics["loss"]=[]
             for i,loss_info in enumerate(loss_infos):
                 ratio_0 = loss_info[1][3].at[0,0].get().mean()
@@ -955,7 +992,7 @@ def make_train(config):
 
             metrics['avg_reward'] = [jnp.mean(tr.reward) for tr in traj_batch]
             metrics['avg_reward_flattened'] = [jnp.mean(tr.reward.flatten()) for tr in traj_batch]
-            metrics["traj_batch"] = traj_batch
+            metrics["traj_batch"] = callback_traj_batch
 
 
             if config["CALC_EVAL"]:
@@ -1050,15 +1087,30 @@ def make_train(config):
                 eval_runner_state, eval_traj_batch = jax.lax.scan(
                     _eval_step, eval_runner_state, None,  config["NUM_STEPS_EVAL"]
                 )
+                callback_eval_traj_batch = [
+                    transition._replace(
+                        info={
+                            "world": {
+                                key: value
+                                for key, value in transition.info["world"].items()
+                                if key not in callback_world_exclusions
+                            },
+                            "agent": transition.info["agent"],
+                        }
+                    )
+                    for transition in eval_traj_batch
+                ]
                 metrics['agents_eval'] = [jax.tree.map(
                     lambda x: x.reshape(
                         (config["NUM_STEPS_EVAL"], local_num_envs, config["NUM_AGENTS_PER_TYPE"][i])
                     ),
-                    trjbtch.info['agent']) for i, trjbtch in enumerate(eval_traj_batch)]
-                metrics['world_eval'] = [trjbtch.info['world'] for i, trjbtch in enumerate(eval_traj_batch)]
+                    trjbtch.info['agent']) for i, trjbtch in enumerate(callback_eval_traj_batch)]
+                metrics['world_eval'] = [
+                    trjbtch.info['world'] for trjbtch in callback_eval_traj_batch
+                ]
                 if config["CALC_EVAL"]:
-                    metrics['avg_reward_eval'] = [jnp.mean(tr.reward) for tr in eval_traj_batch]
-                    metrics["traj_batch_eval"] = eval_traj_batch
+                    metrics['avg_reward_eval'] = [jnp.mean(tr.reward) for tr in callback_eval_traj_batch]
+                    metrics["traj_batch_eval"] = callback_eval_traj_batch
 
             def callback(metric):
                 print("Update step:", metric["update_steps"])

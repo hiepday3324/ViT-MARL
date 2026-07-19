@@ -70,6 +70,7 @@ from gymnax_exchange.jaxen.StatesandParams import MultiAgentState, MultiAgentPar
 
 
 from gymnax_exchange.jaxob import JaxOrderBookArrays as job
+from gymnax_exchange.jaxob import jaxob_constants as cst
 from gymnax_exchange.jaxob.jaxob_config import MarketMaking_EnvironmentConfig
 from gymnax_exchange.jaxob.jaxob_config import Execution_EnvironmentConfig
 from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig
@@ -432,6 +433,12 @@ class MARLEnv(MultiAgentEnv):
             (state.world_state.ask_raw_orders, state.world_state.bid_raw_orders, trades_reinit),
              self.num_msgs_per_step
         )
+        trade_valid_mask = (
+            new_trades[:, cst.TradesFeat.PASS_OID.value] != cst.EMPTY_SLOT
+        )
+        trade_buffer_saturated = (
+            jnp.sum(trade_valid_mask.astype(jnp.int32)) == new_trades.shape[0]
+        )
 
         #print("--------------------------------")
         #print("end processing combined messages")
@@ -648,6 +655,11 @@ class MARLEnv(MultiAgentEnv):
             "average_best_bid":average_best_bid,
             "delta_time":new_world_state.delta_time,
             "current_step":new_world_state.step_counter,
+            # Transition-local execution evidence must survive the auto-reset
+            # wrapper, so it is emitted here rather than read from returned state.
+            "new_trades":new_trades,
+            "trade_valid_mask":trade_valid_mask,
+            "trade_buffer_saturated":trade_buffer_saturated,
         }
 
 

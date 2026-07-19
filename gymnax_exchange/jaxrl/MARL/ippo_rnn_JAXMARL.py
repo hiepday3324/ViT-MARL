@@ -117,7 +117,7 @@ class ReliabilityFusionRNN(nn.Module):
             hidden_dim=self.config.get("reliability_hidden_dim", self.config["FC_DIM_SIZE"]),
             gate_epsilon=self.config.get("reliability_gate_epsilon", 0.1),
         )
-        reliability_scores_t, filtered_tokens_t = reliability(
+        reliability_logits_t, reliability_scores_t, filtered_tokens_t = reliability(
             z_tokens=z_tokens_t,
             side_id=side_id_t,
             mid_context=mid_context_t,
@@ -160,7 +160,12 @@ class ReliabilityFusionRNN(nn.Module):
                 dtype=jnp.float32,
             ),
         }
-        return new_rnn_state, (y_t, reliability_scores_t, rvd_diag_t)
+        return new_rnn_state, (
+            y_t,
+            reliability_logits_t,
+            reliability_scores_t,
+            rvd_diag_t,
+        )
 
 # FIXME: APPLY VISION 
 class ActorCriticRNN(nn.Module):
@@ -185,12 +190,22 @@ class ActorCriticRNN(nn.Module):
 
             use_reliability_head = self.config.get("use_reliability_head", False)
             if use_reliability_head:
-                hidden, (embedding, reliability_scores, rvd_diag) = ReliabilityFusionRNN(config=self.config)(
+                hidden, (
+                    embedding,
+                    reliability_logits,
+                    reliability_scores,
+                    rvd_diag,
+                ) = ReliabilityFusionRNN(config=self.config)(
                     hidden,
                     (obs_exec, obs_exec_smoothed, z_tokens, mid_context, dones),
                 )
                 aux_info = {
+                    "reliability_logits": reliability_logits,
                     "reliability_scores": reliability_scores,
+                    "reliability_path_active": jnp.ones(
+                        reliability_scores.shape[:2],
+                        dtype=jnp.float32,
+                    ),
                     **rvd_diag,
                 }
             else:
@@ -205,7 +220,9 @@ class ActorCriticRNN(nn.Module):
 
                 hidden, embedding = ScannedRNN()(hidden, rnn_in)
                 aux_info = {
+                    "reliability_logits": jnp.zeros((*z_tokens.shape[:-1], 1), dtype=z_tokens.dtype),
                     "reliability_scores": jnp.zeros((*z_tokens.shape[:-1], 1), dtype=z_tokens.dtype),
+                    "reliability_path_active": jnp.zeros(z_tokens.shape[:2], dtype=jnp.float32),
                     "z_tokens_norm": jnp.linalg.norm(z_tokens, axis=-1),
                     "filtered_tokens_norm": jnp.linalg.norm(z_tokens, axis=-1),
                     "fusion_output_norm": jnp.linalg.norm(fused_obs, axis=-1),
@@ -237,7 +254,9 @@ class ActorCriticRNN(nn.Module):
             hidden, embedding = ScannedRNN()(hidden, rnn_in)
             zero_diag = jnp.zeros(embedding.shape[:-1], dtype=embedding.dtype)
             aux_info = {
+                "reliability_logits": jnp.zeros((*embedding.shape[:-1], 1, 1, 1), dtype=embedding.dtype),
                 "reliability_scores": jnp.zeros((*embedding.shape[:-1], 1, 1, 1), dtype=embedding.dtype),
+                "reliability_path_active": jnp.zeros(embedding.shape[:-1], dtype=jnp.float32),
                 "z_tokens_norm": zero_diag,
                 "filtered_tokens_norm": zero_diag,
                 "fusion_output_norm": zero_diag,
@@ -628,7 +647,7 @@ def make_train(config):
             survival_masks = []
             survival_raw_ratios = []
             survival_task_side_masks = []
-            survival_mid_diags = []
+            survival_target_diags = []
             if not hasattr(env.multi_agent_config.world_config, "tick_size"):
                 raise ValueError(
                     "Cannot build liquidity survival labels: "
@@ -640,6 +659,27 @@ def make_train(config):
                     "Cannot build liquidity survival labels: "
                     "env.multi_agent_config.world_config.tick_size is None."
                 )
+
+            def _zero_execution_target_diag(levels=10):
+                return {
+                    "valid_target_rate": jnp.array(0.0, dtype=jnp.float32),
+                    "trade_buffer_saturated_rate": jnp.array(0.0, dtype=jnp.float32),
+                    "q0_mean": jnp.array(0.0, dtype=jnp.float32),
+                    "q_tau_mean": jnp.array(0.0, dtype=jnp.float32),
+                    "cumulative_executed_mean": jnp.array(0.0, dtype=jnp.float32),
+                    "cancel_star_mean": jnp.array(0.0, dtype=jnp.float32),
+                    "target_mean": jnp.array(0.0, dtype=jnp.float32),
+                    "target_min": jnp.array(0.0, dtype=jnp.float32),
+                    "target_max": jnp.array(0.0, dtype=jnp.float32),
+                    "ask_target_mean": jnp.array(0.0, dtype=jnp.float32),
+                    "ask_target_min": jnp.array(0.0, dtype=jnp.float32),
+                    "ask_target_max": jnp.array(0.0, dtype=jnp.float32),
+                    "bid_target_mean": jnp.array(0.0, dtype=jnp.float32),
+                    "bid_target_min": jnp.array(0.0, dtype=jnp.float32),
+                    "bid_target_max": jnp.array(0.0, dtype=jnp.float32),
+                    "ask_key_t0_b0": jnp.zeros((levels,), dtype=jnp.float32),
+                    "bid_key_t0_b0": jnp.zeros((levels,), dtype=jnp.float32),
+                }
 
             def _broadcast_mid_prices(mid_prices, batch_size):
                 mid_prices = jnp.asarray(mid_prices, dtype=jnp.float32)
@@ -1279,7 +1319,7 @@ def make_train(config):
                         num_steps=config["NUM_STEPS"],
                         batch_size=traj_batch_padded[i].obs["vision_obs"].shape[1],
                     )
-                    surv_label, surv_mask = build_liquidity_survival_targets(
+                    surv_label, surv_mask, surv_target_diag = build_liquidity_survival_targets(
                         traj_batch_padded[i].obs["vision_obs"],
                         obs_mid_prices,
                         tick_size=tick_size,
@@ -1292,31 +1332,35 @@ def make_train(config):
                         ),
                         ask_raw_orders=obs_ask_raw_orders,
                         bid_raw_orders=obs_bid_raw_orders,
+                        new_trades=traj_batch_padded[i].info["world"]["new_trades"],
+                        trade_valid_mask=traj_batch_padded[i].info["world"]["trade_valid_mask"],
+                        trade_buffer_saturated=traj_batch_padded[i].info["world"]["trade_buffer_saturated"],
                         num_steps=config["NUM_STEPS"],
-                        episode_done=traj_batch_padded[i].info["agent"]["done"],
+                        episode_done=traj_batch_padded[i].global_done,
+                        return_diagnostics=True,
                         eps=config.get("survival_eps", 1e-8),
                     )
-                    surv_raw_ratio, surv_task_side, surv_mid_diag = _build_survival_diag_components(
-                        traj_batch_padded[i].obs["vision_obs"],
-                        obs_mid_prices,
-                        is_sell_task,
-                        reference_mid_prices=end_mid_prices,
-                        surv_mask=surv_mask,
-                        ask_raw_orders=obs_ask_raw_orders,
-                        bid_raw_orders=obs_bid_raw_orders,
+                    task_side = jnp.stack(
+                        [is_sell_task, 1.0 - is_sell_task],
+                        axis=-1,
                     )
+                    surv_task_side = jnp.broadcast_to(
+                        task_side[:, :, None, :],
+                        surv_label.shape,
+                    )
+                    surv_raw_ratio = surv_label
                 else:
                     reward_shape = traj_batch_padded[i].reward.shape
                     surv_label = jnp.zeros((config["NUM_STEPS"], reward_shape[1], 10, 2), dtype=jnp.float32)
                     surv_mask = jnp.zeros_like(surv_label)
                     surv_raw_ratio = jnp.zeros_like(surv_label)
                     surv_task_side = jnp.zeros_like(surv_label)
-                    surv_mid_diag = _zero_mid_diag()
+                    surv_target_diag = _zero_execution_target_diag(surv_label.shape[2])
                 survival_labels.append(surv_label)
                 survival_masks.append(surv_mask)
                 survival_raw_ratios.append(surv_raw_ratio)
                 survival_task_side_masks.append(surv_task_side)
-                survival_mid_diags.append(surv_mid_diag)
+                survival_target_diags.append(surv_target_diag)
 
             # ==========================================================
             # [PHASE 3]: CƯA ĐUÔI DATA VÀ KHÔI PHỤC DÒNG THỜI GIAN
@@ -1456,8 +1500,11 @@ def make_train(config):
                             ppo_loss = loss_actor + weighted_value_loss + weighted_entropy_term
 
                             reliability_scores = aux_info["reliability_scores"]
+                            reliability_logits = aux_info["reliability_logits"]
                             if reliability_scores.ndim == 4:
                                 reliability_scores = reliability_scores[..., None]
+                            if reliability_logits.ndim == 4:
+                                reliability_logits = reliability_logits[..., None]
 
                             reliability_mean = jnp.mean(reliability_scores)
                             reliability_std = jnp.std(reliability_scores)
@@ -1559,6 +1606,7 @@ def make_train(config):
                                     surv_mask,
                                     loss_type=config.get("reliability_loss_type", "bce"),
                                     eps=config.get("survival_eps", 1e-8),
+                                    reliability_logits=reliability_logits,
                                 )
                                 lambda_surv = config.get("lambda_surv", 0.0)
                                 survival_mask_ratio = jnp.mean(surv_mask.astype(jnp.float32))
@@ -1749,14 +1797,35 @@ def make_train(config):
                     reliability_alignment_diags.append(_zero_reliability_alignment_diag())
 
 
+            callback_world_exclusions = {
+                "new_trades",
+                "trade_valid_mask",
+                "obs_ask_raw_orders",
+                "obs_bid_raw_orders",
+            }
+            callback_traj_batch = [
+                transition._replace(
+                    info={
+                        "world": {
+                            key: value
+                            for key, value in transition.info["world"].items()
+                            if key not in callback_world_exclusions
+                        },
+                        "agent": transition.info["agent"],
+                    }
+                )
+                for transition in traj_batch
+            ]
             metrics= {}
             metrics['agents'] = [jax.tree.map(
                 lambda x: x.reshape(
                     (config["NUM_STEPS"], config["NUM_ENVS"], config["NUM_AGENTS_PER_TYPE"][i])
                 ),
                 trjbtch.info['agent']) for i, trjbtch in enumerate(traj_batch)]
-            metrics['world'] = [traj_batch.info['world'] for i, traj_batch in enumerate(traj_batch)]
-            metrics["survival_mid_diag"] = survival_mid_diags
+            metrics['world'] = [
+                transition.info['world'] for transition in callback_traj_batch
+            ]
+            metrics["execution_target_diag"] = survival_target_diags
             metrics["reliability_alignment_diag"] = reliability_alignment_diags
             metrics["loss"]=[]
             for i,loss_info in enumerate(loss_infos):
@@ -1846,7 +1915,7 @@ def make_train(config):
 
             metrics['avg_reward'] = [jnp.mean(tr.reward) for tr in traj_batch]
             metrics['avg_reward_flattened'] = [jnp.mean(tr.reward.flatten()) for tr in traj_batch]
-            metrics["traj_batch"] = traj_batch
+            metrics["traj_batch"] = callback_traj_batch
 
 
             if config["CALC_EVAL"]:
@@ -1941,15 +2010,30 @@ def make_train(config):
                 eval_runner_state, eval_traj_batch = jax.lax.scan(
                     _eval_step, eval_runner_state, None,  config["NUM_STEPS_EVAL"]
                 )
+                callback_eval_traj_batch = [
+                    transition._replace(
+                        info={
+                            "world": {
+                                key: value
+                                for key, value in transition.info["world"].items()
+                                if key not in callback_world_exclusions
+                            },
+                            "agent": transition.info["agent"],
+                        }
+                    )
+                    for transition in eval_traj_batch
+                ]
                 metrics['agents_eval'] = [jax.tree.map(
                     lambda x: x.reshape(
                         (config["NUM_STEPS_EVAL"], config["NUM_ENVS"], config["NUM_AGENTS_PER_TYPE"][i])
                     ),
-                    trjbtch.info['agent']) for i, trjbtch in enumerate(eval_traj_batch)]
-                metrics['world_eval'] = [trjbtch.info['world'] for i, trjbtch in enumerate(eval_traj_batch)]
+                    trjbtch.info['agent']) for i, trjbtch in enumerate(callback_eval_traj_batch)]
+                metrics['world_eval'] = [
+                    trjbtch.info['world'] for trjbtch in callback_eval_traj_batch
+                ]
                 if config["CALC_EVAL"]:
-                    metrics['avg_reward_eval'] = [jnp.mean(tr.reward) for tr in eval_traj_batch]
-                    metrics["traj_batch_eval"] = eval_traj_batch
+                    metrics['avg_reward_eval'] = [jnp.mean(tr.reward) for tr in callback_eval_traj_batch]
+                    metrics["traj_batch_eval"] = callback_eval_traj_batch
 
             def callback(metric):
                 update_idx = int(metric["update_steps"])
@@ -2079,6 +2163,39 @@ def make_train(config):
                     ]))
                 else:
                     print(f"RVD_DIAG update={update_idx} status=no_execution_loss_metrics")
+
+                if exe_agent_index is not None and "execution_target_diag" in metric:
+                    target_diag = metric["execution_target_diag"][exe_agent_index]
+
+                    def _target_diag_value(key, default=0.0):
+                        if key in target_diag:
+                            return float(np.nanmean(np.array(target_diag[key])))
+                        return float(default)
+
+                    print("[EXECUTION-AWARE RELIABILITY TARGET]")
+                    print(" ".join([
+                        "EXEC_AWARE_TARGET_DIAG",
+                        f"update={update_idx}",
+                        f"valid_target_rate={_target_diag_value('valid_target_rate'):.6g}",
+                        f"trade_buffer_saturated_rate={_target_diag_value('trade_buffer_saturated_rate'):.6g}",
+                        f"q0_mean={_target_diag_value('q0_mean'):.6g}",
+                        f"q_tau_mean={_target_diag_value('q_tau_mean'):.6g}",
+                        f"cumulative_executed_mean={_target_diag_value('cumulative_executed_mean'):.6g}",
+                        f"cancel_star_mean={_target_diag_value('cancel_star_mean'):.6g}",
+                        f"target_mean={_target_diag_value('target_mean'):.6g}",
+                        f"target_min={_target_diag_value('target_min'):.6g}",
+                        f"target_max={_target_diag_value('target_max'):.6g}",
+                    ]))
+                    print(" ".join([
+                        "EXEC_AWARE_TARGET_SIDE_DIAG",
+                        f"update={update_idx}",
+                        f"ask_mean={_target_diag_value('ask_target_mean'):.6g}",
+                        f"ask_min={_target_diag_value('ask_target_min'):.6g}",
+                        f"ask_max={_target_diag_value('ask_target_max'):.6g}",
+                        f"bid_mean={_target_diag_value('bid_target_mean'):.6g}",
+                        f"bid_min={_target_diag_value('bid_target_min'):.6g}",
+                        f"bid_max={_target_diag_value('bid_target_max'):.6g}",
+                    ]))
 
                 if exe_agent_index is not None and "survival_mid_diag" in metric:
                     exe_mid_diag = metric["survival_mid_diag"][exe_agent_index]
@@ -2310,8 +2427,8 @@ def make_train(config):
                         f"shape={_shape_text('mask')} "
                         f"shape_ok={bool(_rel_value('mask_shape_ok') >= 0.5)}"
                     )
-                    if exe_agent_index is not None and "survival_mid_diag" in metric:
-                        exe_mid_diag_for_rel = metric["survival_mid_diag"][exe_agent_index]
+                    if exe_agent_index is not None and "execution_target_diag" in metric:
+                        exe_mid_diag_for_rel = metric["execution_target_diag"][exe_agent_index]
 
                         def _rel_mid_values(key):
                             if key in exe_mid_diag_for_rel:

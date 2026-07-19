@@ -46,7 +46,7 @@ class LevelWiseReliabilityHead(nn.Module):
 
     @nn.compact
     def __call__(self, *, z_tokens, side_id, mid_context, h_prev):
-        """Return reliability scores and reliability-filtered vision tokens.
+        """Return logits, reliability scores, and filtered vision tokens.
 
         Args:
             z_tokens: Side-aware level-wise tokens shaped
@@ -140,14 +140,17 @@ class LevelWiseReliabilityHead(nn.Module):
         x = jnp.concatenate([z_proj, side_proj, mid_proj, h_proj], axis=-1)
         x = nn.relu(nn.Dense(self.hidden_dim, name="mlp_l1")(x))
         x = nn.relu(nn.Dense(self.hidden_dim, name="mlp_l2")(x))
-        reliability_scores = nn.sigmoid(nn.Dense(1, name="score")(x))
+        reliability_logits = nn.Dense(1, name="score")(x)
+        reliability_scores = nn.sigmoid(reliability_logits)
         gate_epsilon = min(max(float(self.gate_epsilon), 0.0), 1.0)
         gate = gate_epsilon + (1.0 - gate_epsilon) * reliability_scores
         filtered_tokens = gate * z_tokens
         if squeeze_legacy_side:
+            reliability_logits = jnp.squeeze(reliability_logits, axis=-2)
             reliability_scores = jnp.squeeze(reliability_scores, axis=-2)
             filtered_tokens = jnp.squeeze(filtered_tokens, axis=-2)
         if squeeze_time:
+            reliability_logits = jnp.squeeze(reliability_logits, axis=0)
             reliability_scores = jnp.squeeze(reliability_scores, axis=0)
             filtered_tokens = jnp.squeeze(filtered_tokens, axis=0)
-        return reliability_scores, filtered_tokens
+        return reliability_logits, reliability_scores, filtered_tokens

@@ -3,6 +3,7 @@ import inspect
 
 import jax
 import jax.numpy as jnp
+import optax
 import os
 import sys
 from flax.traverse_util import flatten_dict
@@ -18,6 +19,7 @@ from gymnax_exchange.networks.reliability_head import (
     select_h_prev_for_reliability,
 )
 from gymnax_exchange.networks.vision_agent import VisionAgent, supervised_contrastive_loss
+from gymnax_exchange.jaxrl.MARL.reliability_targets import masked_reliability_loss
 
 
 class VisionPipelineShapeTest(unittest.TestCase):
@@ -74,13 +76,14 @@ class VisionPipelineShapeTest(unittest.TestCase):
         self.assertFalse(any("shift_proj" in name for name in param_names))
         self.assertTrue(any("side_proj" in name for name in param_names))
         self.assertTrue(any("mid_proj" in name for name in param_names))
-        reliability_scores, filtered_tokens = reliability.apply(
+        reliability_logits, reliability_scores, filtered_tokens = reliability.apply(
             reliability_params,
             z_tokens=tokens,
             side_id=side_id,
             mid_context=mid_context,
             h_prev=h_prev,
         )
+        self.assertEqual(reliability_logits.shape, (time_steps, batch_size, 10, 2, 1))
         self.assertEqual(reliability_scores.shape, (time_steps, batch_size, 10, 2, 1))
         self.assertEqual(filtered_tokens.shape, tokens.shape)
         self.assertTrue(bool(jnp.all(reliability_scores >= 0.0)))
@@ -89,13 +92,14 @@ class VisionPipelineShapeTest(unittest.TestCase):
         filtered_fused = fusion.apply(fusion_params, smoothed, filtered_tokens)
         self.assertEqual(filtered_fused.shape, (time_steps, batch_size, embed_dim // 2))
 
-        single_scores, single_filtered = reliability.apply(
+        single_logits, single_scores, single_filtered = reliability.apply(
             reliability_params,
             z_tokens=tokens[0],
             side_id=side_id[0],
             mid_context=mid_context[0],
             h_prev=h_prev,
         )
+        self.assertEqual(single_logits.shape, (batch_size, 10, 2, 1))
         self.assertEqual(single_scores.shape, (batch_size, 10, 2, 1))
         self.assertEqual(single_filtered.shape, tokens[0].shape)
         single_fused = fusion.apply(fusion_params, smoothed[0], single_filtered)
@@ -126,7 +130,7 @@ class VisionPipelineShapeTest(unittest.TestCase):
             mid_context=mid_context,
             h_prev=h_prev,
         )
-        scores, filtered = reliability.apply(
+        logits, scores, filtered = reliability.apply(
             params,
             z_tokens=z_tokens,
             side_id=side_id,
@@ -134,6 +138,7 @@ class VisionPipelineShapeTest(unittest.TestCase):
             h_prev=h_prev,
         )
 
+        self.assertEqual(logits.shape, (time_steps, batch_size, n_levels, n_sides, 1))
         self.assertEqual(scores.shape, (time_steps, batch_size, n_levels, n_sides, 1))
         self.assertEqual(filtered.shape, z_tokens.shape)
 
@@ -183,7 +188,7 @@ class VisionPipelineShapeTest(unittest.TestCase):
             mid_context=mid_context,
             h_prev=selected,
         )
-        scores, filtered = reliability.apply(
+        logits, scores, filtered = reliability.apply(
             params,
             z_tokens=z_tokens,
             side_id=side_id,
@@ -191,8 +196,136 @@ class VisionPipelineShapeTest(unittest.TestCase):
             h_prev=selected,
         )
 
+        self.assertEqual(logits.shape, (time_steps, batch_size, n_levels, n_sides, 1))
         self.assertEqual(scores.shape, (time_steps, batch_size, n_levels, n_sides, 1))
         self.assertEqual(filtered.shape, z_tokens.shape)
+
+    def test_actor_reliability_enabled_and_disabled_paths(self):
+        from gymnax.environments import spaces
+        from gymnax_exchange.jaxrl.MARL.ippo_rnn_JAXMARL import (
+            ActorCriticRNN,
+            ScannedRNN,
+        )
+
+        time_steps = 2
+        batch_size = 2
+        hidden_dim = 16
+        obs = {
+            "exec_obs": jnp.ones((time_steps, batch_size, 28), dtype=jnp.float32),
+            "vision_obs": jnp.ones((time_steps, batch_size, 10, 3, 2), dtype=jnp.float32),
+            "mid_context": jnp.ones((time_steps, batch_size, 4), dtype=jnp.float32),
+        }
+        done = jnp.zeros((time_steps, batch_size), dtype=jnp.bool_)
+        hidden = ScannedRNN.initialize_carry(batch_size, hidden_dim)
+        action_space = spaces.Discrete(3)
+
+        def init_and_apply(use_reliability_head):
+            config = {
+                "FC_DIM_SIZE": hidden_dim,
+                "GRU_HIDDEN_DIM": hidden_dim,
+                "use_reliability_head": use_reliability_head,
+                "use_h_prev_in_reliability": True,
+                "reliability_hidden_dim": hidden_dim,
+                "reliability_gate_epsilon": 0.1,
+            }
+            model = ActorCriticRNN(action_space, config=config)
+            variables = model.init(
+                jax.random.PRNGKey(int(use_reliability_head) + 10),
+                hidden,
+                (obs, done),
+            )
+            outputs = model.apply(variables, hidden, (obs, done))
+            return variables, outputs[-1]
+
+        enabled_variables, enabled_aux = init_and_apply(True)
+        enabled_paths = [
+            "/".join(key)
+            for key in flatten_dict(enabled_variables["params"]).keys()
+        ]
+        self.assertTrue(any("LevelWiseReliabilityHead" in path for path in enabled_paths))
+        self.assertFalse(bool(jnp.all(enabled_aux["reliability_scores"] == 0.0)))
+        self.assertTrue(bool(jnp.all(enabled_aux["reliability_path_active"] == 1.0)))
+
+        disabled_variables, disabled_aux = init_and_apply(False)
+        disabled_paths = [
+            "/".join(key)
+            for key in flatten_dict(disabled_variables["params"]).keys()
+        ]
+        self.assertFalse(any("LevelWiseReliabilityHead" in path for path in disabled_paths))
+        self.assertTrue(bool(jnp.all(disabled_aux["reliability_scores"] == 0.0)))
+        self.assertTrue(bool(jnp.all(disabled_aux["reliability_path_active"] == 0.0)))
+
+    def test_fixed_batch_reliability_gradient_update_and_overfit(self):
+        rng = jax.random.PRNGKey(20)
+        time_steps = 2
+        batch_size = 3
+        n_levels = 4
+        n_sides = 2
+        embed_dim = 16
+        rng, token_rng, context_rng = jax.random.split(rng, 3)
+        z_tokens = jax.random.normal(
+            token_rng,
+            (time_steps, batch_size, n_levels, n_sides, embed_dim),
+        )
+        side_id = build_side_id_from_tokens(z_tokens)
+        mid_context = jax.random.normal(
+            context_rng,
+            (time_steps, batch_size, 4),
+        )
+        h_prev = jnp.zeros((batch_size, embed_dim), dtype=jnp.float32)
+        labels = (
+            jnp.arange(time_steps * batch_size * n_levels * n_sides)
+            .reshape(time_steps, batch_size, n_levels, n_sides)
+            % 3
+            == 0
+        ).astype(jnp.float32)
+        mask = jnp.ones_like(labels)
+        reliability = LevelWiseReliabilityHead(hidden_dim=16)
+        variables = reliability.init(
+            rng,
+            z_tokens=z_tokens,
+            side_id=side_id,
+            mid_context=mid_context,
+            h_prev=h_prev,
+        )
+
+        def loss_fn(params):
+            logits, scores, _filtered = reliability.apply(
+                {"params": params},
+                z_tokens=z_tokens,
+                side_id=side_id,
+                mid_context=mid_context,
+                h_prev=h_prev,
+            )
+            return masked_reliability_loss(
+                scores,
+                labels,
+                mask,
+                loss_type="bce",
+                reliability_logits=logits,
+            )
+
+        params = variables["params"]
+        initial_loss, grads = jax.value_and_grad(loss_fn)(params)
+        grad_norm = optax.global_norm(grads)
+        self.assertGreater(float(grad_norm), 0.0)
+
+        tx = optax.adam(1e-2)
+        opt_state = tx.init(params)
+        updates, opt_state = tx.update(grads, opt_state, params)
+        updated_params = optax.apply_updates(params, updates)
+        update_norm = optax.global_norm(
+            jax.tree_util.tree_map(lambda new, old: new - old, updated_params, params)
+        )
+        self.assertGreater(float(update_norm), 0.0)
+
+        params = updated_params
+        for _ in range(19):
+            loss, grads = jax.value_and_grad(loss_fn)(params)
+            updates, opt_state = tx.update(grads, opt_state, params)
+            params = optax.apply_updates(params, updates)
+        final_loss = loss_fn(params)
+        self.assertLess(float(final_loss), float(initial_loss))
 
 
 if __name__ == "__main__":
