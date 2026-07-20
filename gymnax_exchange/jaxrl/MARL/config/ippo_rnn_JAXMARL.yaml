@@ -15,8 +15,6 @@
 "lambda_surv": 0.0
 "survival_delta_steps": 10
 "survival_min_volume": 1.0
-"survival_ratio": 0.5
-"survival_fullbook_match_mode": "same_side"
 "TOTAL_TIMESTEPS": 5e7
 "UPDATE_EPOCHS": 4
 "NUM_MINIBATCHES": 16

@@ -68,6 +68,7 @@ from gymnax_exchange.networks.reliability_head import (
 from gymnax_exchange.networks.vision_agent import VisionAgent
 from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     build_liquidity_survival_targets,
+    empty_liquidity_survival_diagnostics,
     masked_reliability_loss,
 )
 import wandb
@@ -630,6 +631,7 @@ def make_train(config):
             # ==========================================================
             survival_labels = []
             survival_masks = []
+            survival_target_diags = []
             if not hasattr(env.multi_agent_config.world_config, "tick_size"):
                 raise ValueError(
                     "Cannot build liquidity survival labels: "
@@ -652,17 +654,12 @@ def make_train(config):
                     and isinstance(traj_batch_padded[i].obs, dict)
                     and "vision_obs" in traj_batch_padded[i].obs
                 ):
-                    surv_label, surv_mask = build_liquidity_survival_targets(
+                    surv_label, surv_mask, surv_target_diag = build_liquidity_survival_targets(
                         traj_batch_padded[i].obs["vision_obs"],
                         mid_prices,
                         tick_size=tick_size,
                         survival_delta_steps=survival_delta_steps,
                         survival_min_volume=config.get("survival_min_volume", 1.0),
-                        survival_ratio=config.get("survival_gamma", 0.5),
-                        survival_availability_temperature=config.get(
-                            "survival_availability_temperature",
-                            0.15,
-                        ),
                         ask_raw_orders=obs_ask_raw_orders,
                         bid_raw_orders=obs_bid_raw_orders,
                         new_trades=traj_batch_padded[i].info["world"]["new_trades"],
@@ -670,14 +667,19 @@ def make_train(config):
                         trade_buffer_saturated=traj_batch_padded[i].info["world"]["trade_buffer_saturated"],
                         num_steps=config["NUM_STEPS"],
                         episode_done=traj_batch_padded[i].global_done,
+                        return_diagnostics=True,
                         eps=config.get("survival_eps", 1e-8),
                     )
                 else:
                     reward_shape = traj_batch_padded[i].reward.shape
                     surv_label = jnp.zeros((config["NUM_STEPS"], reward_shape[1], 10, 2), dtype=jnp.float32)
                     surv_mask = jnp.zeros_like(surv_label)
+                    surv_target_diag = empty_liquidity_survival_diagnostics(
+                        surv_label.shape[2]
+                    )
                 survival_labels.append(surv_label)
                 survival_masks.append(surv_mask)
+                survival_target_diags.append(surv_target_diag)
 
             # ==========================================================
             # [PHASE 3]: CƯA ĐUÔI DATA VÀ KHÔI PHỤC DÒNG THỜI GIAN
@@ -962,6 +964,7 @@ def make_train(config):
             metrics['world'] = [
                 transition.info['world'] for transition in callback_traj_batch
             ]
+            metrics["execution_target_diag"] = survival_target_diags
             metrics["loss"]=[]
             for i,loss_info in enumerate(loss_infos):
                 ratio_0 = loss_info[1][3].at[0,0].get().mean()
@@ -1258,6 +1261,108 @@ def make_train(config):
                     jax.block_until_ready((runner_state,updates,metrics))
                     jax.profiler.stop_trace()
             print(f"Update step {updates} completed with metrics {metrics['avg_reward']}")
+            execution_agent_index = next(
+                (
+                    idx
+                    for idx, agent_config in enumerate(env.list_of_agents_configs)
+                    if _is_execution_agent(agent_config)
+                ),
+                None,
+            )
+            if execution_agent_index is not None:
+                target_diag = metrics["execution_target_diag"][execution_agent_index]
+
+                def _device_diag_values(key):
+                    return np.asarray(
+                        jax.device_get(target_diag[key]),
+                        dtype=np.float64,
+                    ).reshape(-1)
+
+                valid_counts = _device_diag_values("valid_target_count")
+                ask_counts = _device_diag_values("ask_valid_count")
+                bid_counts = _device_diag_values("bid_valid_count")
+
+                def _device_mean(key):
+                    return float(np.mean(_device_diag_values(key)))
+
+                def _device_sum(key):
+                    return float(np.sum(_device_diag_values(key)))
+
+                def _weighted_device_mean(key, counts=valid_counts):
+                    values = _device_diag_values(key)
+                    denominator = np.sum(counts)
+                    if denominator <= 0:
+                        return 0.0
+                    return float(np.sum(values * counts) / denominator)
+
+                def _pooled_device_std(mean_key, std_key, counts):
+                    means = _device_diag_values(mean_key)
+                    stds = _device_diag_values(std_key)
+                    denominator = np.sum(counts)
+                    if denominator <= 0:
+                        return 0.0
+                    global_mean = np.sum(means * counts) / denominator
+                    variance = np.sum(
+                        counts * (np.square(stds) + np.square(means - global_mean))
+                    ) / denominator
+                    return float(np.sqrt(max(variance, 0.0)))
+
+                def _device_extreme(key, counts, reducer):
+                    values = _device_diag_values(key)
+                    valid_devices = counts > 0
+                    if not np.any(valid_devices):
+                        return 0.0
+                    return float(reducer(values[valid_devices]))
+
+                target_mean = _weighted_device_mean("target_mean")
+                target_std = _pooled_device_std(
+                    "target_mean",
+                    "target_std",
+                    valid_counts,
+                )
+                ask_mean = _weighted_device_mean("ask_target_mean", ask_counts)
+                ask_std = _pooled_device_std(
+                    "ask_target_mean",
+                    "ask_target_std",
+                    ask_counts,
+                )
+                bid_mean = _weighted_device_mean("bid_target_mean", bid_counts)
+                bid_std = _pooled_device_std(
+                    "bid_target_mean",
+                    "bid_target_std",
+                    bid_counts,
+                )
+
+                print(" ".join([
+                    "EXEC_AWARE_TARGET_DIAG",
+                    f"update={int(np.asarray(jax.device_get(updates)))}",
+                    f"valid_target_count={_device_sum('valid_target_count'):.0f}",
+                    f"valid_target_rate={_device_mean('valid_target_rate'):.6g}",
+                    f"done_masked_rate={_device_mean('done_masked_rate'):.6g}",
+                    f"trade_buffer_saturated_rate={_device_mean('trade_buffer_saturated_rate'):.6g}",
+                    f"q0_mean={_weighted_device_mean('q0_mean'):.6g}",
+                    f"q_tau_mean={_weighted_device_mean('q_tau_mean'):.6g}",
+                    f"cumulative_executed_mean={_weighted_device_mean('cumulative_executed_mean'):.6g}",
+                    f"cancel_star_mean={_weighted_device_mean('cancel_star_mean'):.6g}",
+                    f"target_mean={target_mean:.6g}",
+                    f"target_std={target_std:.6g}",
+                    f"target_min={_device_extreme('target_min', valid_counts, np.min):.6g}",
+                    f"target_max={_device_extreme('target_max', valid_counts, np.max):.6g}",
+                ]))
+                print(" ".join([
+                    "EXEC_AWARE_TARGET_SIDE_DIAG",
+                    f"update={int(np.asarray(jax.device_get(updates)))}",
+                    f"ask_valid_count={_device_sum('ask_valid_count'):.0f}",
+                    f"ask_mean={ask_mean:.6g}",
+                    f"ask_std={ask_std:.6g}",
+                    f"ask_min={_device_extreme('ask_target_min', ask_counts, np.min):.6g}",
+                    f"ask_max={_device_extreme('ask_target_max', ask_counts, np.max):.6g}",
+                    f"bid_valid_count={_device_sum('bid_valid_count'):.0f}",
+                    f"bid_mean={bid_mean:.6g}",
+                    f"bid_std={bid_std:.6g}",
+                    f"bid_min={_device_extreme('bid_target_min', bid_counts, np.min):.6g}",
+                    f"bid_max={_device_extreme('bid_target_max', bid_counts, np.max):.6g}",
+                ]))
             if checkpoint_manager is not None:
                 if config["CALC_EVAL"]:
                     ckpt = {

@@ -338,6 +338,68 @@ def _safe_masked_extreme(values, mask, *, mode):
     return jnp.where(has_values, extreme, 0.0)
 
 
+def _safe_masked_mean_over_axes(values, mask, *, axes, eps):
+    values = jnp.asarray(values, dtype=jnp.float32)
+    mask = jnp.asarray(mask, dtype=jnp.float32)
+    numerator = jnp.sum(jnp.where(mask > 0, values, 0.0), axis=axes)
+    denominator = jnp.sum(mask, axis=axes)
+    return numerator / jnp.maximum(denominator, eps)
+
+
+def empty_liquidity_survival_diagnostics(num_levels=10):
+    """Return the canonical empty diagnostic tree for a disabled target path."""
+    scalar_keys = (
+        "valid_target_count",
+        "valid_target_rate",
+        "done_masked_rate",
+        "trade_buffer_saturated_rate",
+        "q0_mean",
+        "q0_min",
+        "q0_max",
+        "q_tau_mean",
+        "cumulative_executed_mean",
+        "cancel_star_mean",
+        "net_missing_liquidity_mean",
+        "target_mean",
+        "target_std",
+        "target_min",
+        "target_max",
+        "ask_valid_count",
+        "bid_valid_count",
+        "ask_target_mean",
+        "ask_target_std",
+        "ask_target_min",
+        "ask_target_max",
+        "bid_target_mean",
+        "bid_target_std",
+        "bid_target_min",
+        "bid_target_max",
+    )
+    level_keys = (
+        "target_level_mean_ask",
+        "target_level_mean_bid",
+        "q0_level_mean_ask",
+        "q0_level_mean_bid",
+        "q_tau_level_mean_ask",
+        "q_tau_level_mean_bid",
+        "cumulative_executed_level_mean_ask",
+        "cumulative_executed_level_mean_bid",
+        "cancel_star_level_mean_ask",
+        "cancel_star_level_mean_bid",
+        "ask_key_t0_b0",
+        "bid_key_t0_b0",
+    )
+    diagnostics = {
+        key: jnp.array(0.0, dtype=jnp.float32)
+        for key in scalar_keys
+    }
+    diagnostics.update({
+        key: jnp.zeros((num_levels,), dtype=jnp.float32)
+        for key in level_keys
+    })
+    return diagnostics
+
+
 def build_liquidity_survival_targets(
     vision_obs,
     mid_prices,
@@ -345,10 +407,8 @@ def build_liquidity_survival_targets(
     tick_size,
     survival_delta_steps,
     survival_min_volume,
-    survival_ratio,
     num_steps,
     episode_done=None,
-    survival_availability_temperature=0.15,
     ask_raw_orders=None,
     bid_raw_orders=None,
     new_trades=None,
@@ -574,16 +634,43 @@ def build_liquidity_survival_targets(
     target = jnp.where(target_finite, target, 0.0).astype(jnp.float32)
     side_mask = side_mask.astype(jnp.float32)
 
-    # These legacy tuning arguments remain accepted so existing CLI/config files
-    # do not break, but the execution-aware target does not use them.
-    del survival_ratio, survival_availability_temperature
-
     if not return_diagnostics:
         return target, side_mask
 
     valid_mask = side_mask > 0
     ask_mask = valid_mask[..., 0]
     bid_mask = valid_mask[..., 1]
+    horizon_mask = jnp.broadcast_to(valid_mask[None, ...], q_tau_values.shape)
+    target_level_mean = _safe_masked_mean_over_axes(
+        target,
+        valid_mask,
+        axes=(0, 1),
+        eps=eps,
+    )
+    q0_level_mean = _safe_masked_mean_over_axes(
+        q0,
+        valid_mask,
+        axes=(0, 1),
+        eps=eps,
+    )
+    q_tau_level_mean = _safe_masked_mean_over_axes(
+        q_tau_values,
+        horizon_mask,
+        axes=(0, 1, 2),
+        eps=eps,
+    )
+    cumulative_executed_level_mean = _safe_masked_mean_over_axes(
+        cumulative_execution_values,
+        horizon_mask,
+        axes=(0, 1, 2),
+        eps=eps,
+    )
+    cancel_star_level_mean = _safe_masked_mean_over_axes(
+        cancel_star_values,
+        horizon_mask,
+        axes=(0, 1, 2),
+        eps=eps,
+    )
     target_diag = {
         "valid_target_count": jnp.sum(side_mask),
         "valid_target_rate": jnp.mean(side_mask),
@@ -596,22 +683,22 @@ def build_liquidity_survival_targets(
         "q0_max": _safe_masked_extreme(q0, valid_mask, mode="max"),
         "q_tau_mean": _safe_masked_mean(
             q_tau_values,
-            jnp.broadcast_to(valid_mask[None, ...], q_tau_values.shape),
+            horizon_mask,
             eps,
         ),
         "cumulative_executed_mean": _safe_masked_mean(
             cumulative_execution_values,
-            jnp.broadcast_to(valid_mask[None, ...], cumulative_execution_values.shape),
+            horizon_mask,
             eps,
         ),
         "cancel_star_mean": _safe_masked_mean(
             cancel_star_values,
-            jnp.broadcast_to(valid_mask[None, ...], cancel_star_values.shape),
+            horizon_mask,
             eps,
         ),
         "net_missing_liquidity_mean": _safe_masked_mean(
             cancel_star_values,
-            jnp.broadcast_to(valid_mask[None, ...], cancel_star_values.shape),
+            horizon_mask,
             eps,
         ),
         "target_mean": _safe_masked_mean(target, valid_mask, eps),
@@ -621,11 +708,25 @@ def build_liquidity_survival_targets(
         "ask_valid_count": jnp.sum(ask_mask.astype(jnp.float32)),
         "bid_valid_count": jnp.sum(bid_mask.astype(jnp.float32)),
         "ask_target_mean": _safe_masked_mean(target[..., 0], ask_mask, eps),
+        "ask_target_std": _safe_masked_std(target[..., 0], ask_mask, eps),
         "ask_target_min": _safe_masked_extreme(target[..., 0], ask_mask, mode="min"),
         "ask_target_max": _safe_masked_extreme(target[..., 0], ask_mask, mode="max"),
         "bid_target_mean": _safe_masked_mean(target[..., 1], bid_mask, eps),
+        "bid_target_std": _safe_masked_std(target[..., 1], bid_mask, eps),
         "bid_target_min": _safe_masked_extreme(target[..., 1], bid_mask, mode="min"),
         "bid_target_max": _safe_masked_extreme(target[..., 1], bid_mask, mode="max"),
+        # These arrays aggregate by current token rank for diagnostics only.
+        # Absolute price and side remain the target matching keys.
+        "target_level_mean_ask": target_level_mean[..., 0],
+        "target_level_mean_bid": target_level_mean[..., 1],
+        "q0_level_mean_ask": q0_level_mean[..., 0],
+        "q0_level_mean_bid": q0_level_mean[..., 1],
+        "q_tau_level_mean_ask": q_tau_level_mean[..., 0],
+        "q_tau_level_mean_bid": q_tau_level_mean[..., 1],
+        "cumulative_executed_level_mean_ask": cumulative_executed_level_mean[..., 0],
+        "cumulative_executed_level_mean_bid": cumulative_executed_level_mean[..., 1],
+        "cancel_star_level_mean_ask": cancel_star_level_mean[..., 0],
+        "cancel_star_level_mean_bid": cancel_star_level_mean[..., 1],
         "ask_key_t0_b0": ask_key[0, 0],
         "bid_key_t0_b0": bid_key[0, 0],
     }

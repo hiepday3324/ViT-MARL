@@ -133,8 +133,6 @@ class ReliabilityTargetTest(unittest.TestCase):
             tick_size=self.tick_size,
             survival_delta_steps=case["delta"],
             survival_min_volume=1.0,
-            survival_ratio=0.5,
-            survival_availability_temperature=0.15,
             num_steps=1,
             episode_done=case["done"],
             ask_raw_orders=case["ask_orders"],
@@ -152,6 +150,8 @@ class ReliabilityTargetTest(unittest.TestCase):
 
         labels, mask = self._build_targets(case)
 
+        self.assertEqual(labels.shape, (1, 1, 1, 2))
+        self.assertEqual(mask.shape, (1, 1, 1, 2))
         self.assertTrue(bool(jnp.all(mask == 1.0)))
         self.assertTrue(bool(jnp.allclose(labels, 1.0)))
 
@@ -173,6 +173,23 @@ class ReliabilityTargetTest(unittest.TestCase):
                 self.assertEqual(float(mask[0, 0, 0, side_index]), 1.0)
                 self.assertAlmostEqual(float(labels[0, 0, 0, side_index]), 1.0, places=6)
 
+    def test_cumulative_execution_persists_after_book_liquidity_is_consumed(self):
+        case = self._make_case(delta=10)
+        for tau in range(1, 5):
+            self._set_future_side_volume(case, tau=tau, side="ask", quantity=100.0)
+        self._set_trade(
+            case,
+            transition=4,
+            slot=0,
+            price=self._ask_price(),
+            signed_quantity=-100.0,
+        )
+
+        labels, mask = self._build_targets(case)
+
+        self.assertEqual(float(mask[0, 0, 0, 0]), 1.0)
+        self.assertAlmostEqual(float(labels[0, 0, 0, 0]), 1.0, places=6)
+
     def test_partial_cancel_with_execution_uses_execution_plus_resting(self):
         case = self._make_case()
         self._set_trade(
@@ -187,6 +204,21 @@ class ReliabilityTargetTest(unittest.TestCase):
         labels, _mask = self._build_targets(case)
 
         self.assertAlmostEqual(float(labels[0, 0, 0, 0]), 0.7, places=6)
+
+    def test_execution_plus_resting_is_clipped_to_one(self):
+        case = self._make_case()
+        self._set_trade(
+            case,
+            transition=0,
+            slot=0,
+            price=self._ask_price(),
+            signed_quantity=-80.0,
+        )
+        self._set_future_side_volume(case, tau=1, side="ask", quantity=50.0)
+
+        labels, _mask = self._build_targets(case)
+
+        self.assertAlmostEqual(float(labels[0, 0, 0, 0]), 1.0, places=6)
 
     def test_complete_cancel_has_zero_target(self):
         case = self._make_case()
@@ -246,7 +278,21 @@ class ReliabilityTargetTest(unittest.TestCase):
 
         self.assertAlmostEqual(float(labels[0, 0, 0, 0]), 0.0, places=6)
 
-    def test_opposite_side_trade_and_refill_do_not_count(self):
+    def test_opposite_side_resting_does_not_count(self):
+        case = self._make_case()
+        self._set_future_side_volume(
+            case,
+            tau=1,
+            side="bid",
+            quantity=100.0,
+            price=self._ask_price(),
+        )
+
+        labels, _mask = self._build_targets(case)
+
+        self.assertAlmostEqual(float(labels[0, 0, 0, 0]), 0.0, places=6)
+
+    def test_opposite_side_execution_does_not_count(self):
         case = self._make_case()
         self._set_trade(
             case,
@@ -254,13 +300,6 @@ class ReliabilityTargetTest(unittest.TestCase):
             slot=0,
             price=self._ask_price(),
             signed_quantity=100.0,
-        )
-        self._set_future_side_volume(
-            case,
-            tau=1,
-            side="bid",
-            quantity=100.0,
-            price=self._ask_price(),
         )
 
         labels, _mask = self._build_targets(case)
@@ -338,6 +377,17 @@ class ReliabilityTargetTest(unittest.TestCase):
         self.assertEqual(float(mask[0, 0, 0, 0]), 0.0)
         self.assertTrue(bool(jnp.all(jnp.isfinite(labels))))
 
+    def test_nonfinite_future_raw_book_masks_target(self):
+        case = self._make_case()
+        case["ask_orders"] = case["ask_orders"].at[
+            1, 0, 0, cst.OrderSideFeat.Q.value
+        ].set(jnp.nan)
+
+        labels, mask = self._build_targets(case)
+
+        self.assertEqual(float(mask[0, 0, 0, 0]), 0.0)
+        self.assertTrue(bool(jnp.all(jnp.isfinite(labels))))
+
     def test_diagnostics_report_execution_aware_components(self):
         case = self._make_case()
         self._set_trade(
@@ -356,6 +406,11 @@ class ReliabilityTargetTest(unittest.TestCase):
         self.assertTrue(bool(jnp.isfinite(diag["q_tau_mean"])))
         self.assertTrue(bool(jnp.isfinite(diag["cumulative_executed_mean"])))
         self.assertTrue(bool(jnp.isfinite(diag["cancel_star_mean"])))
+        self.assertTrue(bool(jnp.isfinite(diag["ask_target_std"])))
+        self.assertTrue(bool(jnp.isfinite(diag["bid_target_std"])))
+        self.assertEqual(diag["target_level_mean_ask"].shape, (1,))
+        self.assertEqual(diag["target_level_mean_bid"].shape, (1,))
+        self.assertAlmostEqual(float(diag["ask_target_mean"]), 0.7, places=6)
 
     def test_missing_execution_log_raises(self):
         case = self._make_case()
@@ -369,7 +424,6 @@ class ReliabilityTargetTest(unittest.TestCase):
                 tick_size=self.tick_size,
                 survival_delta_steps=1,
                 survival_min_volume=1.0,
-                survival_ratio=0.5,
                 num_steps=1,
                 ask_raw_orders=case["ask_orders"],
                 bid_raw_orders=case["bid_orders"],

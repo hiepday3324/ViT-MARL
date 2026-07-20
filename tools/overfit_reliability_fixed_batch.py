@@ -406,10 +406,6 @@ def _make_fixed_batch(bundle: RolloutBundle) -> FixedBatch:
         tick_size=tick_size,
         survival_delta_steps=survival_delta_steps,
         survival_min_volume=config.get("survival_min_volume", 1.0),
-        survival_ratio=config.get("survival_gamma", 0.5),
-        survival_availability_temperature=config.get(
-            "survival_availability_temperature", 0.15
-        ),
         ask_raw_orders=traj.info["world"].get("obs_ask_raw_orders", None),
         bid_raw_orders=traj.info["world"].get("obs_bid_raw_orders", None),
         new_trades=traj.info["world"]["new_trades"],
@@ -446,7 +442,11 @@ def _make_fixed_batch(bundle: RolloutBundle) -> FixedBatch:
         f"trade_buffer_saturated_rate={_float(target_diag['trade_buffer_saturated_rate']):.6g}",
         f"done_masked_rate={_float(target_diag['done_masked_rate']):.6g}",
         f"ask_valid_count={_float(target_diag['ask_valid_count']):.0f}",
+        f"ask_target_mean={_float(target_diag['ask_target_mean']):.6g}",
+        f"ask_target_std={_float(target_diag['ask_target_std']):.6g}",
         f"bid_valid_count={_float(target_diag['bid_valid_count']):.0f}",
+        f"bid_target_mean={_float(target_diag['bid_target_mean']):.6g}",
+        f"bid_target_std={_float(target_diag['bid_target_std']):.6g}",
     )
     return FixedBatch(
         train_state=bundle.train_states[exec_idx],

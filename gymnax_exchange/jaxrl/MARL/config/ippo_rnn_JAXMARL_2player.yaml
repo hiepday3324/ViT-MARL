@@ -17,8 +17,6 @@
 "lambda_surv": 0.0
 "survival_delta_steps": 10
 "survival_min_volume": 1.0
-"survival_gamma": 0.5
-"survival_availability_temperature": 0.15
 "reliability_loss_type": "bce"
 "survival_eps": 1e-8
 "TOTAL_TIMESTEPS": 5e7
