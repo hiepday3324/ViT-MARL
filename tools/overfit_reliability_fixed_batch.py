@@ -25,7 +25,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from flax.traverse_util import flatten_dict
 from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
@@ -43,6 +42,14 @@ from gymnax_exchange.jaxrl.MARL.ippo_rnn_JAXMARL import (
     batchify,
     batchify_action,
     unbatchify,
+)
+from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
+    flatten_gradient_tree,
+    flatten_tree_with_paths,
+    gradient_l2_norm,
+    matching_parameter_paths,
+    subtract_gradient_trees,
+    tree_l2_norm,
 )
 from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     build_liquidity_survival_targets,
@@ -510,94 +517,28 @@ def _fmt(values):
     return "[" + ",".join(f"{v:.6g}" for v in arr) + "]"
 
 
-VISION_GRAD_FILTERS = ("VisionAgent", "vision_agent", "vision", "encoder")
-RELIABILITY_GRAD_FILTERS = (
-    "LevelWiseReliabilityHead",
-    "ReliabilityHead",
-    "reliability_head",
-    "reliability",
-)
-PARAM_DIAG_FILTERS = RELIABILITY_GRAD_FILTERS + (
-    "ReliabilityFusionRNN",
-    "score",
-    "VisionAgent",
-)
-
-
-def _tree_norm(tree):
-    leaves = [x for x in jax.tree_util.tree_leaves(tree) if x is not None]
-    if not leaves:
-        return jnp.array(0.0, dtype=jnp.float32)
-    return jnp.sqrt(sum(jnp.sum(jnp.square(jnp.asarray(x))) for x in leaves))
-
-
-def _flatten_grad_subtree(grads, key_filter):
-    filters = (key_filter,) if isinstance(key_filter, str) else tuple(key_filter)
-    flat = flatten_dict(grads)
-    return [
-        value
-        for key, value in flat.items()
-        if any(token in "/".join(str(part) for part in key) for token in filters)
-    ]
-
-
-def _grad_norm(flat_grad):
-    if not flat_grad:
-        return jnp.array(0.0, dtype=jnp.float32)
-    return _tree_norm(flat_grad)
-
-
-def _grad_cosine(flat_grad_a, flat_grad_b, eps=1e-8):
-    if not flat_grad_a or not flat_grad_b:
-        return jnp.array(0.0, dtype=jnp.float32)
-    if len(flat_grad_a) != len(flat_grad_b):
-        return jnp.array(0.0, dtype=jnp.float32)
-    dot = sum(
-        jnp.sum(jnp.asarray(a) * jnp.asarray(b))
-        for a, b in zip(flat_grad_a, flat_grad_b)
-    )
-    norm_a = _grad_norm(flat_grad_a)
-    norm_b = _grad_norm(flat_grad_b)
-    return dot / (norm_a * norm_b + eps)
-
-
-def _filtered_grad_norm(grads, key_filter):
-    selected = _flatten_grad_subtree(grads, key_filter)
-    if not selected:
-        return jnp.array(0.0, dtype=jnp.float32)
-    return _grad_norm(selected)
-
-
 def _top_level_param_keys(params):
-    flat = flatten_dict(params)
-    return sorted({str(key[0]) for key in flat.keys() if key})
+    return sorted({path[0] for path in flatten_tree_with_paths(params) if path})
 
 
-def _matching_param_paths(params, filters=PARAM_DIAG_FILTERS):
-    paths = []
-    for key in flatten_dict(params).keys():
-        path = "/".join(str(part) for part in key)
-        if any(token in path for token in filters):
-            paths.append(path)
-    return sorted(paths)
+def _matching_param_paths(params):
+    paths = set()
+    for group in ("reliability_head", "vision_encoder", "fusion_shared_trunk"):
+        paths.update(matching_parameter_paths(params, group))
+    return ["/".join(path) for path in sorted(paths)]
 
 
 def _score_grad_norm(grads, leaf_name):
-    selected = []
-    for key, value in flatten_dict(grads).items():
-        path = "/".join(str(part) for part in key)
-        if (
-            any(token in path for token in RELIABILITY_GRAD_FILTERS)
-            and "/score/" in path
-            and path.endswith(f"/{leaf_name}")
-        ):
-            selected.append(value)
-    return _grad_norm(selected)
+    selected = {
+        path: value
+        for path, value in flatten_gradient_tree(grads, "reliability_head").items()
+        if len(path) >= 2 and path[-2] == "score" and path[-1] == leaf_name
+    }
+    return tree_l2_norm(selected)
 
 
 def _parameter_delta_norm(new_params, old_params):
-    delta = jax.tree_util.tree_map(lambda new, old: new - old, new_params, old_params)
-    return _tree_norm(delta)
+    return tree_l2_norm(subtract_gradient_trees(new_params, old_params))
 
 
 def _make_loss_fn(batch: FixedBatch):
@@ -660,7 +601,7 @@ def _raw_output_grad_norm(batch: FixedBatch, logits):
                 reliability_logits=candidate_logits,
             )
 
-        return _tree_norm(jax.grad(output_loss)(logits))
+        return tree_l2_norm(jax.grad(output_loss)(logits))
 
     def output_loss(candidate_scores):
         return masked_reliability_loss(
@@ -671,7 +612,7 @@ def _raw_output_grad_norm(batch: FixedBatch, logits):
             eps=batch.config.get("survival_eps", 1e-8),
         )
 
-    return _tree_norm(jax.grad(output_loss)(jax.nn.sigmoid(logits)))
+    return tree_l2_norm(jax.grad(output_loss)(jax.nn.sigmoid(logits)))
 
 
 def _print_diagnostics(
@@ -731,14 +672,12 @@ def _print_diagnostics(
         f"score_level_mean={_fmt(_level_means(score, mask))}",
         f"target_level_mean={_fmt(_level_means(labels, mask))}",
     )
-    total_vision = _flatten_grad_subtree(total_grads, VISION_GRAD_FILTERS)
-    total_reliability = _flatten_grad_subtree(total_grads, RELIABILITY_GRAD_FILTERS)
     print(
         "OVERFIT_GRAD",
         f"step={step}",
-        f"grad_norm_total={_float(_tree_norm(total_grads)):.6g}",
-        f"grad_norm_vision_agent={_float(_grad_norm(total_vision)):.6g}",
-        f"grad_norm_reliability_head={_float(_grad_norm(total_reliability)):.6g}",
+        f"grad_norm_total={_float(tree_l2_norm(total_grads)):.6g}",
+        f"grad_norm_vision_agent={_float(gradient_l2_norm(total_grads, 'vision_encoder')):.6g}",
+        f"grad_norm_reliability_head={_float(gradient_l2_norm(total_grads, 'reliability_head')):.6g}",
         f"grad_norm_score_kernel={_float(_score_grad_norm(total_grads, 'kernel')):.6g}",
         f"grad_norm_score_bias={_float(_score_grad_norm(total_grads, 'bias')):.6g}",
         f"grad_norm_raw_reliability_output={_float(_raw_output_grad_norm(batch, diag['logits'])):.6g}",
@@ -759,9 +698,9 @@ def _validate_initial_forward_and_gradients(diag, grads, parameter_update_norm):
     if _float(diag["reliability_path_active"]) < 1.0:
         raise RuntimeError("Forward did not pass through ReliabilityFusionRNN.")
 
-    total_grad_norm = _float(_tree_norm(grads))
+    total_grad_norm = _float(tree_l2_norm(grads))
     reliability_grad_norm = _float(
-        _filtered_grad_norm(grads, RELIABILITY_GRAD_FILTERS)
+        gradient_l2_norm(grads, "reliability_head")
     )
     update_norm = _float(parameter_update_norm)
     if total_grad_norm <= 1e-12:
@@ -799,7 +738,7 @@ def run_overfit(batch: FixedBatch):
         (loss, diag), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         updates, new_opt_state = tx.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, loss, diag, _tree_norm(updates)
+        return new_params, new_opt_state, loss, diag, tree_l2_norm(updates)
 
     (initial_loss, initial_diag), initial_grads = value_and_grad_fn(params)
     updates, opt_state = tx.update(initial_grads, opt_state, params)

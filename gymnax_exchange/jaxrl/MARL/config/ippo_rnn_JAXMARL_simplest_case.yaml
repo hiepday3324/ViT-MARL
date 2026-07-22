@@ -14,6 +14,8 @@
 "reliability_hidden_dim": 128
 "use_survival_loss": False
 "lambda_surv": 0.0
+"enable_grad_interaction_diag": False
+"grad_interaction_diag_every_updates": 1
 "survival_delta_steps": 10
 "survival_min_volume": 1.0
 "TOTAL_TIMESTEPS": 1e7

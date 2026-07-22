@@ -59,6 +59,17 @@ from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     masked_reliability_loss,
     resolve_rollout_is_sell_task,
 )
+from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
+    GRADIENT_GROUPS,
+    PARAMETER_GROUP_RULES,
+    empty_gradient_interaction_diagnostics,
+    format_gradient_interaction_diagnostics,
+    gradient_diag_should_run,
+    subtract_gradient_trees,
+    summarize_gradient_interaction,
+    validate_gradient_diag_config,
+    validate_required_parameter_groups,
+)
 import wandb
 import functools
 import matplotlib.pyplot as plt
@@ -352,6 +363,8 @@ def _is_execution_agent(agent_config):
 
 def make_train(config):
     # scenario = map_name_to_scenario(config["MAP_NAME"])
+    grad_diag_cadence = validate_gradient_diag_config(config)
+    grad_diag_enabled = bool(config.get("enable_grad_interaction_diag", False))
     init_key = jax.random.PRNGKey(config["SEED"])
     config_dict={"MarketMaking": MarketMaking_EnvironmentConfig,"Execution": Execution_EnvironmentConfig}
     print("init_key: ", init_key)
@@ -485,6 +498,23 @@ def make_train(config):
             # FIXME: very unsure about this, why is it NUM_ENVS and not NUM_ACTORS?
             init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
             network_params = network.init(_rng, init_hstate, init_x)
+            if (
+                grad_diag_enabled
+                and config.get("use_reliability_head", False)
+                and config.get("use_survival_loss", False)
+                and _is_execution_agent(env.list_of_agents_configs[i])
+            ):
+                group_counts = validate_required_parameter_groups(
+                    network_params,
+                    required_groups=GRADIENT_GROUPS,
+                )
+                for group in GRADIENT_GROUPS:
+                    print(
+                        "GRAD_DIAG_GROUP_RULE",
+                        f"agent=EXE group={group}",
+                        f"param_leaf_count={group_counts[group]}",
+                        f"rule={PARAMETER_GROUP_RULES[group]}",
+                    )
             if config["ANNEAL_LR"][i]:
                 tx = optax.chain(
                     optax.clip_by_global_norm(config["MAX_GRAD_NORM"][i]),
@@ -981,11 +1011,20 @@ def make_train(config):
             # UPDATE NETWORKS
             # FIXME: APPLY VISION, GATED-FUSION
             loss_infos = []
+            grad_interaction_diags = []
             for i, train_state in enumerate(train_states):
                 agent_is_execution = _is_execution_agent(env.list_of_agents_configs[i])
+                grad_diag_applicable = bool(
+                    agent_is_execution
+                    and config.get("use_reliability_head", False)
+                    and config.get("use_survival_loss", False)
+                    and isinstance(traj_batch[i].obs, dict)
+                )
 
-                def _update_epoch(update_state, unused):
-                    def _update_minbatch(train_state, batch_info):
+                def _update_epoch(update_state, epoch_index):
+                    def _update_minbatch(update_carry, scan_input):
+                        train_state, grad_interaction_diag = update_carry
+                        batch_info, minibatch_index = scan_input
                         (
                             init_hstate,
                             traj_batch,
@@ -995,7 +1034,7 @@ def make_train(config):
                             surv_mask,
                         ) = batch_info
 
-                        def _loss_fn(
+                        def _compute_loss_components(
                             params,
                             init_hstate,
                             traj_batch,
@@ -1003,6 +1042,7 @@ def make_train(config):
                             targets,
                             surv_labels,
                             surv_mask,
+                            objective_survival_weight,
                         ):
                             # RERUN NETWORK
                             _, pi, value, _z_vision, aux_info = train_state.apply_fn(
@@ -1165,13 +1205,21 @@ def make_train(config):
 
                             weighted_survival_loss = lambda_surv * survival_loss
                             aux_loss = weighted_survival_loss
-                            total_loss = ppo_loss + aux_loss
+                            total_loss = (
+                                ppo_loss
+                                + objective_survival_weight * survival_loss
+                            )
 
                             # debug
                             approx_kl = ((ratio - 1) - logratio).mean()
                             clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
 
-                            return total_loss, (
+                            return {
+                                "total_loss": total_loss,
+                                "ppo_loss": ppo_loss,
+                                "survival_loss": survival_loss,
+                                "weighted_survival_loss": weighted_survival_loss,
+                                "metrics": (
                                 value_loss,
                                 loss_actor,
                                 entropy,
@@ -1222,7 +1270,30 @@ def make_train(config):
                                 use_h_prev_in_reliability_value,
                                 h_prev_used_in_reliability_value,
                                 h_prev_reliability_zeroed_value,
+                                ),
+                            }
+
+                        def _loss_fn(
+                            params,
+                            init_hstate,
+                            traj_batch,
+                            gae,
+                            targets,
+                            surv_labels,
+                            surv_mask,
+                            objective_survival_weight,
+                        ):
+                            components = _compute_loss_components(
+                                params,
+                                init_hstate,
+                                traj_batch,
+                                gae,
+                                targets,
+                                surv_labels,
+                                surv_mask,
+                                objective_survival_weight,
                             )
+                            return components["total_loss"], components["metrics"]
                         grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                         total_loss, grads = grad_fn(
                             train_state.params,
@@ -1232,9 +1303,66 @@ def make_train(config):
                             targets,
                             surv_labels,
                             surv_mask,
+                            config.get("lambda_surv", 0.0),
                         )
+                        if grad_diag_enabled and grad_diag_applicable:
+                            should_compute_grad_diag = gradient_diag_should_run(
+                                update_steps,
+                                grad_diag_cadence,
+                                epoch_index,
+                                minibatch_index,
+                            )
+
+                            def _compute_grad_interaction_diag(_):
+                                _, ppo_grads = jax.value_and_grad(
+                                    _loss_fn,
+                                    has_aux=True,
+                                )(
+                                    train_state.params,
+                                    init_hstate,
+                                    traj_batch,
+                                    advantages,
+                                    targets,
+                                    surv_labels,
+                                    surv_mask,
+                                    0.0,
+                                )
+                                _, joint_unit_grads = jax.value_and_grad(
+                                    _loss_fn,
+                                    has_aux=True,
+                                )(
+                                    train_state.params,
+                                    init_hstate,
+                                    traj_batch,
+                                    advantages,
+                                    targets,
+                                    surv_labels,
+                                    surv_mask,
+                                    1.0,
+                                )
+                                # The objective is affine in this weight, so
+                                # grad(w=1) - grad(w=0) is the raw survival grad.
+                                # A shared graph also limits float32 ordering noise.
+                                survival_grads = subtract_gradient_trees(
+                                    joint_unit_grads,
+                                    ppo_grads,
+                                )
+                                return summarize_gradient_interaction(
+                                    train_state.params,
+                                    grads,
+                                    ppo_grads,
+                                    survival_grads,
+                                    config.get("lambda_surv", 0.0),
+                                )
+
+                            grad_interaction_diag = jax.lax.cond(
+                                should_compute_grad_diag,
+                                _compute_grad_interaction_diag,
+                                lambda _: grad_interaction_diag,
+                                operand=None,
+                            )
                         train_state = train_state.apply_gradients(grads=grads)
-                        return train_state, total_loss
+                        return (train_state, grad_interaction_diag), total_loss
                     (
                         train_state,
                         init_hstate,
@@ -1244,6 +1372,7 @@ def make_train(config):
                         surv_labels,
                         surv_mask,
                         rng,
+                        grad_interaction_diag,
                     ) = update_state
                     rng, _rng = jax.random.split(rng)
 
@@ -1278,8 +1407,13 @@ def make_train(config):
                         shuffled_batch,
                     )
 
-                    train_state, total_loss = jax.lax.scan(
-                        _update_minbatch, train_state, minibatches
+                    (train_state, grad_interaction_diag), total_loss = jax.lax.scan(
+                        _update_minbatch,
+                        (train_state, grad_interaction_diag),
+                        (
+                            minibatches,
+                            jnp.arange(config["NUM_MINIBATCHES"], dtype=jnp.int32),
+                        ),
                     )
                     update_state = (
                         train_state,
@@ -1290,9 +1424,32 @@ def make_train(config):
                         surv_labels,
                         surv_mask,
                         rng,
+                        grad_interaction_diag,
                     )
                     return update_state, total_loss
 
+                cadence_due = update_steps % grad_diag_cadence == 0
+                initial_grad_interaction_diag = empty_gradient_interaction_diagnostics(
+                    train_state.params,
+                    enabled=grad_diag_enabled,
+                    skipped_by_cadence=(
+                        grad_diag_enabled
+                        and grad_diag_applicable
+                        and ~cadence_due
+                    ),
+                    not_applicable=(grad_diag_enabled and not grad_diag_applicable),
+                    reason_not_execution=(
+                        grad_diag_enabled and not agent_is_execution
+                    ),
+                    reason_reliability_disabled=(
+                        grad_diag_enabled
+                        and not config.get("use_reliability_head", False)
+                    ),
+                    reason_survival_disabled=(
+                        grad_diag_enabled
+                        and not config.get("use_survival_loss", False)
+                    ),
+                )
                 update_state = (
                     train_state,
                     initial_hstates[i],
@@ -1302,12 +1459,16 @@ def make_train(config):
                     survival_labels[i],
                     survival_masks[i],
                     rng,
+                    initial_grad_interaction_diag,
                 )
                 update_state, loss_info = jax.lax.scan(
-                    _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
+                    _update_epoch,
+                    update_state,
+                    jnp.arange(config["UPDATE_EPOCHS"], dtype=jnp.int32),
                 )
                 train_states[i] = update_state[0]
                 loss_infos.append(loss_info)
+                grad_interaction_diags.append(update_state[-1])
 
             reliability_alignment_diags = []
             for i, train_state in enumerate(train_states):
@@ -1365,6 +1526,7 @@ def make_train(config):
             ]
             metrics["execution_target_diag"] = survival_target_diags
             metrics["reliability_alignment_diag"] = reliability_alignment_diags
+            metrics["grad_interaction_diag"] = grad_interaction_diags
             metrics["loss"]=[]
             for i,loss_info in enumerate(loss_infos):
                 ratio_0 = loss_info[1][3].at[0,0].get().mean()
@@ -1883,7 +2045,24 @@ def make_train(config):
                             print(" ".join(fields))
 
                 print("[GRADIENTS]")
-                print(f"GRAD_DIAG update={update_idx} grad_norm_status=deferred")
+                grad_wandb_metrics = {}
+                if exe_agent_index is not None:
+                    grad_lines, grad_values = format_gradient_interaction_diagnostics(
+                        metric["grad_interaction_diag"][exe_agent_index],
+                        update=update_idx,
+                        agent="EXE",
+                    )
+                    for line in grad_lines:
+                        print(line)
+                    grad_wandb_metrics = {
+                        f"agent_EXE/gradient_interaction/{key}": value
+                        for key, value in grad_values.items()
+                    }
+                else:
+                    print(
+                        f"GRAD_DIAG update={update_idx} status=not_applicable "
+                        "reason=no_execution_agent"
+                    )
 
                 for agent_index, tr in enumerate(metric["traj_batch"]):
                     agent_name = agent_type_names[agent_index]
@@ -1908,6 +2087,8 @@ def make_train(config):
                         **{f"agent_{agent_name}/reward": metric["avg_reward"][agent_index]},
                         **action_distribution
                     }
+                    if agent_name == "EXE":
+                        logging_dict.update(grad_wandb_metrics)
                 
                     
                     for key, value in tr.info['agent'].items():
