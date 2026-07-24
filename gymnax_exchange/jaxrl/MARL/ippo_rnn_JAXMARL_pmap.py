@@ -82,6 +82,14 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     validate_gradient_diag_config,
     validate_required_parameter_groups,
 )
+from gymnax_exchange.jaxrl.MARL.phasic_reliability import (
+    empty_phasic_aux_diagnostics,
+    format_phasic_aux_diagnostics,
+    make_auxiliary_optimizer,
+    ppo_survival_loss_weight,
+    resolve_phasic_reliability_settings,
+    run_phasic_auxiliary_phase,
+)
 import wandb
 import functools
 import matplotlib.pyplot as plt
@@ -238,6 +246,7 @@ class ActorCriticRNN(nn.Module):
                 self.action_space.n, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
             )(actor_mean)
             pi = distrax.Categorical(logits=action_logits)
+            aux_info["policy_logits"] = action_logits
         elif isinstance(self.action_space, spaces.Box):
             action_loc = nn.Dense(
                 self.action_space.shape[-1], kernel_init=orthogonal(0.01), bias_init=constant(0.0)
@@ -259,6 +268,8 @@ class ActorCriticRNN(nn.Module):
                 ndims=1,
             )
             pi = distrax.Transformed(base_dist, action_bijector)
+            aux_info["policy_loc"] = action_loc
+            aux_info["policy_log_std"] = actor_logstd
         else:
             raise ValueError(f"Unknown action space type {type(self.action_space)}")
 
@@ -392,6 +403,14 @@ def make_train(config):
     config["MINIBATCH_SIZES"] = [
         nact * config["NUM_STEPS"] // config["NUM_MINIBATCHES"] for i,nact in enumerate(config["NUM_ACTORS_PERTYPE"])
     ]
+    execution_index = next(
+        (
+            idx
+            for idx, agent_config in enumerate(env.list_of_agents_configs)
+            if _is_execution_agent(agent_config)
+        ),
+        None,
+    )
     # config["CLIP_EPS"] = (
     #     config["CLIP_EPS"] / env.num_agents
     #     if config["SCALE_CLIP_EPS"]
@@ -419,6 +438,25 @@ def make_train(config):
         local_num_actors_per_type = [
             n * local_num_envs for n in config["NUM_AGENTS_PER_TYPE"]
         ]
+        local_execution_actor_count = (
+            None
+            if execution_index is None
+            else local_num_actors_per_type[execution_index]
+        )
+        phasic_settings = resolve_phasic_reliability_settings(
+            config,
+            execution_index=execution_index,
+            execution_actor_count=local_execution_actor_count,
+        )
+        phasic_mode = phasic_settings.enabled
+        print(
+            "RELIABILITY_OPTIMIZATION_CONFIG",
+            f"mode={phasic_settings.mode}",
+            f"aux_epochs={phasic_settings.num_epochs}",
+            f"aux_minibatches={phasic_settings.num_minibatches}",
+            f"aux_learning_rate={phasic_settings.learning_rate}",
+            f"aux_max_grad_norm={phasic_settings.max_grad_norm}",
+        )
 
 
         # For a given agent type (instance) we need the following inputs:
@@ -429,6 +467,15 @@ def make_train(config):
         hstates = []
         network_params_list = []
         train_states = []
+        aux_tx = (
+            make_auxiliary_optimizer(
+                phasic_settings,
+                total_updates=config["NUM_UPDATES"],
+            )
+            if phasic_mode
+            else None
+        )
+        aux_opt_state = None
         num_agents_of_instance_list = []
         init_dones_agents = []
         for i, instance in enumerate(env.instance_list):
@@ -462,7 +509,7 @@ def make_train(config):
             init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
             network_params = network.init(_rng, init_hstate, init_x)
             if (
-                grad_diag_enabled
+                (grad_diag_enabled or phasic_mode)
                 and config.get("use_reliability_head", False)
                 and config.get("use_survival_loss", False)
                 and _is_execution_agent(env.list_of_agents_configs[i])
@@ -478,6 +525,8 @@ def make_train(config):
                         f"param_leaf_count={group_counts[group]}",
                         f"rule={PARAMETER_GROUP_RULES[group]}",
                     )
+            if phasic_mode and i == execution_index:
+                aux_opt_state = aux_tx.init(network_params)
             if config["ANNEAL_LR"][i]:
                 tx = optax.chain(
                     optax.clip_by_global_norm(config["MAX_GRAD_NORM"][i]),
@@ -502,7 +551,62 @@ def make_train(config):
             num_agents_of_instance_list.append(env.multi_agent_config.number_of_agents_per_type[i])
             init_dones_agents.append(jnp.zeros((config["NUM_ACTORS_PERTYPE"][i]), dtype=bool))
 
+        if phasic_mode and aux_opt_state is None:
+            raise ValueError("Failed to initialize the Execution auxiliary optimizer state.")
+
         train_states = jax_utils.replicate(train_states)
+        if phasic_mode:
+            aux_opt_state = jax_utils.replicate(aux_opt_state)
+
+        def _unpack_runner_state(runner_state):
+            if phasic_mode:
+                (
+                    runner_train_states,
+                    runner_env_state,
+                    runner_last_obs,
+                    runner_last_done,
+                    runner_hstates,
+                    runner_rng,
+                    runner_aux_opt_state,
+                ) = runner_state
+            else:
+                (
+                    runner_train_states,
+                    runner_env_state,
+                    runner_last_obs,
+                    runner_last_done,
+                    runner_hstates,
+                    runner_rng,
+                ) = runner_state
+                runner_aux_opt_state = None
+            return (
+                runner_train_states,
+                runner_env_state,
+                runner_last_obs,
+                runner_last_done,
+                runner_hstates,
+                runner_rng,
+                runner_aux_opt_state,
+            )
+
+        def _pack_runner_state(
+            runner_train_states,
+            runner_env_state,
+            runner_last_obs,
+            runner_last_done,
+            runner_hstates,
+            runner_rng,
+            runner_aux_opt_state,
+        ):
+            base_state = (
+                runner_train_states,
+                runner_env_state,
+                runner_last_obs,
+                runner_last_done,
+                runner_hstates,
+                runner_rng,
+            )
+            return base_state + (runner_aux_opt_state,) if phasic_mode else base_state
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
@@ -542,7 +646,15 @@ def make_train(config):
             runner_state, update_steps = update_runner_state
             # FIXME: APPLY VISION
             def _env_step(runner_state, unused):
-                train_states, env_state, last_obs, last_done,h_states, rng = runner_state
+                (
+                    train_states,
+                    env_state,
+                    last_obs,
+                    last_done,
+                    h_states,
+                    rng,
+                    current_aux_opt_state,
+                ) = _unpack_runner_state(runner_state)
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -624,9 +736,17 @@ def make_train(config):
                         info_i,
                         # avail_actions,
                     ))
-                runner_state = (train_states, env_state, obsv, done_batch['agents'], h_states, rng)
+                runner_state = _pack_runner_state(
+                    train_states,
+                    env_state,
+                    obsv,
+                    done_batch['agents'],
+                    h_states,
+                    rng,
+                    current_aux_opt_state,
+                )
                 return runner_state, transitions
-            initial_hstates = runner_state[-2]
+            initial_hstates = _unpack_runner_state(runner_state)[4]
 
             survival_delta_steps = int(config.get("survival_delta_steps", 10))
             if survival_delta_steps < 1:
@@ -720,16 +840,40 @@ def make_train(config):
             )
 
             # 3.2 Khôi phục bộ nhớ ở bước 128 cho vòng lặp sau
-            t_states, e_state, l_obs, l_dones, h_states, _ = stashed_runner_state
+            (
+                t_states,
+                e_state,
+                l_obs,
+                l_dones,
+                h_states,
+                _,
+                aux_opt_state,
+            ) = _unpack_runner_state(stashed_runner_state)
             
             # Chôm chìa khóa RNG từ bước 138 (final_runner_state).
-            fresh_rng = final_runner_state[-1] 
+            fresh_rng = _unpack_runner_state(final_runner_state)[5]
             
             # Gắn lại vào runner_state
-            runner_state = (t_states, e_state, l_obs, l_dones, h_states, fresh_rng)
+            runner_state = _pack_runner_state(
+                t_states,
+                e_state,
+                l_obs,
+                l_dones,
+                h_states,
+                fresh_rng,
+                aux_opt_state,
+            )
 
             # CALCULATE ADVANTAGE
-            train_states, env_state, last_obs, last_dones, hstates_new, rng = runner_state
+            (
+                train_states,
+                env_state,
+                last_obs,
+                last_dones,
+                hstates_new,
+                rng,
+                aux_opt_state,
+            ) = _unpack_runner_state(runner_state)
 
             def _calculate_gae(gamma,gae_lambda,traj_batch, last_val):
                     def _get_advantages(gae_and_next_value, transition):
@@ -779,13 +923,20 @@ def make_train(config):
             # FIXME: APPLY VISION, GATED-FUSION
             loss_infos = []
             grad_interaction_diags = []
+            phasic_aux_diags = []
+            execution_post_ppo_rng = rng
             for i, train_state in enumerate(train_states):
                 agent_is_execution = _is_execution_agent(env.list_of_agents_configs[i])
+                ppo_objective_survival_weight = ppo_survival_loss_weight(
+                    phasic_settings,
+                    config.get("lambda_surv", 0.0),
+                )
                 grad_diag_applicable = bool(
                     agent_is_execution
                     and config.get("use_reliability_head", False)
                     and config.get("use_survival_loss", False)
                     and isinstance(traj_batch[i].obs, dict)
+                    and not phasic_mode
                 )
 
                 def _update_epoch(update_state, epoch_index):
@@ -876,7 +1027,9 @@ def make_train(config):
                                 survival_mask_ratio = jnp.array(0.0)
                                 reliability_mean = jnp.array(0.0)
 
-                            weighted_survival_loss = lambda_surv * survival_loss
+                            weighted_survival_loss = (
+                                objective_survival_weight * survival_loss
+                            )
                             total_loss = (
                                 ppo_loss
                                 + objective_survival_weight * survival_loss
@@ -935,7 +1088,7 @@ def make_train(config):
                             targets,
                             surv_labels,
                             surv_mask,
-                            config.get("lambda_surv", 0.0),
+                            ppo_objective_survival_weight,
                         )
                         total_loss = jax.lax.pmean(total_loss, axis_name="device_batch")
                         grads = jax.lax.pmean(grads, axis_name="device_batch")
@@ -1091,6 +1244,7 @@ def make_train(config):
                         grad_diag_enabled
                         and not config.get("use_survival_loss", False)
                     ),
+                    reason_phasic_ppo_only=(grad_diag_enabled and phasic_mode),
                 )
                 update_state = (
                     train_state,
@@ -1111,6 +1265,46 @@ def make_train(config):
                 train_states[i] = update_state[0]
                 loss_infos.append(loss_info)
                 grad_interaction_diags.append(update_state[-1])
+                phasic_aux_diags.append(
+                    empty_phasic_aux_diagnostics(
+                        is_discrete=isinstance(env.action_spaces[i], spaces.Discrete),
+                        settings=phasic_settings,
+                    )
+                )
+                if phasic_mode and i == execution_index:
+                    execution_post_ppo_rng = update_state[7]
+
+            if phasic_mode:
+                execution_train_state = train_states[execution_index]
+                (
+                    phasic_params,
+                    aux_opt_state,
+                    rng,
+                    phasic_aux_diag,
+                ) = run_phasic_auxiliary_phase(
+                    apply_fn=execution_train_state.apply_fn,
+                    params=execution_train_state.params,
+                    aux_opt_state=aux_opt_state,
+                    aux_tx=aux_tx,
+                    init_hstate=initial_hstates[execution_index],
+                    obs=traj_batch[execution_index].obs,
+                    done=traj_batch[execution_index].done,
+                    labels=survival_labels[execution_index],
+                    mask=survival_masks[execution_index],
+                    rng=execution_post_ppo_rng,
+                    settings=phasic_settings,
+                    is_discrete=isinstance(
+                        env.action_spaces[execution_index],
+                        spaces.Discrete,
+                    ),
+                    reliability_loss_type=config.get("reliability_loss_type", "bce"),
+                    survival_eps=config.get("survival_eps", 1e-8),
+                    axis_name="device_batch",
+                )
+                train_states[execution_index] = execution_train_state.replace(
+                    params=phasic_params
+                )
+                phasic_aux_diags[execution_index] = phasic_aux_diag
 
 
             callback_world_exclusions = {
@@ -1143,6 +1337,7 @@ def make_train(config):
             ]
             metrics["execution_target_diag"] = survival_target_diags
             metrics["grad_interaction_diag"] = grad_interaction_diags
+            metrics["phasic_aux_diag"] = phasic_aux_diags
             metrics["loss"]=[]
             for i,loss_info in enumerate(loss_infos):
                 ratio_0 = loss_info[1][3].at[0,0].get().mean()
@@ -1385,7 +1580,15 @@ def make_train(config):
 
             metrics["update_steps"] = update_steps
             update_steps = update_steps + 1
-            runner_state = (train_states, env_state, last_obs, last_dones, hstates_new, rng)
+            runner_state = _pack_runner_state(
+                train_states,
+                env_state,
+                last_obs,
+                last_dones,
+                hstates_new,
+                rng,
+                aux_opt_state,
+            )
 
             print("Finished compiling")
             # jax.profiler.save_device_memory_profile(f"memory_{update_steps}.prof")
@@ -1394,22 +1597,31 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         host_device_rng = jax.random.fold_in(_rng, jax.process_index())
         device_rng = jax.random.split(host_device_rng, num_devices)
-        runner_state = (
+        runner_state = _pack_runner_state(
             train_states,
             env_state,
             obsv,
-            init_dones_agents, # last_done
-            hstates,  # initial hidden states for RNN
+            init_dones_agents,
+            hstates,
             device_rng,
+            aux_opt_state,
         )
 
         jitted_update_step = jax.jit(_update_step)
-        pmapped_update_step = jax.pmap(
-            jitted_update_step,
-            axis_name="device_batch",
-            in_axes=(((0, 0, 0, 0, 0, 0), None), None, None, None),
-            out_axes=(((0, 0, 0, 0, 0, 0), None), 0),
-        )
+        if phasic_mode:
+            pmapped_update_step = jax.pmap(
+                jitted_update_step,
+                axis_name="device_batch",
+                in_axes=(((0, 0, 0, 0, 0, 0, 0), None), None, None, None),
+                out_axes=(((0, 0, 0, 0, 0, 0, 0), None), 0),
+            )
+        else:
+            pmapped_update_step = jax.pmap(
+                jitted_update_step,
+                axis_name="device_batch",
+                in_axes=(((0, 0, 0, 0, 0, 0), None), None, None, None),
+                out_axes=(((0, 0, 0, 0, 0, 0), None), 0),
+            )
         
         checkpoint_manager = None
         if config.get("SAVE_CHECKPOINT", False):
@@ -1548,13 +1760,23 @@ def make_train(config):
                 )
                 for line in grad_lines:
                     print(line)
+                phasic_line, phasic_values = format_phasic_aux_diagnostics(
+                    metrics["phasic_aux_diag"][execution_agent_index],
+                    update=int(np.asarray(jax.device_get(updates))),
+                    mode=phasic_settings.mode,
+                )
+                print(phasic_line)
                 if config["WANDB_MODE"] != "disabled":
-                    wandb.log(
-                        {
+                    wandb.log({
+                        **{
                             f"agent_EXE/gradient_interaction/{key}": value
                             for key, value in grad_values.items()
-                        }
-                    )
+                        },
+                        **{
+                            f"agent_EXE/phasic_aux/{key}": value
+                            for key, value in phasic_values.items()
+                        },
+                    })
             if checkpoint_manager is not None:
                 if config["CALC_EVAL"]:
                     ckpt = {
@@ -1571,8 +1793,12 @@ def make_train(config):
                         # 'config': config if isinstance(config, dict) else config.as_dict(),
                         'metrics': {
                             'train_rewards': metrics["avg_reward"],
-                            }
+                        }
                     }
+                if phasic_mode:
+                    ckpt["aux_optimizer_state"] = _unpack_runner_state(
+                        runner_state
+                    )[6]
                 print(f"Saving checkpoint {updates} with metrics {metrics['avg_reward']}")
                 save_args = orbax_utils.save_args_from_target(ckpt)
                 checkpoint_manager.save(updates, ckpt, save_kwargs={"save_args": save_args})

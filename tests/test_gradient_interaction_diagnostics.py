@@ -11,6 +11,7 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     GRADIENT_GROUPS,
     add_gradient_trees,
     empty_gradient_interaction_diagnostics,
+    format_gradient_interaction_diagnostics,
     gradient_cosine,
     gradient_diag_should_run,
     gradient_dot,
@@ -329,6 +330,23 @@ def test_status_branches_have_static_pytree_and_first_minibatch_gate():
         validate_gradient_diag_config(
             {"grad_interaction_diag_every_updates": 0}
         )
+
+
+def test_phasic_ppo_only_gradient_diagnostic_reason_is_explicit():
+    params = _toy_tree([1.0, 2.0])
+    diagnostics = empty_gradient_interaction_diagnostics(
+        params,
+        enabled=True,
+        not_applicable=True,
+        reason_phasic_ppo_only=True,
+    )
+    lines, _metrics = format_gradient_interaction_diagnostics(
+        diagnostics,
+        update=3,
+    )
+    assert lines == [
+        "GRAD_DIAG update=3 status=not_applicable reason=phasic_ppo_only"
+    ]
 
 
 def test_single_device_pmap_gradient_diagnostics_compile_and_are_finite():

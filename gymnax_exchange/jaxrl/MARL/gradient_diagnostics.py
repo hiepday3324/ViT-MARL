@@ -7,7 +7,8 @@ from typing import Any, Mapping, Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax.traverse_util import flatten_dict
+from flax.core import FrozenDict, freeze, unfreeze
+from flax.traverse_util import flatten_dict, unflatten_dict
 
 
 GRADIENT_GROUPS = (
@@ -58,6 +59,12 @@ PARAMETER_GROUP_RULES = {
     "critic_head": "prefix=params/Dense_2 or params/Dense_3",
 }
 
+AUXILIARY_TRAINABLE_GROUPS = (
+    "reliability_head",
+    "vision_encoder",
+    "fusion_shared_trunk",
+)
+
 
 def _string_path(path: Sequence[Any]) -> tuple[str, ...]:
     return tuple(str(part) for part in path)
@@ -94,6 +101,34 @@ def parameter_path_in_group(path: Sequence[Any], group: str) -> bool:
             and path[1] in _CRITIC_DENSE_MODULES
         )
     raise KeyError(f"Unknown gradient parameter group: {group!r}.")
+
+
+def parameter_path_in_any_group(
+    path: Sequence[Any],
+    groups: Sequence[str],
+) -> bool:
+    """Return whether ``path`` belongs to at least one centralized group."""
+    return any(parameter_path_in_group(path, group) for group in groups)
+
+
+def mask_tree_to_groups(
+    tree: Mapping[str, Any],
+    groups: Sequence[str] = AUXILIARY_TRAINABLE_GROUPS,
+) -> Mapping[str, Any]:
+    """Zero every array leaf outside ``groups`` while preserving tree type."""
+    was_frozen = isinstance(tree, FrozenDict)
+    mutable_tree = unfreeze(tree) if was_frozen else tree
+    flat_tree = flatten_dict(mutable_tree)
+    masked_flat = {
+        path: (
+            value
+            if value is None or parameter_path_in_any_group(path, groups)
+            else jnp.zeros_like(value)
+        )
+        for path, value in flat_tree.items()
+    }
+    masked = unflatten_dict(masked_flat)
+    return freeze(masked) if was_frozen else masked
 
 
 def flatten_tree_with_paths(tree: Mapping[str, Any]) -> dict[tuple[str, ...], Any]:
@@ -269,6 +304,7 @@ def empty_gradient_interaction_diagnostics(
     reason_not_execution=False,
     reason_reliability_disabled=False,
     reason_survival_disabled=False,
+    reason_phasic_ppo_only=False,
 ) -> dict[str, Any]:
     """Return the fixed diagnostics pytree used by every control-flow branch."""
     counts = parameter_group_leaf_counts(params)
@@ -287,6 +323,10 @@ def empty_gradient_interaction_diagnostics(
         ),
         "reason_survival_disabled": jnp.asarray(
             reason_survival_disabled,
+            dtype=jnp.bool_,
+        ),
+        "reason_phasic_ppo_only": jnp.asarray(
+            reason_phasic_ppo_only,
             dtype=jnp.bool_,
         ),
         "groups": {
@@ -353,6 +393,7 @@ def summarize_gradient_interaction(
         "reason_not_execution": jnp.array(False),
         "reason_reliability_disabled": jnp.array(False),
         "reason_survival_disabled": jnp.array(False),
+        "reason_phasic_ppo_only": jnp.array(False),
         "groups": groups,
     }
 
@@ -413,6 +454,7 @@ def format_gradient_interaction_diagnostics(
             ("reason_not_execution", "not_execution_agent"),
             ("reason_reliability_disabled", "reliability_head_disabled"),
             ("reason_survival_disabled", "survival_loss_disabled"),
+            ("reason_phasic_ppo_only", "phasic_ppo_only"),
         ):
             if _host_bool(diagnostics[key]):
                 reasons.append(label)

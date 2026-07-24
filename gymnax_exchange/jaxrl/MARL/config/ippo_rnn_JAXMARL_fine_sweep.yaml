@@ -15,6 +15,17 @@
 "lambda_surv": 0.0
 "enable_grad_interaction_diag": False
 "grad_interaction_diag_every_updates": 1
+"reliability_optimization_mode": "joint"
+"aux_reliability_epochs": 1
+"aux_reliability_num_minibatches": null
+"aux_survival_coef": 1.0
+"aux_kl_coef": 1.0
+"aux_target_kl": 0.005
+"aux_early_stop_on_kl": True
+"aux_reject_step_on_kl": True
+"aux_learning_rate": null
+"aux_max_grad_norm": null
+"aux_anneal_lr": False
 "survival_delta_steps": 10
 "survival_min_volume": 1.0
 "TOTAL_TIMESTEPS": 1e7
