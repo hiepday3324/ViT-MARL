@@ -914,6 +914,7 @@ def format_phasic_aux_diagnostics(
     *,
     update: int,
     mode: str,
+    survival_loss_pre_ppo: Any | None = None,
 ):
     values = {
         key: float(np.mean(np.asarray(diagnostics[key])))
@@ -931,6 +932,17 @@ def format_phasic_aux_diagnostics(
         "status=active",
         "optimization_mode=phasic",
     ]
+    if survival_loss_pre_ppo is not None:
+        pre_ppo_loss = float(np.mean(np.asarray(survival_loss_pre_ppo)))
+        ppo_damage = values["survival_loss_before_aux"] - pre_ppo_loss
+        values["survival_loss_pre_ppo"] = pre_ppo_loss
+        values["ppo_damage_to_survival"] = ppo_damage
+        fields.extend(
+            [
+                f"survival_loss_pre_ppo={pre_ppo_loss:.6g}",
+                f"ppo_damage_to_survival={ppo_damage:.6g}",
+            ]
+        )
     for key in PHASIC_DIAGNOSTIC_FIELDS:
         if key == "phasic_aux_active":
             continue

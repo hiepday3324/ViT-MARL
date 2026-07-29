@@ -36,6 +36,21 @@ GRADIENT_METRICS = (
     "decomposition_rel_error",
 )
 
+PHASIC_GRADIENT_GROUPS = (
+    "total",
+    "reliability_head",
+    "vision_encoder",
+    "fusion_shared_trunk",
+)
+
+PHASIC_GRADIENT_METRICS = (
+    "param_leaf_count",
+    "ppo_grad_norm",
+    "survival_grad_norm_raw",
+    "ppo_survival_dot_raw",
+    "ppo_survival_cosine_raw",
+)
+
 _PARAMS = ("params",)
 _RELIABILITY_HEAD = _PARAMS + (
     "ReliabilityFusionRNN_0",
@@ -305,6 +320,7 @@ def empty_gradient_interaction_diagnostics(
     reason_reliability_disabled=False,
     reason_survival_disabled=False,
     reason_phasic_ppo_only=False,
+    survival_loss_pre_ppo=0.0,
 ) -> dict[str, Any]:
     """Return the fixed diagnostics pytree used by every control-flow branch."""
     counts = parameter_group_leaf_counts(params)
@@ -329,6 +345,10 @@ def empty_gradient_interaction_diagnostics(
             reason_phasic_ppo_only,
             dtype=jnp.bool_,
         ),
+        "survival_loss_pre_ppo": jnp.asarray(
+            survival_loss_pre_ppo,
+            dtype=jnp.float32,
+        ),
         "groups": {
             group: _empty_group_metrics(counts[group])
             for group in GRADIENT_GROUPS
@@ -342,6 +362,7 @@ def summarize_gradient_interaction(
     ppo_gradients: Mapping[str, Any],
     survival_gradients: Mapping[str, Any],
     lambda_surv: Any,
+    survival_loss_pre_ppo=0.0,
     eps=1e-12,
 ) -> dict[str, Any]:
     """Summarize the numerical decomposition of the optimizer's total gradient."""
@@ -394,8 +415,55 @@ def summarize_gradient_interaction(
         "reason_reliability_disabled": jnp.array(False),
         "reason_survival_disabled": jnp.array(False),
         "reason_phasic_ppo_only": jnp.array(False),
+        "survival_loss_pre_ppo": jnp.asarray(
+            survival_loss_pre_ppo,
+            dtype=jnp.float32,
+        ),
         "groups": groups,
     }
+
+
+def summarize_phasic_gradient_interaction(
+    params: Mapping[str, Any],
+    ppo_gradients: Mapping[str, Any],
+    survival_gradients: Mapping[str, Any],
+    survival_loss_pre_ppo: Any,
+    eps=1e-12,
+) -> dict[str, Any]:
+    """Summarize read-only PPO/survival gradients before phasic PPO updates."""
+    diagnostics = empty_gradient_interaction_diagnostics(
+        params,
+        enabled=True,
+        survival_loss_pre_ppo=survival_loss_pre_ppo,
+    )
+    diagnostics["grad_diag_active"] = jnp.array(True)
+    counts = parameter_group_leaf_counts(params)
+    for group in PHASIC_GRADIENT_GROUPS:
+        ppo_norm = gradient_l2_norm(ppo_gradients, group)
+        survival_norm = gradient_l2_norm(survival_gradients, group)
+        cosine, cosine_valid = gradient_cosine(
+            ppo_gradients,
+            survival_gradients,
+            group,
+            eps,
+        )
+        diagnostics["groups"][group].update(
+            {
+                "param_leaf_count": jnp.array(counts[group], dtype=jnp.int32),
+                "ppo_grad_norm": ppo_norm,
+                "survival_grad_norm_raw": survival_norm,
+                "ppo_survival_dot_raw": gradient_dot(
+                    ppo_gradients,
+                    survival_gradients,
+                    group,
+                ),
+                "ppo_survival_cosine_raw": cosine,
+                "ppo_grad_nonzero": ppo_norm > eps,
+                "survival_grad_nonzero": survival_norm > eps,
+                "cosine_valid": cosine_valid,
+            }
+        )
+    return diagnostics
 
 
 def gradient_diag_should_run(
@@ -434,6 +502,7 @@ def format_gradient_interaction_diagnostics(
     *,
     update: int,
     agent="EXE",
+    optimization_mode="joint",
 ) -> tuple[list[str], dict[str, float]]:
     """Format scalar callback output for non-PMAP and replicated PMAP metrics."""
     enabled = _host_bool(diagnostics["grad_diag_enabled"])
@@ -472,32 +541,52 @@ def format_gradient_interaction_diagnostics(
             "reason=first_minibatch_not_observed"
         ], status_metrics
 
+    if optimization_mode not in {"joint", "phasic"}:
+        raise ValueError(
+            "optimization_mode must be 'joint' or 'phasic'; "
+            f"got {optimization_mode!r}."
+        )
+    groups = (
+        PHASIC_GRADIENT_GROUPS
+        if optimization_mode == "phasic"
+        else GRADIENT_GROUPS
+    )
+    metric_names = (
+        PHASIC_GRADIENT_METRICS
+        if optimization_mode == "phasic"
+        else GRADIENT_METRICS
+    )
+
     lines = []
     wandb_metrics = dict(status_metrics)
-    for group in GRADIENT_GROUPS:
+    for group in groups:
         group_metrics = diagnostics["groups"][group]
         values = {
             key: _host_scalar(group_metrics[key])
-            for key in GRADIENT_METRICS
+            for key in metric_names
         }
-        lines.append(
-            " ".join(
+        fields = [
+            "GRAD_DIAG",
+            f"update={update}",
+            "status=active",
+            f"agent={agent}",
+            f"optimization_mode={optimization_mode}",
+            "scope=first_minibatch_first_epoch",
+            "params_state=pre_update",
+            f"group={group}",
+            f"param_leaf_count={int(round(values['param_leaf_count']))}",
+            f"ppo_grad_norm={values['ppo_grad_norm']:.6g}",
+            f"survival_grad_norm_raw={values['survival_grad_norm_raw']:.6g}",
+            f"ppo_survival_dot_raw={values['ppo_survival_dot_raw']:.6g}",
+            f"ppo_survival_cosine_raw={values['ppo_survival_cosine_raw']:.6g}",
+        ]
+        if optimization_mode == "joint":
+            fields.extend(
                 [
-                    "GRAD_DIAG",
-                    f"update={update}",
-                    "status=active",
-                    f"agent={agent}",
-                    "scope=first_minibatch_first_epoch",
-                    "params_state=pre_update",
-                    f"group={group}",
-                    f"param_leaf_count={int(round(values['param_leaf_count']))}",
-                    f"ppo_grad_norm={values['ppo_grad_norm']:.6g}",
-                    f"survival_grad_norm_raw={values['survival_grad_norm_raw']:.6g}",
-                    f"survival_grad_norm_weighted={values['survival_grad_norm_weighted']:.6g}",
+                    "survival_grad_norm_weighted="
+                    f"{values['survival_grad_norm_weighted']:.6g}",
                     "weighted_survival_to_ppo_grad_ratio="
                     f"{values['weighted_survival_to_ppo_grad_ratio']:.6g}",
-                    f"ppo_survival_dot_raw={values['ppo_survival_dot_raw']:.6g}",
-                    f"ppo_survival_cosine_raw={values['ppo_survival_cosine_raw']:.6g}",
                     f"ppo_grad_nonzero={str(values['ppo_grad_nonzero'] >= 0.5).lower()}",
                     "survival_grad_nonzero="
                     f"{str(values['survival_grad_nonzero'] >= 0.5).lower()}",
@@ -507,7 +596,7 @@ def format_gradient_interaction_diagnostics(
                     f"decomposition_rel_error={values['decomposition_rel_error']:.6g}",
                 ]
             )
-        )
+        lines.append(" ".join(fields))
         for key, value in values.items():
             wandb_metrics[f"{group}/{key}"] = value
     return lines, wandb_metrics

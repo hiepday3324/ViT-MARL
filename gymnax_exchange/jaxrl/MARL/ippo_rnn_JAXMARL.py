@@ -67,6 +67,7 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     gradient_diag_should_run,
     subtract_gradient_trees,
     summarize_gradient_interaction,
+    summarize_phasic_gradient_interaction,
     validate_gradient_diag_config,
     validate_required_parameter_groups,
 )
@@ -1168,7 +1169,6 @@ def make_train(config):
                     and config.get("use_reliability_head", False)
                     and config.get("use_survival_loss", False)
                     and isinstance(traj_batch[i].obs, dict)
-                    and not phasic_mode
                 )
 
                 def _update_epoch(update_state, epoch_index):
@@ -1446,6 +1446,47 @@ def make_train(config):
                                 objective_survival_weight,
                             )
                             return components["total_loss"], components["metrics"]
+
+                        def _ppo_objective(
+                            params,
+                            init_hstate,
+                            traj_batch,
+                            gae,
+                            targets,
+                            surv_labels,
+                            surv_mask,
+                        ):
+                            return _compute_loss_components(
+                                params,
+                                init_hstate,
+                                traj_batch,
+                                gae,
+                                targets,
+                                surv_labels,
+                                surv_mask,
+                                0.0,
+                            )["ppo_loss"]
+
+                        def _survival_objective(
+                            params,
+                            init_hstate,
+                            traj_batch,
+                            gae,
+                            targets,
+                            surv_labels,
+                            surv_mask,
+                        ):
+                            return _compute_loss_components(
+                                params,
+                                init_hstate,
+                                traj_batch,
+                                gae,
+                                targets,
+                                surv_labels,
+                                surv_mask,
+                                0.0,
+                            )["survival_loss"]
+
                         grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                         total_loss, grads = grad_fn(
                             train_state.params,
@@ -1466,6 +1507,33 @@ def make_train(config):
                             )
 
                             def _compute_grad_interaction_diag(_):
+                                if phasic_mode:
+                                    ppo_grads = jax.grad(_ppo_objective)(
+                                        train_state.params,
+                                        init_hstate,
+                                        traj_batch,
+                                        advantages,
+                                        targets,
+                                        surv_labels,
+                                        surv_mask,
+                                    )
+                                    survival_grads = jax.grad(
+                                        _survival_objective
+                                    )(
+                                        train_state.params,
+                                        init_hstate,
+                                        traj_batch,
+                                        advantages,
+                                        targets,
+                                        surv_labels,
+                                        surv_mask,
+                                    )
+                                    return summarize_phasic_gradient_interaction(
+                                        train_state.params,
+                                        ppo_grads,
+                                        survival_grads,
+                                        survival_loss_pre_ppo,
+                                    )
                                 _, ppo_grads = jax.value_and_grad(
                                     _loss_fn,
                                     has_aux=True,
@@ -1492,9 +1560,6 @@ def make_train(config):
                                     surv_mask,
                                     1.0,
                                 )
-                                # The objective is affine in this weight, so
-                                # grad(w=1) - grad(w=0) is the raw survival grad.
-                                # A shared graph also limits float32 ordering noise.
                                 survival_grads = subtract_gradient_trees(
                                     joint_unit_grads,
                                     ppo_grads,
@@ -1505,6 +1570,7 @@ def make_train(config):
                                     ppo_grads,
                                     survival_grads,
                                     config.get("lambda_surv", 0.0),
+                                    survival_loss_pre_ppo,
                                 )
 
                             grad_interaction_diag = jax.lax.cond(
@@ -1581,6 +1647,35 @@ def make_train(config):
                     return update_state, total_loss
 
                 cadence_due = update_steps % grad_diag_cadence == 0
+                survival_loss_pre_ppo = jnp.array(0.0, dtype=jnp.float32)
+                if grad_diag_enabled and grad_diag_applicable and phasic_mode:
+                    def _compute_survival_loss_pre_ppo(_):
+                        pre_ppo_outputs = build_rollout_outputs(
+                            train_state.apply_fn,
+                            train_state.params,
+                            initial_hstates[i],
+                            traj_batch[i].obs,
+                            traj_batch[i].done,
+                            is_discrete=isinstance(
+                                env.action_spaces[i],
+                                spaces.Discrete,
+                            ),
+                        )
+                        return masked_reliability_loss(
+                            pre_ppo_outputs.reliability_scores,
+                            survival_labels[i],
+                            survival_masks[i],
+                            loss_type=config.get("reliability_loss_type", "bce"),
+                            eps=config.get("survival_eps", 1e-8),
+                            reliability_logits=pre_ppo_outputs.reliability_logits,
+                        )
+
+                    survival_loss_pre_ppo = jax.lax.cond(
+                        cadence_due,
+                        _compute_survival_loss_pre_ppo,
+                        lambda _: jnp.array(0.0, dtype=jnp.float32),
+                        operand=None,
+                    )
                 initial_grad_interaction_diag = empty_gradient_interaction_diagnostics(
                     train_state.params,
                     enabled=grad_diag_enabled,
@@ -1601,7 +1696,7 @@ def make_train(config):
                         grad_diag_enabled
                         and not config.get("use_survival_loss", False)
                     ),
-                    reason_phasic_ppo_only=(grad_diag_enabled and phasic_mode),
+                    survival_loss_pre_ppo=survival_loss_pre_ppo,
                 )
                 update_state = (
                     train_state,
@@ -2247,10 +2342,14 @@ def make_train(config):
                 grad_wandb_metrics = {}
                 phasic_wandb_metrics = {}
                 if exe_agent_index is not None:
+                    execution_grad_diag = metric["grad_interaction_diag"][
+                        exe_agent_index
+                    ]
                     grad_lines, grad_values = format_gradient_interaction_diagnostics(
-                        metric["grad_interaction_diag"][exe_agent_index],
+                        execution_grad_diag,
                         update=update_idx,
                         agent="EXE",
+                        optimization_mode=phasic_settings.mode,
                     )
                     for line in grad_lines:
                         print(line)
@@ -2258,10 +2357,26 @@ def make_train(config):
                         f"agent_EXE/gradient_interaction/{key}": value
                         for key, value in grad_values.items()
                     }
+                    survival_loss_pre_ppo = None
+                    if (
+                        phasic_settings.mode == "phasic"
+                        and float(
+                            np.mean(
+                                np.asarray(
+                                    execution_grad_diag["grad_diag_active"]
+                                )
+                            )
+                        )
+                        >= 0.5
+                    ):
+                        survival_loss_pre_ppo = execution_grad_diag[
+                            "survival_loss_pre_ppo"
+                        ]
                     phasic_line, phasic_values = format_phasic_aux_diagnostics(
                         metric["phasic_aux_diag"][exe_agent_index],
                         update=update_idx,
                         mode=phasic_settings.mode,
+                        survival_loss_pre_ppo=survival_loss_pre_ppo,
                     )
                     print(phasic_line)
                     phasic_wandb_metrics = {
@@ -2613,9 +2728,24 @@ def make_train(config):
 @hydra.main(version_base=None, config_path="config", config_name="ippo_rnn_JAXMARL_2player")
 def main(config):
     print("MultiAgentConfig", MultiAgentConfig().world_config)
-    env_config=OmegaConf.structured(MultiAgentConfig(number_of_agents_per_type=config["NUM_AGENTS_PER_TYPE"]))
-    final_config=OmegaConf.merge(config,env_config)
-    config = OmegaConf.to_container(final_config)
+    env_config = OmegaConf.structured(
+        MultiAgentConfig(
+            number_of_agents_per_type=config["NUM_AGENTS_PER_TYPE"]
+        )
+    )
+
+    env_config_plain = OmegaConf.create(
+        OmegaConf.to_container(env_config, resolve=True)
+    )
+    hydra_config_plain = OmegaConf.create(
+        OmegaConf.to_container(config, resolve=True)
+    )
+
+    final_config = OmegaConf.merge(
+        env_config_plain,
+        hydra_config_plain,
+    )
+    config = OmegaConf.to_container(final_config, resolve=True)
 
     print(config)
 

@@ -26,6 +26,8 @@ from gymnax_exchange.jaxrl.MARL.phasic_reliability import (
     build_rollout_outputs,
     categorical_policy_kl,
     diagonal_normal_policy_kl,
+    empty_phasic_aux_diagnostics,
+    format_phasic_aux_diagnostics,
     make_auxiliary_optimizer,
     ppo_survival_loss_weight,
     resolve_phasic_reliability_settings,
@@ -171,6 +173,35 @@ def test_joint_mode_preserves_legacy_survival_weight_and_phasic_isolates_ppo():
     )(params)
     np.testing.assert_array_equal(phasic_gradient, jax.grad(ppo_only)(params))
     assert not np.array_equal(phasic_gradient, legacy_gradients)
+
+
+def test_phasic_formatter_reports_pre_ppo_loss_and_derived_damage():
+    settings = resolve_phasic_reliability_settings(
+        _base_config(),
+        execution_index=1,
+        execution_actor_count=8,
+    )
+    diagnostics = empty_phasic_aux_diagnostics(
+        is_discrete=False,
+        settings=settings,
+    )
+    diagnostics["phasic_aux_active"] = jnp.array(1.0, dtype=jnp.float32)
+    diagnostics["survival_loss_before_aux"] = jnp.array(
+        0.6,
+        dtype=jnp.float32,
+    )
+
+    line, values = format_phasic_aux_diagnostics(
+        diagnostics,
+        update=4,
+        mode="phasic",
+        survival_loss_pre_ppo=jnp.array(0.75, dtype=jnp.float32),
+    )
+
+    assert "survival_loss_pre_ppo=0.75" in line
+    assert "ppo_damage_to_survival=-0.15" in line
+    assert values["survival_loss_pre_ppo"] == pytest.approx(0.75)
+    assert values["ppo_damage_to_survival"] == pytest.approx(-0.15)
 
 
 def test_categorical_kl_identity_perturbation_and_gradient():

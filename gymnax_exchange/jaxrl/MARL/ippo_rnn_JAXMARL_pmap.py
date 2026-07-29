@@ -79,10 +79,12 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     gradient_diag_should_run,
     subtract_gradient_trees,
     summarize_gradient_interaction,
+    summarize_phasic_gradient_interaction,
     validate_gradient_diag_config,
     validate_required_parameter_groups,
 )
 from gymnax_exchange.jaxrl.MARL.phasic_reliability import (
+    build_rollout_outputs,
     empty_phasic_aux_diagnostics,
     format_phasic_aux_diagnostics,
     make_auxiliary_optimizer,
@@ -936,7 +938,6 @@ def make_train(config):
                     and config.get("use_reliability_head", False)
                     and config.get("use_survival_loss", False)
                     and isinstance(traj_batch[i].obs, dict)
-                    and not phasic_mode
                 )
 
                 def _update_epoch(update_state, epoch_index):
@@ -1079,6 +1080,47 @@ def make_train(config):
                                 objective_survival_weight,
                             )
                             return components["total_loss"], components["metrics"]
+
+                        def _ppo_objective(
+                            params,
+                            init_hstate,
+                            traj_batch,
+                            gae,
+                            targets,
+                            surv_labels,
+                            surv_mask,
+                        ):
+                            return _compute_loss_components(
+                                params,
+                                init_hstate,
+                                traj_batch,
+                                gae,
+                                targets,
+                                surv_labels,
+                                surv_mask,
+                                0.0,
+                            )["ppo_loss"]
+
+                        def _survival_objective(
+                            params,
+                            init_hstate,
+                            traj_batch,
+                            gae,
+                            targets,
+                            surv_labels,
+                            surv_mask,
+                        ):
+                            return _compute_loss_components(
+                                params,
+                                init_hstate,
+                                traj_batch,
+                                gae,
+                                targets,
+                                surv_labels,
+                                surv_mask,
+                                0.0,
+                            )["survival_loss"]
+
                         grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                         total_loss, grads = grad_fn(
                             train_state.params,
@@ -1101,6 +1143,41 @@ def make_train(config):
                             )
 
                             def _compute_grad_interaction_diag(_):
+                                if phasic_mode:
+                                    ppo_grads = jax.grad(_ppo_objective)(
+                                        train_state.params,
+                                        init_hstate,
+                                        traj_batch,
+                                        advantages,
+                                        targets,
+                                        surv_labels,
+                                        surv_mask,
+                                    )
+                                    survival_grads = jax.grad(
+                                        _survival_objective
+                                    )(
+                                        train_state.params,
+                                        init_hstate,
+                                        traj_batch,
+                                        advantages,
+                                        targets,
+                                        surv_labels,
+                                        surv_mask,
+                                    )
+                                    ppo_grads = jax.lax.pmean(
+                                        ppo_grads,
+                                        axis_name="device_batch",
+                                    )
+                                    survival_grads = jax.lax.pmean(
+                                        survival_grads,
+                                        axis_name="device_batch",
+                                    )
+                                    return summarize_phasic_gradient_interaction(
+                                        train_state.params,
+                                        ppo_grads,
+                                        survival_grads,
+                                        survival_loss_pre_ppo,
+                                    )
                                 _, ppo_grads = jax.value_and_grad(
                                     _loss_fn,
                                     has_aux=True,
@@ -1135,9 +1212,6 @@ def make_train(config):
                                     joint_unit_grads,
                                     axis_name="device_batch",
                                 )
-                                # The objective is affine in this weight, so the
-                                # pmean of grad(w=1) - grad(w=0) is the raw
-                                # survival grad. Subtract after cross-device pmean.
                                 survival_grads = subtract_gradient_trees(
                                     joint_unit_grads,
                                     ppo_grads,
@@ -1148,6 +1222,7 @@ def make_train(config):
                                     ppo_grads,
                                     survival_grads,
                                     config.get("lambda_surv", 0.0),
+                                    survival_loss_pre_ppo,
                                 )
 
                             grad_interaction_diag = jax.lax.cond(
@@ -1224,6 +1299,39 @@ def make_train(config):
                     return update_state, total_loss
 
                 cadence_due = update_steps % grad_diag_cadence == 0
+                survival_loss_pre_ppo = jnp.array(0.0, dtype=jnp.float32)
+                if grad_diag_enabled and grad_diag_applicable and phasic_mode:
+                    def _compute_survival_loss_pre_ppo(_):
+                        pre_ppo_outputs = build_rollout_outputs(
+                            train_state.apply_fn,
+                            train_state.params,
+                            initial_hstates[i],
+                            traj_batch[i].obs,
+                            traj_batch[i].done,
+                            is_discrete=isinstance(
+                                env.action_spaces[i],
+                                spaces.Discrete,
+                            ),
+                        )
+                        pre_ppo_loss = masked_reliability_loss(
+                            pre_ppo_outputs.reliability_scores,
+                            survival_labels[i],
+                            survival_masks[i],
+                            loss_type=config.get("reliability_loss_type", "bce"),
+                            eps=config.get("survival_eps", 1e-8),
+                            reliability_logits=pre_ppo_outputs.reliability_logits,
+                        )
+                        return jax.lax.pmean(
+                            pre_ppo_loss,
+                            axis_name="device_batch",
+                        )
+
+                    survival_loss_pre_ppo = jax.lax.cond(
+                        cadence_due,
+                        _compute_survival_loss_pre_ppo,
+                        lambda _: jnp.array(0.0, dtype=jnp.float32),
+                        operand=None,
+                    )
                 initial_grad_interaction_diag = empty_gradient_interaction_diagnostics(
                     train_state.params,
                     enabled=grad_diag_enabled,
@@ -1244,7 +1352,7 @@ def make_train(config):
                         grad_diag_enabled
                         and not config.get("use_survival_loss", False)
                     ),
-                    reason_phasic_ppo_only=(grad_diag_enabled and phasic_mode),
+                    survival_loss_pre_ppo=survival_loss_pre_ppo,
                 )
                 update_state = (
                     train_state,
@@ -1753,17 +1861,39 @@ def make_train(config):
                     f"bid_min={_device_extreme('bid_target_min', bid_counts, np.min):.6g}",
                     f"bid_max={_device_extreme('bid_target_max', bid_counts, np.max):.6g}",
                 ]))
+                execution_grad_diag = metrics["grad_interaction_diag"][
+                    execution_agent_index
+                ]
                 grad_lines, grad_values = format_gradient_interaction_diagnostics(
-                    metrics["grad_interaction_diag"][execution_agent_index],
+                    execution_grad_diag,
                     update=int(np.asarray(jax.device_get(updates))),
                     agent="EXE",
+                    optimization_mode=phasic_settings.mode,
                 )
                 for line in grad_lines:
                     print(line)
+                survival_loss_pre_ppo = None
+                if (
+                    phasic_settings.mode == "phasic"
+                    and float(
+                        np.mean(
+                            np.asarray(
+                                jax.device_get(
+                                    execution_grad_diag["grad_diag_active"]
+                                )
+                            )
+                        )
+                    )
+                    >= 0.5
+                ):
+                    survival_loss_pre_ppo = execution_grad_diag[
+                        "survival_loss_pre_ppo"
+                    ]
                 phasic_line, phasic_values = format_phasic_aux_diagnostics(
                     metrics["phasic_aux_diag"][execution_agent_index],
                     update=int(np.asarray(jax.device_get(updates))),
                     mode=phasic_settings.mode,
+                    survival_loss_pre_ppo=survival_loss_pre_ppo,
                 )
                 print(phasic_line)
                 if config["WANDB_MODE"] != "disabled":

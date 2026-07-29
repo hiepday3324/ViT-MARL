@@ -19,6 +19,7 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     scale_gradient_tree,
     subtract_gradient_trees,
     summarize_gradient_interaction,
+    summarize_phasic_gradient_interaction,
     validate_gradient_diag_config,
     validate_required_parameter_groups,
 )
@@ -245,17 +246,24 @@ def test_fixed_reliability_batch_gradient_interaction_and_group_assignment():
         assert not bool(diagnostics["groups"][group]["cosine_valid"])
 
 
-def test_diagnostics_do_not_change_applied_update_or_rng():
+@pytest.mark.parametrize("optimization_mode", ("joint", "phasic"))
+def test_diagnostics_do_not_change_applied_update_or_rng(optimization_mode):
     params, components = _make_reliability_model_fixture()
     lambda_surv = 0.01
 
-    def total_objective(p):
-        ppo_loss, survival_loss = components(p)
-        return ppo_loss + lambda_surv * survival_loss
+    def ppo_objective(p):
+        ppo_loss, _survival_loss = components(p)
+        return ppo_loss
 
-    def weighted_objective(p, survival_weight):
+    def survival_objective(p):
+        _ppo_loss, survival_loss = components(p)
+        return survival_loss
+
+    def applied_objective(p):
         ppo_loss, survival_loss = components(p)
-        return ppo_loss + survival_weight * survival_loss
+        if optimization_mode == "phasic":
+            return ppo_loss
+        return ppo_loss + lambda_surv * survival_loss
 
     tx = optax.adam(1e-3)
     opt_state = tx.init(params)
@@ -263,21 +271,25 @@ def test_diagnostics_do_not_change_applied_update_or_rng():
 
     def run_update(enable_diagnostics):
         next_rng, _ = jax.random.split(initial_rng)
-        total_loss, total_grads = jax.value_and_grad(total_objective)(params)
+        total_loss, total_grads = jax.value_and_grad(applied_objective)(params)
         if enable_diagnostics:
-            ppo_grads = jax.grad(weighted_objective)(params, 0.0)
-            joint_unit_grads = jax.grad(weighted_objective)(params, 1.0)
-            survival_grads = subtract_gradient_trees(
-                joint_unit_grads,
-                ppo_grads,
-            )
-            diagnostics = summarize_gradient_interaction(
-                params,
-                total_grads,
-                ppo_grads,
-                survival_grads,
-                lambda_surv,
-            )
+            ppo_grads = jax.grad(ppo_objective)(params)
+            survival_grads = jax.grad(survival_objective)(params)
+            if optimization_mode == "phasic":
+                diagnostics = summarize_phasic_gradient_interaction(
+                    params,
+                    ppo_grads,
+                    survival_grads,
+                    survival_loss_pre_ppo=survival_objective(params),
+                )
+            else:
+                diagnostics = summarize_gradient_interaction(
+                    params,
+                    total_grads,
+                    ppo_grads,
+                    survival_grads,
+                    lambda_surv,
+                )
             assert bool(diagnostics["grad_diag_active"])
         updates, next_opt_state = tx.update(total_grads, opt_state, params)
         next_params = optax.apply_updates(params, updates)
@@ -316,9 +328,15 @@ def test_status_branches_have_static_pytree_and_first_minibatch_gate():
     ppo = jax.grad(lambda p: jnp.sum(p["params"]["x"] ** 2))(params)
     survival = jax.grad(lambda p: jnp.sum((p["params"]["x"] - 1) ** 2))(params)
     active = summarize_gradient_interaction(params, ppo, ppo, survival, 0.0)
+    phasic_active = summarize_phasic_gradient_interaction(
+        params,
+        ppo,
+        survival,
+        survival_loss_pre_ppo=0.25,
+    )
     structures = [
         jax.tree_util.tree_structure(item)
-        for item in (disabled, skipped, not_applicable, active)
+        for item in (disabled, skipped, not_applicable, active, phasic_active)
     ]
     assert all(structure == structures[0] for structure in structures[1:])
 
@@ -332,21 +350,66 @@ def test_status_branches_have_static_pytree_and_first_minibatch_gate():
         )
 
 
-def test_phasic_ppo_only_gradient_diagnostic_reason_is_explicit():
-    params = _toy_tree([1.0, 2.0])
-    diagnostics = empty_gradient_interaction_diagnostics(
+def test_phasic_gradient_diagnostics_log_only_raw_interaction_metrics():
+    params = {
+        "params": {
+            "ReliabilityFusionRNN_0": {
+                "LevelWiseReliabilityHead_0": {
+                    "kernel": jnp.array([1.0, 2.0], dtype=jnp.float32),
+                },
+                "fusion": {
+                    "kernel": jnp.array([3.0], dtype=jnp.float32),
+                },
+            },
+            "VisionAgent_0": {
+                "kernel": jnp.array([4.0], dtype=jnp.float32),
+            },
+        }
+    }
+    ppo_grads = jax.tree_util.tree_map(jnp.ones_like, params)
+    survival_grads = jax.tree_util.tree_map(
+        lambda value: -2.0 * jnp.ones_like(value),
         params,
-        enabled=True,
-        not_applicable=True,
-        reason_phasic_ppo_only=True,
     )
-    lines, _metrics = format_gradient_interaction_diagnostics(
+    diagnostics = summarize_phasic_gradient_interaction(
+        params,
+        ppo_grads,
+        survival_grads,
+        survival_loss_pre_ppo=jnp.array(0.75, dtype=jnp.float32),
+    )
+    lines, metrics = format_gradient_interaction_diagnostics(
         diagnostics,
         update=3,
+        optimization_mode="phasic",
     )
-    assert lines == [
-        "GRAD_DIAG update=3 status=not_applicable reason=phasic_ppo_only"
-    ]
+    assert len(lines) == 4
+    assert all("status=active" in line for line in lines)
+    assert all("optimization_mode=phasic" in line for line in lines)
+    assert all("ppo_grad_norm=" in line for line in lines)
+    assert all("survival_grad_norm_raw=" in line for line in lines)
+    assert all("ppo_survival_dot_raw=" in line for line in lines)
+    assert all("ppo_survival_cosine_raw=" in line for line in lines)
+    forbidden = (
+        "joint_grad_norm",
+        "survival_grad_norm_weighted",
+        "weighted_survival_to_ppo_grad_ratio",
+        "decomposition_abs_error",
+        "decomposition_rel_error",
+    )
+    assert all(
+        forbidden_name not in line
+        for line in lines
+        for forbidden_name in forbidden
+    )
+    assert all(
+        forbidden_name not in metric_name
+        for metric_name in metrics
+        for forbidden_name in forbidden
+    )
+    assert float(diagnostics["survival_loss_pre_ppo"]) == pytest.approx(0.75)
+    assert float(
+        diagnostics["groups"]["total"]["ppo_survival_cosine_raw"]
+    ) == pytest.approx(-1.0)
 
 
 def test_single_device_pmap_gradient_diagnostics_compile_and_are_finite():
@@ -381,3 +444,66 @@ def test_single_device_pmap_gradient_diagnostics_compile_and_are_finite():
     for value in metrics.values():
         assert bool(jnp.all(jnp.isfinite(jnp.asarray(value))))
     assert bool(jnp.all(metrics["decomposition_rel_error"] < 1e-5))
+
+
+def test_single_device_pmap_phasic_gradient_diagnostics_are_finite():
+    device_count = jax.local_device_count()
+    initial = jnp.tile(
+        jnp.array([[0.2, -0.4]], dtype=jnp.float32),
+        (device_count, 1),
+    )
+
+    @partial(jax.pmap, axis_name="device")
+    def pmapped(values):
+        params = {
+            "params": {
+                "ReliabilityFusionRNN_0": {
+                    "LevelWiseReliabilityHead_0": {"kernel": values},
+                    "fusion": {"kernel": values},
+                },
+                "VisionAgent_0": {"kernel": values},
+            }
+        }
+
+        def objective(tree, offset):
+            return sum(
+                jnp.sum(jnp.square(leaf - offset))
+                for leaf in jax.tree_util.tree_leaves(tree)
+            )
+
+        ppo = jax.grad(objective)(params, 0.0)
+        survival = jax.grad(objective)(params, 1.0)
+        ppo = jax.lax.pmean(ppo, "device")
+        survival = jax.lax.pmean(survival, "device")
+        return summarize_phasic_gradient_interaction(
+            params,
+            ppo,
+            survival,
+            survival_loss_pre_ppo=jax.lax.pmean(
+                jnp.array(0.4, dtype=jnp.float32),
+                "device",
+            ),
+        )
+
+    diagnostics = pmapped(initial)
+    assert bool(jnp.all(diagnostics["grad_diag_active"]))
+    np.testing.assert_allclose(
+        np.asarray(diagnostics["survival_loss_pre_ppo"]),
+        0.4,
+        atol=1e-7,
+    )
+    for group in (
+        "total",
+        "reliability_head",
+        "vision_encoder",
+        "fusion_shared_trunk",
+    ):
+        for key in (
+            "ppo_grad_norm",
+            "survival_grad_norm_raw",
+            "ppo_survival_dot_raw",
+            "ppo_survival_cosine_raw",
+        ):
+            assert bool(
+                jnp.all(jnp.isfinite(diagnostics["groups"][group][key]))
+            )
