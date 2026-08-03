@@ -15,6 +15,7 @@
 "use_survival_loss": False
 "lambda_surv": 0.0
 "enable_grad_interaction_diag": False
+"enable_box_ppo_numerics_diag": False
 "grad_interaction_diag_every_updates": 1
 "reliability_optimization_mode": "joint"
 "aux_reliability_epochs": 1

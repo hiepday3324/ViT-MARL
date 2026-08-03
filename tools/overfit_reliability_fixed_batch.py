@@ -51,6 +51,7 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     subtract_gradient_trees,
     tree_l2_norm,
 )
+from gymnax_exchange.jaxrl.MARL.box_ppo import sample_policy_action
 from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     build_liquidity_survival_targets,
     masked_reliability_loss,
@@ -278,24 +279,44 @@ def _collect_rollout(config: Dict[str, Any]) -> RolloutBundle:
 
     for _step in range(total_rollout_steps):
         actions = []
+        pre_tanh_actions = []
         values = []
         log_probs = []
         for i, train_state in enumerate(train_states):
             obs_i = batchify(last_obs[i], config["NUM_ACTORS_PERTYPE"][i])
             obs_i_batched = jax.tree.map(lambda x: x[jnp.newaxis, :], obs_i)
             ac_in = (obs_i_batched, last_done[i][jnp.newaxis, :])
-            hstates[i], pi, value, _, _ = train_state.apply_fn(
+            hstates[i], pi, value, _, policy_aux_info = train_state.apply_fn(
                 train_state.params,
                 hstates[i],
                 ac_in,
             )
             rng, action_rng = jax.random.split(rng)
-            action = pi.sample(seed=action_rng)
+            action_space = env.action_spaces[i]
+            sample_kwargs = {}
+            if hasattr(action_space, "low") and hasattr(action_space, "high"):
+                sample_kwargs = {
+                    "action_low": action_space.low,
+                    "action_high": action_space.high,
+                }
+            policy_sample = sample_policy_action(
+                pi,
+                policy_aux_info,
+                action_rng,
+                **sample_kwargs,
+            )
             values.append(value)
-            log_probs.append(pi.log_prob(action))
+            log_probs.append(policy_sample.log_prob)
             actions.append(
                 unbatchify(
-                    action,
+                    policy_sample.action,
+                    config["NUM_ENVS"],
+                    env.multi_agent_config.number_of_agents_per_type[i],
+                ).squeeze()
+            )
+            pre_tanh_actions.append(
+                unbatchify(
+                    policy_sample.pre_tanh_action,
                     config["NUM_ENVS"],
                     env.multi_agent_config.number_of_agents_per_type[i],
                 ).squeeze()
@@ -315,6 +336,10 @@ def _collect_rollout(config: Dict[str, Any]) -> RolloutBundle:
             ).squeeze()
             obs_batch = batchify(last_obs[i], config["NUM_ACTORS_PERTYPE"][i])
             action_batch = batchify_action(actions[i], config["NUM_ACTORS_PERTYPE"][i])
+            pre_tanh_action_batch = batchify_action(
+                pre_tanh_actions[i],
+                config["NUM_ACTORS_PERTYPE"][i],
+            )
             info_world_i = {
                 **info["world"],
                 "obs_mid_price": pre_step_env_state.world_state.mid_price,
@@ -333,6 +358,7 @@ def _collect_rollout(config: Dict[str, Any]) -> RolloutBundle:
                     jnp.tile(done["__all__"], config["NUM_AGENTS_PER_TYPE"][i]),
                     last_done[i],
                     action_batch.squeeze(),
+                    pre_tanh_action_batch.squeeze(),
                     values[i].squeeze(),
                     batchify(reward[i], config["NUM_ACTORS_PERTYPE"][i]).squeeze(),
                     log_probs[i].squeeze(),

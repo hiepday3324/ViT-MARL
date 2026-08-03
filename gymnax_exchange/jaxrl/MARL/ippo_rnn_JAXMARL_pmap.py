@@ -83,6 +83,17 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     validate_gradient_diag_config,
     validate_required_parameter_groups,
 )
+from gymnax_exchange.jaxrl.MARL.box_ppo import (
+    FIRST_NONFINITE_STAGE_NAME,
+    build_box_ppo_numerics_diagnostics,
+    empty_box_ppo_numerics_diagnostics,
+    empty_ppo_safety_state,
+    guarded_ppo_apply_gradients,
+    policy_log_prob_from_transition,
+    sample_policy_action,
+    select_guarded_train_state,
+    update_ppo_safety_state,
+)
 from gymnax_exchange.jaxrl.MARL.phasic_reliability import (
     build_rollout_outputs,
     empty_phasic_aux_diagnostics,
@@ -290,6 +301,7 @@ class Transition(NamedTuple):
     global_done: jnp.ndarray
     done: jnp.ndarray
     action: jnp.ndarray
+    pre_tanh_action: jnp.ndarray
     value: jnp.ndarray
     reward: jnp.ndarray
     log_prob: jnp.ndarray
@@ -328,6 +340,7 @@ def make_train(config):
     # scenario = map_name_to_scenario(config["MAP_NAME"])
     grad_diag_cadence = validate_gradient_diag_config(config)
     grad_diag_enabled = bool(config.get("enable_grad_interaction_diag", False))
+    box_ppo_diag_enabled = bool(config.get("enable_box_ppo_numerics_diag", False))
     init_key = jax.random.PRNGKey(config["SEED"])
     config_dict={"MarketMaking": MarketMaking_EnvironmentConfig,"Execution": Execution_EnvironmentConfig}
     print("init_key: ", init_key)
@@ -668,6 +681,7 @@ def make_train(config):
                 # )
                 # obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
                 actions=[]
+                pre_tanh_actions=[]
                 values=[]
                 log_probs=[]
                 '''
@@ -683,12 +697,38 @@ def make_train(config):
                         last_done[i][jnp.newaxis, :],
                         # avail_actions,
                     )
-                    h_states[i], pi, value, _, _ = train_state.apply_fn(train_state.params, h_states[i], ac_in)
+                    h_states[i], pi, value, _, policy_aux_info = train_state.apply_fn(
+                        train_state.params,
+                        h_states[i],
+                        ac_in,
+                    )
                     values.append(value)
-                    action = pi.sample(seed=_rng)
-                    log_probs.append(pi.log_prob(action))
-                    action=unbatchify(action, local_num_envs, env.multi_agent_config.number_of_agents_per_type[i])  # Reshape to match the action shape
+                    action_space = env.action_spaces[i]
+                    sample_kwargs = {}
+                    if isinstance(action_space, spaces.Box):
+                        sample_kwargs = {
+                            "action_low": action_space.low,
+                            "action_high": action_space.high,
+                        }
+                    policy_sample = sample_policy_action(
+                        pi,
+                        policy_aux_info,
+                        _rng,
+                        **sample_kwargs,
+                    )
+                    log_probs.append(policy_sample.log_prob)
+                    action = unbatchify(
+                        policy_sample.action,
+                        local_num_envs,
+                        env.multi_agent_config.number_of_agents_per_type[i],
+                    )
+                    pre_tanh_action = unbatchify(
+                        policy_sample.pre_tanh_action,
+                        local_num_envs,
+                        env.multi_agent_config.number_of_agents_per_type[i],
+                    )
                     actions.append(action.squeeze())
+                    pre_tanh_actions.append(pre_tanh_action.squeeze())
                     # env_act = unbatchify(
                     #     action, env.agents, config["NUM_ENVS"], env.num_agents
                     # )
@@ -714,6 +754,10 @@ def make_train(config):
                     done_batch['agents'][i] = batchify(done["agents"][i],local_num_actors_per_type[i]).squeeze()
                     obs_batch = batchify(last_obs[i],local_num_actors_per_type[i])
                     action_batch = batchify_action(actions[i],local_num_actors_per_type[i])
+                    pre_tanh_action_batch = batchify_action(
+                        pre_tanh_actions[i],
+                        local_num_actors_per_type[i],
+                    )
                     value = values[i]
                     log_prob = log_probs[i]
 
@@ -731,6 +775,7 @@ def make_train(config):
                         jnp.tile(done["__all__"], config["NUM_AGENTS_PER_TYPE"][i]),
                         last_done[i],
                         action_batch.squeeze(),
+                        pre_tanh_action_batch.squeeze(),
                         value.squeeze(),
                         batchify(reward[i], local_num_actors_per_type[i]).squeeze(),
                         log_prob.squeeze(),
@@ -926,9 +971,12 @@ def make_train(config):
             loss_infos = []
             grad_interaction_diags = []
             phasic_aux_diags = []
+            ppo_safety_diags = []
+            box_ppo_numerics_diags = []
             execution_post_ppo_rng = rng
             for i, train_state in enumerate(train_states):
                 agent_is_execution = _is_execution_agent(env.list_of_agents_configs[i])
+                agent_is_box = isinstance(env.action_spaces[i], spaces.Box)
                 ppo_objective_survival_weight = ppo_survival_loss_weight(
                     phasic_settings,
                     config.get("lambda_surv", 0.0),
@@ -942,7 +990,11 @@ def make_train(config):
 
                 def _update_epoch(update_state, epoch_index):
                     def _update_minbatch(update_carry, scan_input):
-                        train_state, grad_interaction_diag = update_carry
+                        (
+                            train_state,
+                            grad_interaction_diag,
+                            ppo_safety_state,
+                        ) = update_carry
                         batch_info, minibatch_index = scan_input
                         init_hstate, traj_batch, advantages, targets, surv_labels, surv_mask = batch_info
 
@@ -962,7 +1014,19 @@ def make_train(config):
                                 init_hstate.squeeze(),
                                 (traj_batch.obs, traj_batch.done),
                             )
-                            log_prob = pi.log_prob(traj_batch.action)
+                            replay_kwargs = {}
+                            if isinstance(env.action_spaces[i], spaces.Box):
+                                replay_kwargs = {
+                                    "action_low": env.action_spaces[i].low,
+                                    "action_high": env.action_spaces[i].high,
+                                }
+                            log_prob = policy_log_prob_from_transition(
+                                pi,
+                                aux_info,
+                                traj_batch.action,
+                                traj_batch.pre_tanh_action,
+                                **replay_kwargs,
+                            )
 
                             # CALCULATE VALUE LOSS
                             value_pred_clipped = traj_batch.value + (
@@ -977,6 +1041,7 @@ def make_train(config):
                             # CALCULATE ACTOR LOSS
                             logratio = log_prob - traj_batch.log_prob
                             ratio = jnp.exp(logratio)
+                            unnormalized_gae = gae
                             gae = (gae - gae.mean()) / (gae.std() + 1e-8)
                             loss_actor1 = ratio * gae
                             loss_actor2 = (
@@ -1045,6 +1110,27 @@ def make_train(config):
                                 "ppo_loss": ppo_loss,
                                 "survival_loss": survival_loss,
                                 "weighted_survival_loss": weighted_survival_loss,
+                                "ppo_numerics_inputs": {
+                                    "loc": aux_info.get(
+                                        "policy_loc",
+                                        jnp.zeros(
+                                            traj_batch.action.shape + (1,),
+                                            dtype=jnp.float32,
+                                        ),
+                                    ),
+                                    "log_std": aux_info.get(
+                                        "policy_log_std",
+                                        jnp.zeros((1,), dtype=jnp.float32),
+                                    ),
+                                    "pre_tanh_action": traj_batch.pre_tanh_action,
+                                    "action": traj_batch.action,
+                                    "old_log_prob": traj_batch.log_prob,
+                                    "new_log_prob": log_prob,
+                                    "logratio": logratio,
+                                    "ratio": ratio,
+                                    "advantage": unnormalized_gae,
+                                    "value": value,
+                                },
                                 "metrics": (
                                     value_loss,
                                     loss_actor,
@@ -1079,7 +1165,10 @@ def make_train(config):
                                 surv_mask,
                                 objective_survival_weight,
                             )
-                            return components["total_loss"], components["metrics"]
+                            return components["total_loss"], (
+                                components["metrics"],
+                                components["ppo_numerics_inputs"],
+                            )
 
                         def _ppo_objective(
                             params,
@@ -1132,8 +1221,23 @@ def make_train(config):
                             surv_mask,
                             ppo_objective_survival_weight,
                         )
-                        total_loss = jax.lax.pmean(total_loss, axis_name="device_batch")
+                        local_ppo_numerics_inputs = total_loss[1][1]
+                        total_loss = (
+                            jax.lax.pmean(
+                                total_loss[0],
+                                axis_name="device_batch",
+                            ),
+                            (
+                                jax.lax.pmean(
+                                    total_loss[1][0],
+                                    axis_name="device_batch",
+                                ),
+                                local_ppo_numerics_inputs,
+                            ),
+                        )
                         grads = jax.lax.pmean(grads, axis_name="device_batch")
+                        loss_value, loss_aux = total_loss
+                        loss_metrics, ppo_numerics_inputs = loss_aux
                         if grad_diag_enabled and grad_diag_applicable:
                             should_compute_grad_diag = gradient_diag_should_run(
                                 update_steps,
@@ -1231,8 +1335,70 @@ def make_train(config):
                                 lambda _: grad_interaction_diag,
                                 operand=None,
                             )
-                        train_state = train_state.apply_gradients(grads=grads)
-                        return (train_state, grad_interaction_diag), total_loss
+                        guarded_update = guarded_ppo_apply_gradients(
+                            train_state,
+                            grads,
+                            total_loss=loss_value,
+                            new_log_prob=ppo_numerics_inputs["new_log_prob"],
+                            logratio=ppo_numerics_inputs["logratio"],
+                            ratio=ppo_numerics_inputs["ratio"],
+                            axis_name="device_batch",
+                        )
+                        train_state_after = select_guarded_train_state(
+                            train_state,
+                            guarded_update,
+                            ppo_safety_state,
+                        )
+                        attempt_active = ~ppo_safety_state["stopped"]
+                        diagnostic_guard = guarded_update._replace(
+                            accepted=attempt_active & guarded_update.accepted,
+                            rejected_nonfinite=(
+                                attempt_active & guarded_update.rejected_nonfinite
+                            ),
+                        )
+                        ppo_safety_state = update_ppo_safety_state(
+                            ppo_safety_state,
+                            guarded_update,
+                            epoch_index=epoch_index,
+                            minibatch_index=minibatch_index,
+                        )
+                        if box_ppo_diag_enabled and agent_is_execution and agent_is_box:
+                            box_ppo_diag = build_box_ppo_numerics_diagnostics(
+                                enabled=True,
+                                loc=ppo_numerics_inputs["loc"],
+                                log_std=ppo_numerics_inputs["log_std"],
+                                pre_tanh_action=ppo_numerics_inputs["pre_tanh_action"],
+                                action=ppo_numerics_inputs["action"],
+                                action_low=env.action_spaces[i].low,
+                                action_high=env.action_spaces[i].high,
+                                old_log_prob=ppo_numerics_inputs["old_log_prob"],
+                                new_log_prob=ppo_numerics_inputs["new_log_prob"],
+                                advantage=ppo_numerics_inputs["advantage"],
+                                value=ppo_numerics_inputs["value"],
+                                grads=grads,
+                                total_loss=loss_value,
+                                candidate_update=diagnostic_guard,
+                                epoch_index=epoch_index,
+                                minibatch_index=minibatch_index,
+                            )
+                        else:
+                            action_dim = (
+                                env.action_spaces[i].shape[-1]
+                                if agent_is_box
+                                else 1
+                            )
+                            box_ppo_diag = empty_box_ppo_numerics_diagnostics(
+                                action_dim
+                            )
+                        total_loss = (
+                            loss_value,
+                            loss_metrics + (box_ppo_diag,),
+                        )
+                        return (
+                            train_state_after,
+                            grad_interaction_diag,
+                            ppo_safety_state,
+                        ), total_loss
                     (
                         train_state,
                         init_hstate,
@@ -1243,6 +1409,7 @@ def make_train(config):
                         surv_mask,
                         rng,
                         grad_interaction_diag,
+                        ppo_safety_state,
                     ) = update_state
                     rng, _rng = jax.random.split(rng)
 
@@ -1277,9 +1444,13 @@ def make_train(config):
                         shuffled_batch,
                     )
 
-                    (train_state, grad_interaction_diag), total_loss = jax.lax.scan(
+                    (
+                        train_state,
+                        grad_interaction_diag,
+                        ppo_safety_state,
+                    ), total_loss = jax.lax.scan(
                         _update_minbatch,
-                        (train_state, grad_interaction_diag),
+                        (train_state, grad_interaction_diag, ppo_safety_state),
                         (
                             minibatches,
                             jnp.arange(config["NUM_MINIBATCHES"], dtype=jnp.int32),
@@ -1295,6 +1466,7 @@ def make_train(config):
                         surv_mask,
                         rng,
                         grad_interaction_diag,
+                        ppo_safety_state,
                     )
                     return update_state, total_loss
 
@@ -1364,6 +1536,7 @@ def make_train(config):
                     survival_masks[i],
                     rng,
                     initial_grad_interaction_diag,
+                    empty_ppo_safety_state(),
                 )
                 update_state, loss_info = jax.lax.scan(
                     _update_epoch,
@@ -1372,7 +1545,9 @@ def make_train(config):
                 )
                 train_states[i] = update_state[0]
                 loss_infos.append(loss_info)
-                grad_interaction_diags.append(update_state[-1])
+                grad_interaction_diags.append(update_state[8])
+                ppo_safety_diags.append(update_state[9])
+                box_ppo_numerics_diags.append(loss_info[1][-1])
                 phasic_aux_diags.append(
                     empty_phasic_aux_diagnostics(
                         is_discrete=isinstance(env.action_spaces[i], spaces.Discrete),
@@ -1446,6 +1621,8 @@ def make_train(config):
             metrics["execution_target_diag"] = survival_target_diags
             metrics["grad_interaction_diag"] = grad_interaction_diags
             metrics["phasic_aux_diag"] = phasic_aux_diags
+            metrics["ppo_safety_diag"] = ppo_safety_diags
+            metrics["box_ppo_numerics_diag"] = box_ppo_numerics_diags
             metrics["loss"]=[]
             for i,loss_info in enumerate(loss_infos):
                 ratio_0 = loss_info[1][3].at[0,0].get().mean()
@@ -1485,6 +1662,7 @@ def make_train(config):
                     rng, _rng = jax.random.split(rng)
                 
                     actions=[]
+                    pre_tanh_actions=[]
                     values=[]
                     log_probs=[]
 
@@ -1497,12 +1675,38 @@ def make_train(config):
                             last_done[i][jnp.newaxis, :],
                             # avail_actions,
                         )
-                        h_states[i], pi, value, _, _ = train_state.apply_fn(train_state.params, h_states[i], ac_in)
+                        h_states[i], pi, value, _, policy_aux_info = train_state.apply_fn(
+                            train_state.params,
+                            h_states[i],
+                            ac_in,
+                        )
                         values.append(value)
-                        action = pi.sample(seed=_rng)
-                        log_probs.append(pi.log_prob(action))
-                        action=unbatchify(action, local_num_envs, env.multi_agent_config.number_of_agents_per_type[i])  # Reshape to match the action shape
+                        action_space = env.action_spaces[i]
+                        sample_kwargs = {}
+                        if isinstance(action_space, spaces.Box):
+                            sample_kwargs = {
+                                "action_low": action_space.low,
+                                "action_high": action_space.high,
+                            }
+                        policy_sample = sample_policy_action(
+                            pi,
+                            policy_aux_info,
+                            _rng,
+                            **sample_kwargs,
+                        )
+                        log_probs.append(policy_sample.log_prob)
+                        action = unbatchify(
+                            policy_sample.action,
+                            local_num_envs,
+                            env.multi_agent_config.number_of_agents_per_type[i],
+                        )
+                        pre_tanh_action = unbatchify(
+                            policy_sample.pre_tanh_action,
+                            local_num_envs,
+                            env.multi_agent_config.number_of_agents_per_type[i],
+                        )
                         actions.append(action.squeeze())
+                        pre_tanh_actions.append(pre_tanh_action.squeeze())
 
                         rng, _rng = jax.random.split(rng)
                         rng_step = jax.random.split(_rng, local_num_envs)
@@ -1526,6 +1730,10 @@ def make_train(config):
                         done_batch['agents'][i] = batchify(done["agents"][i],local_num_actors_per_type[i]).squeeze()
                         obs_batch = batchify(last_obs[i],local_num_actors_per_type[i])
                         action_batch = batchify_action(actions[i],local_num_actors_per_type[i])
+                        pre_tanh_action_batch = batchify_action(
+                            pre_tanh_actions[i],
+                            local_num_actors_per_type[i],
+                        )
                         value = values[i]
                         log_prob = log_probs[i]
 
@@ -1537,6 +1745,7 @@ def make_train(config):
                             jnp.tile(done["__all__"], config["NUM_AGENTS_PER_TYPE"][i]),
                             last_done[i],
                             action_batch.squeeze(),
+                            pre_tanh_action_batch.squeeze(),
                             value.squeeze(),
                             batchify(reward[i], local_num_actors_per_type[i]).squeeze(),
                             log_prob.squeeze(),
@@ -1759,6 +1968,32 @@ def make_train(config):
                     jax.block_until_ready((runner_state,updates,metrics))
                     jax.profiler.stop_trace()
             print(f"Update step {updates} completed with metrics {metrics['avg_reward']}")
+            update_index = int(np.asarray(jax.device_get(updates)).reshape(-1)[0])
+            for safety_agent_index, safety_diag in enumerate(
+                metrics["ppo_safety_diag"]
+            ):
+                stage_index = int(
+                    np.asarray(
+                        jax.device_get(safety_diag["first_nonfinite_stage"])
+                    ).reshape(-1)[0]
+                )
+                print(" ".join([
+                    "PPO_SAFETY",
+                    f"update={update_index}",
+                    f"agent_index={safety_agent_index}",
+                    "ppo_candidate_accepted="
+                    f"{str(bool(np.all(np.asarray(jax.device_get(safety_diag['ppo_candidate_accepted']))))).lower()}",
+                    "ppo_candidate_rejected_nonfinite="
+                    f"{str(bool(np.any(np.asarray(jax.device_get(safety_diag['ppo_candidate_rejected_nonfinite']))))).lower()}",
+                    "accepted_minibatch_count="
+                    f"{int(np.min(np.asarray(jax.device_get(safety_diag['accepted_minibatch_count']))))}",
+                    "first_nonfinite_stage="
+                    f"{FIRST_NONFINITE_STAGE_NAME.get(stage_index, f'unknown_{stage_index}')}",
+                    "rejected_epoch_index="
+                    f"{int(np.asarray(jax.device_get(safety_diag['rejected_epoch_index'])).reshape(-1)[0])}",
+                    "rejected_minibatch_index="
+                    f"{int(np.asarray(jax.device_get(safety_diag['rejected_minibatch_index'])).reshape(-1)[0])}",
+                ]))
             execution_agent_index = next(
                 (
                     idx
@@ -1768,6 +2003,162 @@ def make_train(config):
                 None,
             )
             if execution_agent_index is not None:
+                if box_ppo_diag_enabled and isinstance(
+                    env.action_spaces[execution_agent_index],
+                    spaces.Box,
+                ):
+                    box_diag = metrics["box_ppo_numerics_diag"][
+                        execution_agent_index
+                    ]
+                    box_active = np.asarray(jax.device_get(box_diag["active"]))
+                    for epoch_index in range(box_active.shape[1]):
+                        for minibatch_index in range(box_active.shape[2]):
+                            def _pmap_box_scalar(key):
+                                values = np.asarray(jax.device_get(box_diag[key]))[
+                                    :, epoch_index, minibatch_index
+                                ]
+                                return float(np.mean(values))
+
+                            def _pmap_box_scalar_min(key):
+                                values = np.asarray(jax.device_get(box_diag[key]))[
+                                    :, epoch_index, minibatch_index
+                                ]
+                                return float(np.min(values))
+
+                            def _pmap_box_scalar_max(key):
+                                values = np.asarray(jax.device_get(box_diag[key]))[
+                                    :, epoch_index, minibatch_index
+                                ]
+                                return float(np.max(values))
+
+                            def _pmap_box_vector(key):
+                                values = np.asarray(jax.device_get(box_diag[key]))[
+                                    :, epoch_index, minibatch_index
+                                ]
+                                return np.mean(values, axis=0)
+
+                            def _pmap_box_vector_min(key):
+                                values = np.asarray(jax.device_get(box_diag[key]))[
+                                    :, epoch_index, minibatch_index
+                                ]
+                                return np.min(values, axis=0)
+
+                            def _pmap_box_vector_max(key):
+                                values = np.asarray(jax.device_get(box_diag[key]))[
+                                    :, epoch_index, minibatch_index
+                                ]
+                                return np.max(values, axis=0)
+
+                            def _pmap_box_all(key):
+                                values = np.asarray(jax.device_get(box_diag[key]))[
+                                    :, epoch_index, minibatch_index
+                                ]
+                                return bool(np.all(values))
+
+                            def _pmap_box_any(key):
+                                values = np.asarray(jax.device_get(box_diag[key]))[
+                                    :, epoch_index, minibatch_index
+                                ]
+                                return bool(np.any(values))
+
+                            stage_index = int(
+                                np.max(
+                                    np.asarray(
+                                        jax.device_get(
+                                            box_diag["first_nonfinite_stage"]
+                                        )
+                                    )[:, epoch_index, minibatch_index]
+                                )
+                            )
+                            stage_name = FIRST_NONFINITE_STAGE_NAME.get(
+                                stage_index,
+                                f"unknown_{stage_index}",
+                            )
+
+                            print(" ".join([
+                                "BOX_PPO_NUMERICS",
+                                f"update={update_index}",
+                                f"epoch={epoch_index}",
+                                f"minibatch={minibatch_index}",
+                                "agent=EXE",
+                                "scope=pmap_device_mean",
+                                f"loc_mean={np.array2string(_pmap_box_vector('loc_mean'), precision=5)}",
+                                f"loc_std={np.array2string(_pmap_box_vector('loc_std'), precision=5)}",
+                                f"loc_min={np.array2string(_pmap_box_vector_min('loc_min'), precision=5)}",
+                                f"loc_max={np.array2string(_pmap_box_vector_max('loc_max'), precision=5)}",
+                                f"log_std={np.array2string(_pmap_box_vector('log_std'), precision=5)}",
+                                f"std={np.array2string(_pmap_box_vector('std'), precision=5)}",
+                                f"exact_low_count={np.array2string(np.sum(np.asarray(jax.device_get(box_diag['exact_low_count']))[:, epoch_index, minibatch_index], axis=0), precision=5)}",
+                                f"exact_high_count={np.array2string(np.sum(np.asarray(jax.device_get(box_diag['exact_high_count']))[:, epoch_index, minibatch_index], axis=0), precision=5)}",
+                                f"old_log_prob_mean={_pmap_box_scalar('old_log_prob_mean'):.6g}",
+                                f"old_log_prob_min={_pmap_box_scalar_min('old_log_prob_min'):.6g}",
+                                f"old_log_prob_max={_pmap_box_scalar_max('old_log_prob_max'):.6g}",
+                                f"new_log_prob_mean={_pmap_box_scalar('new_log_prob_mean'):.6g}",
+                                f"new_log_prob_min={_pmap_box_scalar_min('new_log_prob_min'):.6g}",
+                                f"new_log_prob_max={_pmap_box_scalar_max('new_log_prob_max'):.6g}",
+                                f"logratio_mean={_pmap_box_scalar('logratio_mean'):.6g}",
+                                f"logratio_std={_pmap_box_scalar('logratio_std'):.6g}",
+                                f"logratio_p95={_pmap_box_scalar('logratio_p95'):.6g}",
+                                f"logratio_p99={_pmap_box_scalar('logratio_p99'):.6g}",
+                                f"logratio_min={_pmap_box_scalar_min('logratio_min'):.6g}",
+                                f"logratio_max={_pmap_box_scalar_max('logratio_max'):.6g}",
+                                f"ratio_mean={_pmap_box_scalar('ratio_mean'):.6g}",
+                                f"ratio_std={_pmap_box_scalar('ratio_std'):.6g}",
+                                f"ratio_p95={_pmap_box_scalar('ratio_p95'):.6g}",
+                                f"ratio_p99={_pmap_box_scalar('ratio_p99'):.6g}",
+                                f"ratio_min={_pmap_box_scalar_min('ratio_min'):.6g}",
+                                f"ratio_max={_pmap_box_scalar_max('ratio_max'):.6g}",
+                            ]))
+                            print(" ".join([
+                                "BOX_PPO_ACTION_DIAG",
+                                f"update={update_index}",
+                                f"epoch={epoch_index}",
+                                f"minibatch={minibatch_index}",
+                                "scope=pmap_device_mean",
+                                f"pre_tanh_min={np.array2string(_pmap_box_vector_min('pre_tanh_min'), precision=5)}",
+                                f"pre_tanh_max={np.array2string(_pmap_box_vector_max('pre_tanh_max'), precision=5)}",
+                                f"action_min={np.array2string(_pmap_box_vector_min('action_min'), precision=5)}",
+                                f"action_max={np.array2string(_pmap_box_vector_max('action_max'), precision=5)}",
+                                f"exact_low_rate={np.array2string(_pmap_box_vector('exact_low_rate'), precision=5)}",
+                                f"exact_high_rate={np.array2string(_pmap_box_vector('exact_high_rate'), precision=5)}",
+                                f"near_low_rate={np.array2string(_pmap_box_vector('near_low_rate'), precision=5)}",
+                                f"near_high_rate={np.array2string(_pmap_box_vector('near_high_rate'), precision=5)}",
+                                f"advantage_mean={_pmap_box_scalar('advantage_mean'):.6g}",
+                                f"advantage_std={_pmap_box_scalar('advantage_std'):.6g}",
+                                f"advantage_min={_pmap_box_scalar_min('advantage_min'):.6g}",
+                                f"advantage_max={_pmap_box_scalar_max('advantage_max'):.6g}",
+                                f"value_mean={_pmap_box_scalar('value_mean'):.6g}",
+                                f"value_std={_pmap_box_scalar('value_std'):.6g}",
+                                f"value_min={_pmap_box_scalar_min('value_min'):.6g}",
+                                f"value_max={_pmap_box_scalar_max('value_max'):.6g}",
+                            ]))
+                            print(" ".join([
+                                "BOX_PPO_FINITE_DIAG",
+                                f"update={update_index}",
+                                f"epoch={epoch_index}",
+                                f"minibatch={minibatch_index}",
+                                "scope=pmap_global_guard",
+                                f"actor_loc_grad_norm={_pmap_box_scalar('actor_loc_grad_norm'):.6g}",
+                                f"log_std_grad_norm={_pmap_box_scalar('log_std_grad_norm'):.6g}",
+                                f"total_grad_norm={_pmap_box_scalar('total_grad_norm'):.6g}",
+                                f"candidate_accepted={str(_pmap_box_all('ppo_candidate_accepted')).lower()}",
+                                f"candidate_rejected_nonfinite={str(_pmap_box_any('ppo_candidate_rejected_nonfinite')).lower()}",
+                                f"first_nonfinite_stage={stage_name}",
+                                f"total_loss_finite={str(_pmap_box_all('total_loss_finite')).lower()}",
+                                f"loc_finite={str(_pmap_box_all('loc_finite')).lower()}",
+                                f"log_std_finite={str(_pmap_box_all('log_std_finite')).lower()}",
+                                f"pre_tanh_finite={str(_pmap_box_all('pre_tanh_finite')).lower()}",
+                                f"action_finite={str(_pmap_box_all('action_finite')).lower()}",
+                                f"old_log_prob_finite={str(_pmap_box_all('old_log_prob_finite')).lower()}",
+                                f"new_log_prob_finite={str(_pmap_box_all('new_log_prob_finite')).lower()}",
+                                f"logratio_finite={str(_pmap_box_all('logratio_finite')).lower()}",
+                                f"ratio_finite={str(_pmap_box_all('ratio_finite')).lower()}",
+                                f"advantage_finite={str(_pmap_box_all('advantage_finite')).lower()}",
+                                f"value_finite={str(_pmap_box_all('value_finite')).lower()}",
+                                f"gradients_finite={str(_pmap_box_all('gradients_finite')).lower()}",
+                                f"candidate_params_finite={str(_pmap_box_all('candidate_params_finite')).lower()}",
+                                f"candidate_optimizer_state_finite={str(_pmap_box_all('candidate_optimizer_state_finite')).lower()}",
+                            ]))
                 target_diag = metrics["execution_target_diag"][execution_agent_index]
 
                 def _device_diag_values(key):
