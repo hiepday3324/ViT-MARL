@@ -59,6 +59,10 @@ from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     masked_reliability_loss,
     resolve_rollout_is_sell_task,
 )
+from gymnax_exchange.jaxrl.MARL.execution_episode_metrics import (
+    accumulate_execution_episode_metrics,
+    empty_execution_episode_metrics,
+)
 from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     GRADIENT_GROUPS,
     PARAMETER_GROUP_RULES,
@@ -616,6 +620,7 @@ def make_train(config):
                     runner_hstates,
                     runner_rng,
                     runner_aux_opt_state,
+                    runner_exe_episode_return,
                 ) = runner_state
             else:
                 (
@@ -625,6 +630,7 @@ def make_train(config):
                     runner_last_done,
                     runner_hstates,
                     runner_rng,
+                    runner_exe_episode_return,
                 ) = runner_state
                 runner_aux_opt_state = None
             return (
@@ -635,6 +641,7 @@ def make_train(config):
                 runner_hstates,
                 runner_rng,
                 runner_aux_opt_state,
+                runner_exe_episode_return,
             )
 
         def _pack_runner_state(
@@ -645,6 +652,7 @@ def make_train(config):
             runner_hstates,
             runner_rng,
             runner_aux_opt_state,
+            runner_exe_episode_return,
         ):
             base_state = (
                 runner_train_states,
@@ -654,7 +662,12 @@ def make_train(config):
                 runner_hstates,
                 runner_rng,
             )
-            return base_state + (runner_aux_opt_state,) if phasic_mode else base_state
+            if phasic_mode:
+                return base_state + (
+                    runner_aux_opt_state,
+                    runner_exe_episode_return,
+                )
+            return base_state + (runner_exe_episode_return,)
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
@@ -682,6 +695,7 @@ def make_train(config):
                     h_states,
                     rng,
                     current_aux_opt_state,
+                    running_exe_episode_return,
                 ) = _unpack_runner_state(runner_state)
 
                 # SELECT ACTION
@@ -804,6 +818,7 @@ def make_train(config):
                     h_states,
                     rng,
                     current_aux_opt_state,
+                    running_exe_episode_return,
                 )
                 return runner_state, transitions
             initial_hstates = _unpack_runner_state(runner_state)[4]
@@ -1126,7 +1141,32 @@ def make_train(config):
                 h_states,
                 _,
                 aux_opt_state,
+                running_exe_episode_return,
             ) = _unpack_runner_state(stashed_runner_state)
+
+            if execution_index is not None:
+                execution_trajectory = traj_batch[execution_index]
+                execution_reward_shape = execution_trajectory.reward.shape
+                execution_quant_left = jnp.reshape(
+                    execution_trajectory.info["agent"]["quant_left"],
+                    execution_reward_shape,
+                )
+                execution_task_size = jnp.reshape(
+                    execution_trajectory.info["agent"]["denom_task"],
+                    execution_reward_shape,
+                )
+                (
+                    running_exe_episode_return,
+                    execution_episode_metrics,
+                ) = accumulate_execution_episode_metrics(
+                    running_exe_episode_return,
+                    execution_trajectory.reward,
+                    execution_trajectory.global_done,
+                    execution_quant_left,
+                    execution_task_size,
+                )
+            else:
+                execution_episode_metrics = empty_execution_episode_metrics()
             
             # Chôm chìa khóa RNG từ bước 138 (final_runner_state).
             fresh_rng = _unpack_runner_state(final_runner_state)[5]
@@ -1140,6 +1180,7 @@ def make_train(config):
                 h_states,
                 fresh_rng,
                 aux_opt_state,
+                running_exe_episode_return,
             )
 
             # CALCULATE ADVANTAGE
@@ -1151,6 +1192,7 @@ def make_train(config):
                 hstates_new,
                 rng,
                 aux_opt_state,
+                running_exe_episode_return,
             ) = _unpack_runner_state(runner_state)
 
             def _calculate_gae(gamma,gae_lambda,traj_batch, last_val):
@@ -2072,6 +2114,7 @@ def make_train(config):
 
             metrics['avg_reward'] = [jnp.mean(tr.reward) for tr in traj_batch]
             metrics['avg_reward_flattened'] = [jnp.mean(tr.reward.flatten()) for tr in traj_batch]
+            metrics["execution_episode_metrics"] = execution_episode_metrics
             metrics["traj_batch"] = callback_traj_batch
 
 
@@ -2832,6 +2875,21 @@ def make_train(config):
                         logging_dict.update(grad_wandb_metrics)
                         logging_dict.update(phasic_wandb_metrics)
                         logging_dict.update(box_ppo_wandb_metrics)
+                        exe_episode_metrics = metric["execution_episode_metrics"]
+                        logging_dict.update({
+                            "agent_EXE/episode_count": int(
+                                np.asarray(exe_episode_metrics.episode_count)
+                            ),
+                            "agent_EXE/episode_return_mean": float(
+                                np.asarray(exe_episode_metrics.episode_return_mean)
+                            ),
+                            "agent_EXE/terminal_quant_left_mean": float(
+                                np.asarray(exe_episode_metrics.terminal_quant_left_mean)
+                            ),
+                            "agent_EXE/terminal_fill_ratio_mean": float(
+                                np.asarray(exe_episode_metrics.terminal_fill_ratio_mean)
+                            ),
+                        })
                     logging_dict.update(
                         ppo_safety_wandb_metrics[agent_index]
                     )
@@ -3046,6 +3104,13 @@ def make_train(config):
                 for agent_index, agent_value in enumerate(metric["avg_reward"]):
                     agent_name = agent_type_names[agent_index]
                     summary_parts.append(f"avg_reward_{agent_name}={float(np.array(agent_value)):.6g}")
+                exe_episode_metrics = metric["execution_episode_metrics"]
+                summary_parts.extend([
+                    f"exe_episode_count={int(np.asarray(exe_episode_metrics.episode_count))}",
+                    f"exe_episode_return_mean={float(np.asarray(exe_episode_metrics.episode_return_mean)):.6g}",
+                    f"exe_terminal_quant_left_mean={float(np.asarray(exe_episode_metrics.terminal_quant_left_mean)):.6g}",
+                    f"exe_terminal_fill_ratio_mean={float(np.asarray(exe_episode_metrics.terminal_fill_ratio_mean)):.6g}",
+                ])
                 print("[SUMMARY]")
                 print(" ".join(summary_parts))
 
@@ -3060,6 +3125,7 @@ def make_train(config):
                 hstates_new,
                 rng,
                 aux_opt_state,
+                running_exe_episode_return,
             )
 
             print("Finished compiling")
@@ -3067,6 +3133,10 @@ def make_train(config):
             return (runner_state, update_steps), metrics
 
         rng, _rng = jax.random.split(rng)
+        running_exe_episode_return = jnp.zeros(
+            (execution_actor_count or 0,),
+            dtype=jnp.float32,
+        )
         runner_state = _pack_runner_state(
             train_states,
             env_state,
@@ -3075,6 +3145,7 @@ def make_train(config):
             hstates,
             _rng,
             aux_opt_state,
+            running_exe_episode_return,
         )
 
         jitted_update_step = jax.jit(_update_step)
