@@ -133,6 +133,19 @@ class MARLEnv(MultiAgentEnv):
         self.num_msgs_per_step = int(num_msg_per_step)
         self.num_action_msgs_per_step_by_all_agents = int(num_action_msg_per_step_by_all_agents)
 
+    def _get_shadow_twap_snapshot(
+        self,
+        pre_step_world_state: WorldState,
+        post_step_asks: jnp.ndarray,
+        post_step_bids: jnp.ndarray,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """Return the decision-time book observed before current agent actions."""
+        del post_step_asks, post_step_bids
+        return (
+            pre_step_world_state.ask_raw_orders,
+            pre_step_world_state.bid_raw_orders,
+        )
+
     def _message_diagnostics(
         self,
         action_msgs: jnp.ndarray,
@@ -495,12 +508,48 @@ class MARLEnv(MultiAgentEnv):
         agent_reward_list = []
         agent_extras_list = []
 
+        shadow_asks, shadow_bids = self._get_shadow_twap_snapshot(
+            state.world_state,
+            new_asks,
+            new_bids,
+        )
+
         for agent_type_index in range(len(self.instance_list)):
             # print("agent_type_index: ", agent_type_index)
             agent_state = state.agent_states[agent_type_index]
             agent_params = params.agent_params[agent_type_index]
-            vmapped_function = vmap(self.instance_list[agent_type_index]._get_reward, in_axes=(None,0,0,None,None,None,None), out_axes = (0,0))
-            reward, extras = vmapped_function(state.world_state, agent_state, agent_params, new_trades, new_bestasks, new_bestbids, final_time)
+            if isinstance(self.instance_list[agent_type_index], ExecutionAgent):
+                vmapped_function = vmap(
+                    self.instance_list[agent_type_index]._get_reward,
+                    in_axes=(None, 0, 0, None, None, None, None, None, None),
+                    out_axes=(0, 0),
+                )
+                reward, extras = vmapped_function(
+                    state.world_state,
+                    agent_state,
+                    agent_params,
+                    new_trades,
+                    shadow_asks,
+                    shadow_bids,
+                    new_bestasks,
+                    new_bestbids,
+                    final_time,
+                )
+            else:
+                vmapped_function = vmap(
+                    self.instance_list[agent_type_index]._get_reward,
+                    in_axes=(None, 0, 0, None, None, None, None),
+                    out_axes=(0, 0),
+                )
+                reward, extras = vmapped_function(
+                    state.world_state,
+                    agent_state,
+                    agent_params,
+                    new_trades,
+                    new_bestasks,
+                    new_bestbids,
+                    final_time,
+                )
             agent_reward_list.append(reward)
             agent_extras_list.append(extras)
 

@@ -125,6 +125,7 @@ from gymnax_exchange.jaxob.jaxob_config import Execution_EnvironmentConfig,World
 from gymnax_exchange.jaxen.StatesandParams import ExecEnvState, ExecEnvParams, WorldState, ITT_WINDOW_SIZE
 from gymnax_exchange.jaxob.jaxob_config import World_EnvironmentConfig
 from gymnax_exchange.jaxen.StatesandParams import MultiAgentState, WorldState
+from gymnax_exchange.jaxen.shadow_twap import simulate_shadow_twap_interval
 
 
 #from gymnax_exchange.jaxen.from_JAXMARL import spaces
@@ -394,7 +395,9 @@ class ExecutionAgent():
         reward, extras = self._get_reward(world_state=state,      # Dùng state của agent làm world_state (vì nó chứa đủ thông tin time, steps)
                                         agent_state=state,      # Dùng state hiện tại
                                         agent_params=params, 
-                                        trades=trades, 
+                                        trades=trades,
+                                        decision_ask_raw_orders=state.ask_raw_orders,
+                                        decision_bid_raw_orders=state.bid_raw_orders,
                                         bestasks=bestasks, 
                                         bestbids=bestbids, 
                                         time=time
@@ -540,6 +543,9 @@ class ExecutionAgent():
             base_cost_window = _zero_itt_reward_window(),
             reward_window_ptr = jnp.array(0, dtype=jnp.int32),
             reward_window_count = jnp.array(0, dtype=jnp.int32),
+            shadow_cumulative_filled_quantity = jnp.array(0.0, dtype=jnp.float32),
+            shadow_remaining_task_quantity = jnp.asarray(self.cfg.task_size, dtype=jnp.float32),
+            shadow_cumulative_execution_cost = jnp.array(0.0, dtype=jnp.float32),
         )
 
         # Calculate things for the message obs space
@@ -668,6 +674,9 @@ class ExecutionAgent():
             base_cost_window=_zero_itt_reward_window(),
             reward_window_ptr=jnp.array(0, dtype=jnp.int32),
             reward_window_count=jnp.array(0, dtype=jnp.int32),
+            shadow_cumulative_filled_quantity=jnp.array(0.0, dtype=jnp.float32),
+            shadow_remaining_task_quantity=jnp.asarray(self.cfg.task_size, dtype=jnp.float32),
+            shadow_cumulative_execution_cost=jnp.array(0.0, dtype=jnp.float32),
             # updated on reset:
             delta_time=0.,
         )
@@ -2203,7 +2212,9 @@ class ExecutionAgent():
                     world_state: WorldState, 
                     agent_state: ExecEnvState, 
                     agent_params: ExecEnvParams, 
-                    trades: chex.Array, 
+                    trades: chex.Array,
+                    decision_ask_raw_orders: chex.Array,
+                    decision_bid_raw_orders: chex.Array,
                     bestasks: chex.Array, 
                     bestbids: chex.Array, 
                     time: jax.Array) -> jnp.int32:
@@ -2252,10 +2263,22 @@ class ExecutionAgent():
         # C. Windowed imitate-then-transcend reward using only real step trades.
         V_RL_step = jnp.asarray(agentQuant_step, dtype=jnp.float32)
         C_RL_step = jnp.asarray(c_rl_step, dtype=jnp.float32)
-        V_base_step = jnp.asarray(
-            self._get_static_twap_baseline_volume(world_state, agent_state),
-            dtype=jnp.float32,
+        scheduled_child_quantity = self._get_static_twap_baseline_volume(
+            world_state,
+            agent_state,
         )
+        shadow_step = simulate_shadow_twap_interval(
+            decision_ask_raw_orders,
+            decision_bid_raw_orders,
+            scheduled_child_quantity,
+            agent_state.shadow_remaining_task_quantity,
+            agent_state.shadow_cumulative_filled_quantity,
+            agent_state.shadow_cumulative_execution_cost,
+            agent_state.is_sell_task,
+            self.world_config.tick_size,
+        )
+        V_base_step = shadow_step.filled_quantity
+        C_base_step = shadow_step.execution_cost
         p_benchmark_tick = jnp.asarray(
             jax.lax.cond(
                 agent_state.is_sell_task,
@@ -2264,7 +2287,6 @@ class ExecutionAgent():
             ),
             dtype=jnp.float32,
         )
-        C_base_step = V_base_step * p_benchmark_tick
 
         (
             rl_vol_window,
@@ -2335,7 +2357,7 @@ class ExecutionAgent():
         p_benchmark = p_benchmark_tick
 
         # 3. TÍNH R_COMP (CẠNH TRANH - SPREAD CAPTURE)
-        # V_base: Volume mục tiêu của TWAP trong bước này
+        # V_base is the actual Shadow TWAP fill for this step.
         v_base = V_base_step
 
         # Chi phí Benchmark giả định (nếu TWAP khớp Market Order với volume thực tế của Agent)
@@ -2348,7 +2370,7 @@ class ExecutionAgent():
         # r_comp/r_mimic/reward are computed from the rolling j=64 window above.
 
         # 4. TÍNH R_MIMIC (HÌNH PHẠT KHỐI LƯỢNG)
-        # Phạt nếu khối lượng khớp lệch so với kế hoạch TWAP
+        # Penalize deviations from the teacher's actual shadow execution volume.
         r_mimic_scaled = r_mimic
 
         # 5. TỔNG HỢP REWARD
@@ -2406,6 +2428,12 @@ class ExecutionAgent():
             "base_cost_window": base_cost_window,
             "reward_window_ptr": reward_window_ptr,
             "reward_window_count": reward_window_count,
+            "shadow_cumulative_filled_quantity": shadow_step.cumulative_filled_quantity,
+            "shadow_remaining_task_quantity": shadow_step.remaining_task_quantity,
+            "shadow_cumulative_execution_cost": shadow_step.cumulative_execution_cost,
+            "shadow_scheduled_child_quantity": shadow_step.scheduled_child_quantity,
+            "shadow_child_quantity": shadow_step.child_quantity,
+            "shadow_unexecuted_child_quantity": shadow_step.unexecuted_quantity,
             "agentQuant_step": agentQuant_step,
             "c_rl_step": c_rl_step,
             "v_base_step": v_base,
@@ -2465,7 +2493,10 @@ class ExecutionAgent():
             base_vol_window = extras["base_vol_window"],
             base_cost_window = extras["base_cost_window"],
             reward_window_ptr = extras["reward_window_ptr"],
-            reward_window_count = extras["reward_window_count"])
+            reward_window_count = extras["reward_window_count"],
+            shadow_cumulative_filled_quantity = extras["shadow_cumulative_filled_quantity"],
+            shadow_remaining_task_quantity = extras["shadow_remaining_task_quantity"],
+            shadow_cumulative_execution_cost = extras["shadow_cumulative_execution_cost"])
         
         # Get done
         done = self.is_terminal(world_state, agent_state)

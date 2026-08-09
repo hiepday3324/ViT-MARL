@@ -119,6 +119,9 @@ class ExecEnvState():
     base_cost_window: jnp.ndarray
     reward_window_ptr: jnp.int32
     reward_window_count: jnp.int32
+    shadow_cumulative_filled_quantity: float = 0.0
+    shadow_remaining_task_quantity: float = 0.0
+    shadow_cumulative_execution_cost: float = 0.0
 
 
 

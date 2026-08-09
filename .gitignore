@@ -22,3 +22,4 @@ gymnax_exchange/jaxen/__pycache__/mm_env.cpython-311.pyc
 !/tests/test_gradient_interaction_diagnostics.py
 !/tests/test_phasic_reliability.py
 !/tests/test_box_ppo_numerics.py
+!/tests/test_shadow_twap_teacher.py
