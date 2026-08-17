@@ -125,7 +125,12 @@ from gymnax_exchange.jaxob.jaxob_config import Execution_EnvironmentConfig,World
 from gymnax_exchange.jaxen.StatesandParams import ExecEnvState, ExecEnvParams, WorldState, ITT_WINDOW_SIZE
 from gymnax_exchange.jaxob.jaxob_config import World_EnvironmentConfig
 from gymnax_exchange.jaxen.StatesandParams import MultiAgentState, WorldState
-from gymnax_exchange.jaxen.shadow_twap import simulate_shadow_twap_interval
+from gymnax_exchange.jaxen.shadow_twap import (
+    compute_terminal_execution_benchmark,
+    empty_terminal_execution_benchmark,
+    simulate_shadow_twap_interval,
+)
+from gymnax_exchange.jaxen.twap_schedule import fixed_step_twap_child_quantity
 
 
 #from gymnax_exchange.jaxen.from_JAXMARL import spaces
@@ -1531,6 +1536,16 @@ class ExecutionAgent():
         return action_msgs 
 
     def _get_static_twap_baseline_volume(self, world_state: WorldState, agent_state: ExecEnvState):
+        """Return the TWAP base child for the current decision state."""
+        if self.world_config.ep_type == "fixed_steps":
+            return fixed_step_twap_child_quantity(
+                agent_state.task_to_execute,
+                world_state.step_counter,
+                world_state.max_steps_in_episode,
+            )
+
+        # Preserve the existing non-fixed-step behavior; this patch only
+        # corrects the active fixed-step schedule.
         max_steps = jnp.maximum(
             jnp.asarray(world_state.max_steps_in_episode, dtype=jnp.float32),
             1.0,
@@ -1605,8 +1620,8 @@ class ExecutionAgent():
         )
 
         # 2. Logic Policy Blending (Bắt chước TWAP rồi vượt qua)
-        # Tính V_twap: Khối lượng mục tiêu cho mỗi bước thời gian
-        # v_twap = Tổng khối lượng / Số bước dự kiến
+        # Fixed-step V_twap is the shared integer-apportioned child for this
+        # decision interval, so non-divisible tasks have no rounding drift.
         v_twap = self._get_static_twap_baseline_volume(world_state, agent_state)
         
         # V_base mặc định đặt tại Level 1 
@@ -2501,6 +2516,44 @@ class ExecutionAgent():
         # Get done
         done = self.is_terminal(world_state, agent_state)
 
+        # The world state here is S_{t+1} before MARLEnv.step auto-resets. Use
+        # it only for terminal evaluation; the read-only sweeps do not affect
+        # the reward teacher, real book, fills, or agent accounting.
+        terminal_benchmark = jax.lax.cond(
+            done,
+            lambda: compute_terminal_execution_benchmark(
+                world_state.ask_raw_orders,
+                world_state.bid_raw_orders,
+                task_quantity=agent_state.task_to_execute,
+                terminal_quant_left=new_quant_left,
+                rl_cumulative_filled_quantity=agent_state.quant_executed,
+                rl_cumulative_execution_cost=agent_state.total_revenue,
+                shadow_cumulative_filled_quantity=(
+                    agent_state.shadow_cumulative_filled_quantity
+                ),
+                shadow_remaining_task_quantity=(
+                    agent_state.shadow_remaining_task_quantity
+                ),
+                shadow_cumulative_execution_cost=(
+                    agent_state.shadow_cumulative_execution_cost
+                ),
+                arrival_price=agent_state.init_price,
+                is_sell_task=agent_state.is_sell_task,
+                tick_size=self.world_config.tick_size,
+            ),
+            empty_terminal_execution_benchmark,
+        )
+        terminal_realized_valid = done & terminal_benchmark.realized_is_valid
+        terminal_forced_valid = (
+            done & terminal_benchmark.forced_liquidation_is_valid
+        )
+        terminal_twap_forced_valid = (
+            done & terminal_benchmark.twap_forced_liquidation_is_valid
+        )
+        terminal_comparison_valid = (
+            done & terminal_benchmark.twap_comparison_valid
+        )
+
         # Get info
         average_price = jnp.nan_to_num(agent_state.total_revenue 
                                             / agent_state.quant_executed, 0.0)
@@ -2558,6 +2611,40 @@ class ExecutionAgent():
             "quant_left_before_unwind": extras["quant_left_before_unwind"],
             "doom_price": extras["doom_price"],
             "terminal_penalty_beta": extras["terminal_penalty_beta"],
+            "terminal_full_completion": (
+                done & terminal_benchmark.full_completion
+            ),
+            "terminal_realized_is_bps": jnp.where(
+                terminal_realized_valid,
+                terminal_benchmark.realized_is_bps,
+                0.0,
+            ),
+            "terminal_realized_is_valid": terminal_realized_valid,
+            "terminal_forced_liquidation_is_bps": jnp.where(
+                terminal_forced_valid,
+                terminal_benchmark.forced_liquidation_is_bps,
+                0.0,
+            ),
+            "terminal_forced_liquidation_is_valid": terminal_forced_valid,
+            "terminal_twap_forced_liquidation_is_bps": jnp.where(
+                terminal_twap_forced_valid,
+                terminal_benchmark.twap_forced_liquidation_is_bps,
+                0.0,
+            ),
+            "terminal_twap_forced_liquidation_is_valid": (
+                terminal_twap_forced_valid
+            ),
+            "terminal_twap_advantage_bps": jnp.where(
+                terminal_comparison_valid,
+                terminal_benchmark.twap_advantage_bps,
+                0.0,
+            ),
+            "terminal_twap_comparison_valid": terminal_comparison_valid,
+            "terminal_twap_win": jnp.where(
+                terminal_comparison_valid,
+                terminal_benchmark.twap_win,
+                0.0,
+            ),
         }
 
         #jax.debug.print("info exec env: {}", info)

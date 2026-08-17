@@ -1155,6 +1155,13 @@ def make_train(config):
                     execution_trajectory.info["agent"]["denom_task"],
                     execution_reward_shape,
                 )
+                execution_info = execution_trajectory.info["agent"]
+
+                def reshape_execution_info(key):
+                    return jnp.reshape(
+                        execution_info[key],
+                        execution_reward_shape,
+                    )
                 (
                     running_exe_episode_return,
                     execution_episode_metrics,
@@ -1164,6 +1171,34 @@ def make_train(config):
                     execution_trajectory.global_done,
                     execution_quant_left,
                     execution_task_size,
+                    full_completion=reshape_execution_info(
+                        "terminal_full_completion"
+                    ),
+                    realized_is_bps=reshape_execution_info(
+                        "terminal_realized_is_bps"
+                    ),
+                    realized_is_valid=reshape_execution_info(
+                        "terminal_realized_is_valid"
+                    ),
+                    forced_liquidation_is_bps=reshape_execution_info(
+                        "terminal_forced_liquidation_is_bps"
+                    ),
+                    forced_liquidation_is_valid=reshape_execution_info(
+                        "terminal_forced_liquidation_is_valid"
+                    ),
+                    twap_forced_liquidation_is_bps=reshape_execution_info(
+                        "terminal_twap_forced_liquidation_is_bps"
+                    ),
+                    twap_forced_liquidation_is_valid=reshape_execution_info(
+                        "terminal_twap_forced_liquidation_is_valid"
+                    ),
+                    twap_advantage_bps=reshape_execution_info(
+                        "terminal_twap_advantage_bps"
+                    ),
+                    twap_comparison_valid=reshape_execution_info(
+                        "terminal_twap_comparison_valid"
+                    ),
+                    twap_win=reshape_execution_info("terminal_twap_win"),
                 )
             else:
                 execution_episode_metrics = empty_execution_episode_metrics()
@@ -1998,6 +2033,18 @@ def make_train(config):
                 "obs_ask_raw_orders",
                 "obs_bid_raw_orders",
             }
+            callback_agent_exclusions = {
+                "terminal_full_completion",
+                "terminal_realized_is_bps",
+                "terminal_realized_is_valid",
+                "terminal_forced_liquidation_is_bps",
+                "terminal_forced_liquidation_is_valid",
+                "terminal_twap_forced_liquidation_is_bps",
+                "terminal_twap_forced_liquidation_is_valid",
+                "terminal_twap_advantage_bps",
+                "terminal_twap_comparison_valid",
+                "terminal_twap_win",
+            }
             callback_traj_batch = [
                 transition._replace(
                     info={
@@ -2006,7 +2053,11 @@ def make_train(config):
                             for key, value in transition.info["world"].items()
                             if key not in callback_world_exclusions
                         },
-                        "agent": transition.info["agent"],
+                        "agent": {
+                            key: value
+                            for key, value in transition.info["agent"].items()
+                            if key not in callback_agent_exclusions
+                        },
                     }
                 )
                 for transition in traj_batch
@@ -2250,7 +2301,11 @@ def make_train(config):
                                 for key, value in transition.info["world"].items()
                                 if key not in callback_world_exclusions
                             },
-                            "agent": transition.info["agent"],
+                            "agent": {
+                                key: value
+                                for key, value in transition.info["agent"].items()
+                                if key not in callback_agent_exclusions
+                            },
                         }
                     )
                     for transition in eval_traj_batch
@@ -2889,6 +2944,28 @@ def make_train(config):
                             "agent_EXE/terminal_fill_ratio_mean": float(
                                 np.asarray(exe_episode_metrics.terminal_fill_ratio_mean)
                             ),
+                            "agent_EXE/full_completion_rate": float(
+                                np.asarray(exe_episode_metrics.full_completion_rate)
+                            ),
+                            "agent_EXE/realized_is_bps_mean": float(
+                                np.asarray(exe_episode_metrics.realized_is_bps_mean)
+                            ),
+                            "agent_EXE/forced_liquidation_is_bps_mean": float(
+                                np.asarray(
+                                    exe_episode_metrics.forced_liquidation_is_bps_mean
+                                )
+                            ),
+                            "agent_EXE/twap_forced_liquidation_is_bps_mean": float(
+                                np.asarray(
+                                    exe_episode_metrics.twap_forced_liquidation_is_bps_mean
+                                )
+                            ),
+                            "agent_EXE/twap_advantage_bps_mean": float(
+                                np.asarray(exe_episode_metrics.twap_advantage_bps_mean)
+                            ),
+                            "agent_EXE/twap_win_rate": float(
+                                np.asarray(exe_episode_metrics.twap_win_rate)
+                            ),
                         })
                     logging_dict.update(
                         ppo_safety_wandb_metrics[agent_index]
@@ -3110,6 +3187,12 @@ def make_train(config):
                     f"exe_episode_return_mean={float(np.asarray(exe_episode_metrics.episode_return_mean)):.6g}",
                     f"exe_terminal_quant_left_mean={float(np.asarray(exe_episode_metrics.terminal_quant_left_mean)):.6g}",
                     f"exe_terminal_fill_ratio_mean={float(np.asarray(exe_episode_metrics.terminal_fill_ratio_mean)):.6g}",
+                    f"exe_full_completion_rate={float(np.asarray(exe_episode_metrics.full_completion_rate)):.6g}",
+                    f"exe_realized_is_bps_mean={float(np.asarray(exe_episode_metrics.realized_is_bps_mean)):.6g}",
+                    f"exe_forced_liquidation_is_bps_mean={float(np.asarray(exe_episode_metrics.forced_liquidation_is_bps_mean)):.6g}",
+                    f"exe_twap_forced_liquidation_is_bps_mean={float(np.asarray(exe_episode_metrics.twap_forced_liquidation_is_bps_mean)):.6g}",
+                    f"exe_twap_advantage_bps_mean={float(np.asarray(exe_episode_metrics.twap_advantage_bps_mean)):.6g}",
+                    f"exe_twap_win_rate={float(np.asarray(exe_episode_metrics.twap_win_rate)):.6g}",
                 ])
                 print("[SUMMARY]")
                 print(" ".join(summary_parts))

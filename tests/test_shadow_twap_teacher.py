@@ -16,9 +16,11 @@ from gymnax_exchange.jaxen.StatesandParams import (
 from gymnax_exchange.jaxen.marl_env import MARLEnv
 from gymnax_exchange.jaxen.mm_env import MarketMakingAgent
 from gymnax_exchange.jaxen.shadow_twap import (
+    compute_terminal_execution_benchmark,
     shadow_market_order_sweep,
     simulate_shadow_twap_interval,
 )
+from gymnax_exchange.jaxen.twap_schedule import fixed_step_twap_child_quantity
 from gymnax_exchange.jaxen.vision_env import (
     ExecutionAgent,
     _compute_windowed_itt_reward,
@@ -192,7 +194,7 @@ def _synthetic_marl_fixture(seed):
         trades=jnp.full((world_config.nTrades, 8), -1, dtype=jnp.int32),
         init_time=jnp.asarray([34200, 0], dtype=jnp.int32),
         window_index=0,
-        max_steps_in_episode=world_config.episode_time,
+        max_steps_in_episode=world_config.episode_time + 1,
         start_index=0,
         step_counter=0,
         best_bids=best_bids,
@@ -289,22 +291,26 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
         self.assertAlmostEqual(float(step.unexecuted_quantity), 10.0)
 
     def test_partial_fill_is_not_carried_to_next_interval(self):
+        first_scheduled = fixed_step_twap_child_quantity(20, 0, 3)
         first = _run_interval(
             _orders([100], [7]),
             _orders([99], [100]),
-            scheduled=10,
+            scheduled=first_scheduled,
             remaining=20,
         )
+        second_scheduled = fixed_step_twap_child_quantity(20, 1, 3)
         second = _run_interval(
             _orders([100], [20]),
             _orders([99], [100]),
-            scheduled=10,
+            scheduled=second_scheduled,
             remaining=first.remaining_task_quantity,
             cumulative_fill=first.cumulative_filled_quantity,
             cumulative_cost=first.cumulative_execution_cost,
         )
         self.assertAlmostEqual(float(first.filled_quantity), 7.0)
         self.assertAlmostEqual(float(first.unexecuted_quantity), 3.0)
+        self.assertEqual(int(first_scheduled), 10)
+        self.assertEqual(int(second_scheduled), 10)
         self.assertAlmostEqual(float(second.child_quantity), 10.0)
         self.assertAlmostEqual(float(second.filled_quantity), 10.0)
 
@@ -392,6 +398,41 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
         self.assertAlmostEqual(float(info["V_base_step"]), 20.0)
         self.assertAlmostEqual(float(info["C_base_step"]), 2025.0)
         self.assertNotAlmostEqual(float(info["C_base_step"]), 20.0 * 100.0)
+
+    def test_policy_and_shadow_receive_the_same_integer_twap_child(self):
+        agent, world_state, agent_state, agent_params, trades = self._reward_fixture(
+            task="buy",
+            task_size=500,
+        )
+        world_state = world_state.replace(
+            max_steps_in_episode=51,
+            step_counter=0,
+        )
+        expected_child = fixed_step_twap_child_quantity(500, 0, 51)
+        action_messages = agent._getActionMsgs_PolicyBlending(
+            jnp.zeros((3,), dtype=jnp.float32),
+            world_state,
+            agent_state,
+            agent_params,
+        )
+        _, reward_info = agent._get_reward(
+            world_state,
+            agent_state,
+            agent_params,
+            trades,
+            world_state.ask_raw_orders,
+            world_state.bid_raw_orders,
+            world_state.best_asks,
+            world_state.best_bids,
+            jnp.asarray([1, 0], dtype=jnp.int32),
+        )
+
+        self.assertEqual(int(expected_child), 10)
+        self.assertEqual(int(action_messages[0, 2]), int(expected_child))
+        self.assertEqual(
+            int(reward_info["shadow_scheduled_child_quantity"]),
+            int(expected_child),
+        )
 
     def test_buy_reward_terms_have_expected_cost_and_sign(self):
         agent, world_state, agent_state, agent_params, _ = self._reward_fixture(
@@ -725,6 +766,11 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
                 "denom_comp",
                 "denom_base",
                 "v_base_step",
+                "terminal_twap_forced_liquidation_is_bps",
+                "terminal_twap_forced_liquidation_is_valid",
+                "terminal_twap_advantage_bps",
+                "terminal_twap_comparison_valid",
+                "terminal_twap_win",
             }
             self.assertEqual(
                 set(info["agents"][1]),
@@ -754,6 +800,72 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
         np.testing.assert_array_equal(selected_bids, world_state.bid_raw_orders)
         self.assertFalse(np.array_equal(np.asarray(selected_asks), np.asarray(post_asks)))
         self.assertFalse(np.array_equal(np.asarray(selected_bids), np.asarray(post_bids)))
+
+    def test_terminal_benchmark_uses_terminal_book_before_auto_reset(self):
+        agent, pre_world, agent_state, agent_params, trades = self._reward_fixture(
+            task="buy",
+            task_size=10,
+        )
+        pre_world = pre_world.replace(step_counter=4)
+        agent_state = agent_state.replace(init_price=10_000)
+        _, extras = agent._get_reward(
+            pre_world,
+            agent_state,
+            agent_params,
+            trades,
+            pre_world.ask_raw_orders,
+            pre_world.bid_raw_orders,
+            pre_world.best_asks,
+            pre_world.best_bids,
+            jnp.asarray([4, 0], dtype=jnp.int32),
+        )
+
+        terminal_asks = _orders([10_100], [10], capacity=3)
+        terminal_bids = _orders([9_900], [10], capacity=3)
+        terminal_world = pre_world.replace(
+            ask_raw_orders=terminal_asks,
+            bid_raw_orders=terminal_bids,
+            step_counter=5,
+        )
+        _, done, info = agent.update_state_and_get_done_and_info(
+            terminal_world,
+            agent_state,
+            extras,
+        )
+
+        reset_asks = _orders([20_000], [10], capacity=3)
+        reset_result = compute_terminal_execution_benchmark(
+            reset_asks,
+            terminal_bids,
+            task_quantity=10.0,
+            terminal_quant_left=10.0,
+            rl_cumulative_filled_quantity=0.0,
+            rl_cumulative_execution_cost=0.0,
+            shadow_cumulative_filled_quantity=extras[
+                "shadow_cumulative_filled_quantity"
+            ],
+            shadow_remaining_task_quantity=extras[
+                "shadow_remaining_task_quantity"
+            ],
+            shadow_cumulative_execution_cost=extras[
+                "shadow_cumulative_execution_cost"
+            ],
+            arrival_price=10_000.0,
+            is_sell_task=False,
+            tick_size=100,
+        )
+
+        self.assertTrue(bool(done))
+        self.assertTrue(bool(info["terminal_forced_liquidation_is_valid"]))
+        self.assertAlmostEqual(
+            float(info["terminal_forced_liquidation_is_bps"]),
+            100.0,
+            places=4,
+        )
+        self.assertNotAlmostEqual(
+            float(info["terminal_forced_liquidation_is_bps"]),
+            float(reset_result.forced_liquidation_is_bps),
+        )
 
     def _assert_tree_equal(self, actual, expected):
         actual_leaves, actual_tree = jax.tree_util.tree_flatten(actual)
@@ -788,7 +900,7 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
             trades=trades,
             init_time=jnp.asarray([0, 0], dtype=jnp.int32),
             window_index=0,
-            max_steps_in_episode=5,
+            max_steps_in_episode=6,
             start_index=0,
             step_counter=0,
             best_bids=jnp.asarray([[9900, 30]], dtype=jnp.int32),

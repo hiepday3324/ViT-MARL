@@ -13,6 +13,12 @@ class ExecutionEpisodeMetrics(NamedTuple):
     episode_return_mean: jax.Array
     terminal_quant_left_mean: jax.Array
     terminal_fill_ratio_mean: jax.Array
+    full_completion_rate: jax.Array
+    realized_is_bps_mean: jax.Array
+    forced_liquidation_is_bps_mean: jax.Array
+    twap_forced_liquidation_is_bps_mean: jax.Array
+    twap_advantage_bps_mean: jax.Array
+    twap_win_rate: jax.Array
 
 
 def empty_execution_episode_metrics() -> ExecutionEpisodeMetrics:
@@ -21,6 +27,12 @@ def empty_execution_episode_metrics() -> ExecutionEpisodeMetrics:
         episode_return_mean=jnp.asarray(0.0, dtype=jnp.float32),
         terminal_quant_left_mean=jnp.asarray(0.0, dtype=jnp.float32),
         terminal_fill_ratio_mean=jnp.asarray(0.0, dtype=jnp.float32),
+        full_completion_rate=jnp.asarray(0.0, dtype=jnp.float32),
+        realized_is_bps_mean=jnp.asarray(0.0, dtype=jnp.float32),
+        forced_liquidation_is_bps_mean=jnp.asarray(0.0, dtype=jnp.float32),
+        twap_forced_liquidation_is_bps_mean=jnp.asarray(0.0, dtype=jnp.float32),
+        twap_advantage_bps_mean=jnp.asarray(0.0, dtype=jnp.float32),
+        twap_win_rate=jnp.asarray(0.0, dtype=jnp.float32),
     )
 
 
@@ -30,6 +42,18 @@ def accumulate_execution_episode_metrics(
     terminals: jax.Array,
     quant_left: jax.Array,
     task_size: jax.Array,
+    *,
+    full_completion: jax.Array,
+    realized_is_bps: jax.Array,
+    realized_is_valid: jax.Array,
+    forced_liquidation_is_bps: jax.Array,
+    forced_liquidation_is_valid: jax.Array,
+    twap_forced_liquidation_is_bps: jax.Array,
+    twap_forced_liquidation_is_valid: jax.Array,
+    twap_advantage_bps: jax.Array,
+    twap_comparison_valid: jax.Array,
+    twap_win: jax.Array,
+    axis_name: str | None = None,
 ) -> tuple[jax.Array, ExecutionEpisodeMetrics]:
     """Accumulate returns and summarize episodes ending in this rollout."""
     running_episode_return = jnp.asarray(running_episode_return, dtype=jnp.float32)
@@ -37,6 +61,28 @@ def accumulate_execution_episode_metrics(
     terminals = jnp.asarray(terminals, dtype=jnp.bool_)
     quant_left = jnp.asarray(quant_left, dtype=jnp.float32)
     task_size = jnp.asarray(task_size, dtype=jnp.float32)
+    full_completion = jnp.asarray(full_completion, dtype=jnp.bool_)
+    realized_is_bps = jnp.asarray(realized_is_bps, dtype=jnp.float32)
+    realized_is_valid = jnp.asarray(realized_is_valid, dtype=jnp.bool_)
+    forced_liquidation_is_bps = jnp.asarray(
+        forced_liquidation_is_bps,
+        dtype=jnp.float32,
+    )
+    forced_liquidation_is_valid = jnp.asarray(
+        forced_liquidation_is_valid,
+        dtype=jnp.bool_,
+    )
+    twap_forced_liquidation_is_bps = jnp.asarray(
+        twap_forced_liquidation_is_bps,
+        dtype=jnp.float32,
+    )
+    twap_forced_liquidation_is_valid = jnp.asarray(
+        twap_forced_liquidation_is_valid,
+        dtype=jnp.bool_,
+    )
+    twap_advantage_bps = jnp.asarray(twap_advantage_bps, dtype=jnp.float32)
+    twap_comparison_valid = jnp.asarray(twap_comparison_valid, dtype=jnp.bool_)
+    twap_win = jnp.asarray(twap_win, dtype=jnp.float32)
 
     if rewards.ndim != 2:
         raise ValueError(f"rewards must have shape (time, actors), got {rewards.shape}.")
@@ -45,6 +91,22 @@ def accumulate_execution_episode_metrics(
         ("terminals", terminals),
         ("quant_left", quant_left),
         ("task_size", task_size),
+        ("full_completion", full_completion),
+        ("realized_is_bps", realized_is_bps),
+        ("realized_is_valid", realized_is_valid),
+        ("forced_liquidation_is_bps", forced_liquidation_is_bps),
+        ("forced_liquidation_is_valid", forced_liquidation_is_valid),
+        (
+            "twap_forced_liquidation_is_bps",
+            twap_forced_liquidation_is_bps,
+        ),
+        (
+            "twap_forced_liquidation_is_valid",
+            twap_forced_liquidation_is_valid,
+        ),
+        ("twap_advantage_bps", twap_advantage_bps),
+        ("twap_comparison_valid", twap_comparison_valid),
+        ("twap_win", twap_win),
     ):
         if value.shape != expected_shape:
             raise ValueError(
@@ -82,12 +144,52 @@ def accumulate_execution_episode_metrics(
         (rewards, terminals, quant_left, task_size),
     )
     terminal_count, completed_return, completed_quant_left, completed_fill_ratio = completed
-    episode_count = jnp.sum(terminal_count)
+    def _aggregate_sum(value):
+        if axis_name is None:
+            return value
+        return jax.lax.psum(value, axis_name)
+
+    episode_count = _aggregate_sum(jnp.sum(terminal_count))
     safe_count = jnp.maximum(episode_count, 1).astype(jnp.float32)
+    completed_return_sum = _aggregate_sum(jnp.sum(completed_return))
+    completed_quant_left_sum = _aggregate_sum(jnp.sum(completed_quant_left))
+    completed_fill_ratio_sum = _aggregate_sum(jnp.sum(completed_fill_ratio))
+    full_completion_sum = _aggregate_sum(
+        jnp.sum((terminals & full_completion).astype(jnp.float32))
+    )
+
+    def _safe_terminal_mean(values, validity):
+        validity = terminals & validity & jnp.isfinite(values)
+        valid_count = _aggregate_sum(jnp.sum(validity.astype(jnp.int32)))
+        value_sum = _aggregate_sum(jnp.sum(jnp.where(validity, values, 0.0)))
+        denominator = jnp.maximum(valid_count, 1).astype(jnp.float32)
+        return value_sum / denominator
+
     metrics = ExecutionEpisodeMetrics(
         episode_count=episode_count,
-        episode_return_mean=jnp.sum(completed_return) / safe_count,
-        terminal_quant_left_mean=jnp.sum(completed_quant_left) / safe_count,
-        terminal_fill_ratio_mean=jnp.sum(completed_fill_ratio) / safe_count,
+        episode_return_mean=completed_return_sum / safe_count,
+        terminal_quant_left_mean=completed_quant_left_sum / safe_count,
+        terminal_fill_ratio_mean=completed_fill_ratio_sum / safe_count,
+        full_completion_rate=full_completion_sum / safe_count,
+        realized_is_bps_mean=_safe_terminal_mean(
+            realized_is_bps,
+            realized_is_valid,
+        ),
+        forced_liquidation_is_bps_mean=_safe_terminal_mean(
+            forced_liquidation_is_bps,
+            forced_liquidation_is_valid,
+        ),
+        twap_forced_liquidation_is_bps_mean=_safe_terminal_mean(
+            twap_forced_liquidation_is_bps,
+            twap_forced_liquidation_is_valid,
+        ),
+        twap_advantage_bps_mean=_safe_terminal_mean(
+            twap_advantage_bps,
+            twap_comparison_valid,
+        ),
+        twap_win_rate=_safe_terminal_mean(
+            twap_win,
+            twap_comparison_valid,
+        ),
     )
     return next_running_return, metrics

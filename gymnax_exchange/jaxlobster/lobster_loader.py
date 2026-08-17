@@ -491,15 +491,19 @@ class LoadLOBSTER_resample():
         fname = f"saved_npz/lobster_{base}.npz"
         return os.path.join(self.alphatrade_path, fname)
 
-    def _pad_last_ep(self,messages,max_msgs_in_windows_arr):
-        length_last_ep=max_msgs_in_windows_arr[-1]
-        new_length=(length_last_ep//self.n_data_msg_per_step+1)*self.n_data_msg_per_step
-        pad=np.zeros((new_length-length_last_ep,messages.shape[1]),dtype=np.int32)
-        last_time=np.array([messages[-1,-2:][0]+1,0])
-        pad[:,-2:]=last_time
-        messages=np.concatenate((messages,pad))
-        max_msgs_in_windows_arr[-1]=new_length
-        return messages,max_msgs_in_windows_arr
+    def _pad_last_ep(self, messages, max_msgs_in_windows_arr):
+        length_last_ep = max_msgs_in_windows_arr[-1]
+        remainder = length_last_ep % self.n_data_msg_per_step
+        pad_length = (self.n_data_msg_per_step - remainder) % self.n_data_msg_per_step
+        if pad_length == 0:
+            return messages, max_msgs_in_windows_arr
+        new_length = length_last_ep + pad_length
+        pad = np.zeros((pad_length, messages.shape[1]), dtype=np.int32)
+        last_time = np.array([messages[-1, -2] + 1, 0])
+        pad[:, -2:] = last_time
+        messages = np.concatenate((messages, pad))
+        max_msgs_in_windows_arr[-1] = new_length
+        return messages, max_msgs_in_windows_arr
     
 
     

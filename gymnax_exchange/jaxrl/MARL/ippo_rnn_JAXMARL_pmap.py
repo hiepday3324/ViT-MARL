@@ -71,6 +71,10 @@ from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     empty_liquidity_survival_diagnostics,
     masked_reliability_loss,
 )
+from gymnax_exchange.jaxrl.MARL.execution_episode_metrics import (
+    accumulate_execution_episode_metrics,
+    empty_execution_episode_metrics,
+)
 from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     GRADIENT_GROUPS,
     PARAMETER_GROUP_RULES,
@@ -583,6 +587,7 @@ def make_train(config):
                     runner_hstates,
                     runner_rng,
                     runner_aux_opt_state,
+                    runner_exe_episode_return,
                 ) = runner_state
             else:
                 (
@@ -592,6 +597,7 @@ def make_train(config):
                     runner_last_done,
                     runner_hstates,
                     runner_rng,
+                    runner_exe_episode_return,
                 ) = runner_state
                 runner_aux_opt_state = None
             return (
@@ -602,6 +608,7 @@ def make_train(config):
                 runner_hstates,
                 runner_rng,
                 runner_aux_opt_state,
+                runner_exe_episode_return,
             )
 
         def _pack_runner_state(
@@ -612,6 +619,7 @@ def make_train(config):
             runner_hstates,
             runner_rng,
             runner_aux_opt_state,
+            runner_exe_episode_return,
         ):
             base_state = (
                 runner_train_states,
@@ -621,7 +629,12 @@ def make_train(config):
                 runner_hstates,
                 runner_rng,
             )
-            return base_state + (runner_aux_opt_state,) if phasic_mode else base_state
+            if phasic_mode:
+                return base_state + (
+                    runner_aux_opt_state,
+                    runner_exe_episode_return,
+                )
+            return base_state + (runner_exe_episode_return,)
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
@@ -653,6 +666,15 @@ def make_train(config):
         obsv = reshape_pytree_leading_dim(obsv, num_devices)
         init_dones_agents = reshape_pytree_leading_dim(init_dones_agents, num_devices)
         hstates = reshape_pytree_leading_dim(hstates, num_devices)
+        running_exe_actor_count = (
+            config["NUM_ACTORS_PERTYPE"][execution_index]
+            if execution_index is not None
+            else config["NUM_ENVS"]
+        )
+        running_exe_episode_return = reshape_pytree_leading_dim(
+            jnp.zeros((running_exe_actor_count,), dtype=jnp.float32),
+            num_devices,
+        )
         # TRAIN LOOP
         
 
@@ -669,6 +691,7 @@ def make_train(config):
                     h_states,
                     rng,
                     current_aux_opt_state,
+                    running_exe_episode_return,
                 ) = _unpack_runner_state(runner_state)
 
                 # SELECT ACTION
@@ -791,6 +814,7 @@ def make_train(config):
                     h_states,
                     rng,
                     current_aux_opt_state,
+                    running_exe_episode_return,
                 )
                 return runner_state, transitions
             initial_hstates = _unpack_runner_state(runner_state)[4]
@@ -895,7 +919,61 @@ def make_train(config):
                 h_states,
                 _,
                 aux_opt_state,
+                running_exe_episode_return,
             ) = _unpack_runner_state(stashed_runner_state)
+
+            if execution_index is not None:
+                execution_trajectory = traj_batch[execution_index]
+                execution_reward_shape = execution_trajectory.reward.shape
+                execution_info = execution_trajectory.info["agent"]
+
+                def _reshape_execution_info(key):
+                    return jnp.reshape(
+                        execution_info[key],
+                        execution_reward_shape,
+                    )
+
+                (
+                    running_exe_episode_return,
+                    execution_episode_metrics,
+                ) = accumulate_execution_episode_metrics(
+                    running_exe_episode_return,
+                    execution_trajectory.reward,
+                    execution_trajectory.global_done,
+                    _reshape_execution_info("quant_left"),
+                    _reshape_execution_info("denom_task"),
+                    full_completion=_reshape_execution_info(
+                        "terminal_full_completion"
+                    ),
+                    realized_is_bps=_reshape_execution_info(
+                        "terminal_realized_is_bps"
+                    ),
+                    realized_is_valid=_reshape_execution_info(
+                        "terminal_realized_is_valid"
+                    ),
+                    forced_liquidation_is_bps=_reshape_execution_info(
+                        "terminal_forced_liquidation_is_bps"
+                    ),
+                    forced_liquidation_is_valid=_reshape_execution_info(
+                        "terminal_forced_liquidation_is_valid"
+                    ),
+                    twap_forced_liquidation_is_bps=_reshape_execution_info(
+                        "terminal_twap_forced_liquidation_is_bps"
+                    ),
+                    twap_forced_liquidation_is_valid=_reshape_execution_info(
+                        "terminal_twap_forced_liquidation_is_valid"
+                    ),
+                    twap_advantage_bps=_reshape_execution_info(
+                        "terminal_twap_advantage_bps"
+                    ),
+                    twap_comparison_valid=_reshape_execution_info(
+                        "terminal_twap_comparison_valid"
+                    ),
+                    twap_win=_reshape_execution_info("terminal_twap_win"),
+                    axis_name="device_batch",
+                )
+            else:
+                execution_episode_metrics = empty_execution_episode_metrics()
             
             # Chôm chìa khóa RNG từ bước 138 (final_runner_state).
             fresh_rng = _unpack_runner_state(final_runner_state)[5]
@@ -909,6 +987,7 @@ def make_train(config):
                 h_states,
                 fresh_rng,
                 aux_opt_state,
+                running_exe_episode_return,
             )
 
             # CALCULATE ADVANTAGE
@@ -920,6 +999,7 @@ def make_train(config):
                 hstates_new,
                 rng,
                 aux_opt_state,
+                running_exe_episode_return,
             ) = _unpack_runner_state(runner_state)
 
             def _calculate_gae(gamma,gae_lambda,traj_batch, last_val):
@@ -1596,6 +1676,18 @@ def make_train(config):
                 "obs_ask_raw_orders",
                 "obs_bid_raw_orders",
             }
+            callback_agent_exclusions = {
+                "terminal_full_completion",
+                "terminal_realized_is_bps",
+                "terminal_realized_is_valid",
+                "terminal_forced_liquidation_is_bps",
+                "terminal_forced_liquidation_is_valid",
+                "terminal_twap_forced_liquidation_is_bps",
+                "terminal_twap_forced_liquidation_is_valid",
+                "terminal_twap_advantage_bps",
+                "terminal_twap_comparison_valid",
+                "terminal_twap_win",
+            }
             callback_traj_batch = [
                 transition._replace(
                     info={
@@ -1604,7 +1696,11 @@ def make_train(config):
                             for key, value in transition.info["world"].items()
                             if key not in callback_world_exclusions
                         },
-                        "agent": transition.info["agent"],
+                        "agent": {
+                            key: value
+                            for key, value in transition.info["agent"].items()
+                            if key not in callback_agent_exclusions
+                        },
                     }
                 )
                 for transition in traj_batch
@@ -1653,6 +1749,7 @@ def make_train(config):
 
             metrics['avg_reward'] = [jnp.mean(tr.reward) for tr in traj_batch]
             metrics['avg_reward_flattened'] = [jnp.mean(tr.reward.flatten()) for tr in traj_batch]
+            metrics["execution_episode_metrics"] = execution_episode_metrics
             metrics["traj_batch"] = callback_traj_batch
 
 
@@ -1788,7 +1885,11 @@ def make_train(config):
                                 for key, value in transition.info["world"].items()
                                 if key not in callback_world_exclusions
                             },
-                            "agent": transition.info["agent"],
+                            "agent": {
+                                key: value
+                                for key, value in transition.info["agent"].items()
+                                if key not in callback_agent_exclusions
+                            },
                         }
                     )
                     for transition in eval_traj_batch
@@ -1905,6 +2006,7 @@ def make_train(config):
                 hstates_new,
                 rng,
                 aux_opt_state,
+                running_exe_episode_return,
             )
 
             print("Finished compiling")
@@ -1922,6 +2024,7 @@ def make_train(config):
             hstates,
             device_rng,
             aux_opt_state,
+            running_exe_episode_return,
         )
 
         jitted_update_step = jax.jit(_update_step)
@@ -1929,15 +2032,15 @@ def make_train(config):
             pmapped_update_step = jax.pmap(
                 jitted_update_step,
                 axis_name="device_batch",
-                in_axes=(((0, 0, 0, 0, 0, 0, 0), None), None, None, None),
-                out_axes=(((0, 0, 0, 0, 0, 0, 0), None), 0),
+                in_axes=(((0, 0, 0, 0, 0, 0, 0, 0), None), None, None, None),
+                out_axes=(((0, 0, 0, 0, 0, 0, 0, 0), None), 0),
             )
         else:
             pmapped_update_step = jax.pmap(
                 jitted_update_step,
                 axis_name="device_batch",
-                in_axes=(((0, 0, 0, 0, 0, 0), None), None, None, None),
-                out_axes=(((0, 0, 0, 0, 0, 0), None), 0),
+                in_axes=(((0, 0, 0, 0, 0, 0, 0), None), None, None, None),
+                out_axes=(((0, 0, 0, 0, 0, 0, 0), None), 0),
             )
         
         checkpoint_manager = None
@@ -1969,6 +2072,64 @@ def make_train(config):
                     jax.profiler.stop_trace()
             print(f"Update step {updates} completed with metrics {metrics['avg_reward']}")
             update_index = int(np.asarray(jax.device_get(updates)).reshape(-1)[0])
+            exe_episode_metrics = jax.tree_util.tree_map(
+                lambda value: np.asarray(jax.device_get(value)).reshape(-1)[0],
+                metrics["execution_episode_metrics"],
+            )
+            summary_parts = [
+                "SUMMARY_DIAG",
+                f"update={update_index}",
+                "status=update_completed",
+            ]
+            for agent_index, agent_value in enumerate(metrics["avg_reward"]):
+                summary_parts.append(
+                    f"avg_reward_{agent_type_names[agent_index]}="
+                    f"{float(np.mean(np.asarray(jax.device_get(agent_value)))):.6g}"
+                )
+            summary_parts.extend([
+                f"exe_episode_count={int(exe_episode_metrics.episode_count)}",
+                f"exe_episode_return_mean={float(exe_episode_metrics.episode_return_mean):.6g}",
+                f"exe_terminal_quant_left_mean={float(exe_episode_metrics.terminal_quant_left_mean):.6g}",
+                f"exe_terminal_fill_ratio_mean={float(exe_episode_metrics.terminal_fill_ratio_mean):.6g}",
+                f"exe_full_completion_rate={float(exe_episode_metrics.full_completion_rate):.6g}",
+                f"exe_realized_is_bps_mean={float(exe_episode_metrics.realized_is_bps_mean):.6g}",
+                f"exe_forced_liquidation_is_bps_mean={float(exe_episode_metrics.forced_liquidation_is_bps_mean):.6g}",
+                f"exe_twap_forced_liquidation_is_bps_mean={float(exe_episode_metrics.twap_forced_liquidation_is_bps_mean):.6g}",
+                f"exe_twap_advantage_bps_mean={float(exe_episode_metrics.twap_advantage_bps_mean):.6g}",
+                f"exe_twap_win_rate={float(exe_episode_metrics.twap_win_rate):.6g}",
+            ])
+            print(" ".join(summary_parts))
+            if config["WANDB_MODE"] != "disabled":
+                wandb.log({
+                    "agent_EXE/episode_count": int(exe_episode_metrics.episode_count),
+                    "agent_EXE/episode_return_mean": float(
+                        exe_episode_metrics.episode_return_mean
+                    ),
+                    "agent_EXE/terminal_quant_left_mean": float(
+                        exe_episode_metrics.terminal_quant_left_mean
+                    ),
+                    "agent_EXE/terminal_fill_ratio_mean": float(
+                        exe_episode_metrics.terminal_fill_ratio_mean
+                    ),
+                    "agent_EXE/full_completion_rate": float(
+                        exe_episode_metrics.full_completion_rate
+                    ),
+                    "agent_EXE/realized_is_bps_mean": float(
+                        exe_episode_metrics.realized_is_bps_mean
+                    ),
+                    "agent_EXE/forced_liquidation_is_bps_mean": float(
+                        exe_episode_metrics.forced_liquidation_is_bps_mean
+                    ),
+                    "agent_EXE/twap_forced_liquidation_is_bps_mean": float(
+                        exe_episode_metrics.twap_forced_liquidation_is_bps_mean
+                    ),
+                    "agent_EXE/twap_advantage_bps_mean": float(
+                        exe_episode_metrics.twap_advantage_bps_mean
+                    ),
+                    "agent_EXE/twap_win_rate": float(
+                        exe_episode_metrics.twap_win_rate
+                    ),
+                })
             for safety_agent_index, safety_diag in enumerate(
                 metrics["ppo_safety_diag"]
             ):

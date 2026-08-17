@@ -23,3 +23,5 @@ gymnax_exchange/jaxen/__pycache__/mm_env.cpython-311.pyc
 !/tests/test_phasic_reliability.py
 !/tests/test_box_ppo_numerics.py
 !/tests/test_shadow_twap_teacher.py
+!/tests/test_execution_episode_metrics.py
+!/tests/test_fixed_step_twap_schedule.py
