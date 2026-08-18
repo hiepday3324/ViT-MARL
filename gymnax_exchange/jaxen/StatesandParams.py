@@ -48,7 +48,7 @@ from typing import Any
 import chex
 
 
-ITT_WINDOW_SIZE = 64
+ITT_WINDOW_SIZE = 16
 
 
 ########################################################################################

@@ -2926,6 +2926,35 @@ class ExecutionAgent():
         market_obs_pass = quote_pass.flatten()  # shape (9,)
         time = world_state.time[0] + world_state.time[1]/1e9
         time_elapsed = time - (world_state.init_time[0] + world_state.init_time[1]/1e9)
+        if self.world_config.ep_type == "fixed_steps":
+            total_decision_steps = jnp.maximum(
+                jnp.asarray(world_state.max_steps_in_episode - 1, dtype=jnp.float32),
+                1.0,
+            )
+            remaining_steps = jnp.maximum(
+                total_decision_steps
+                - jnp.asarray(world_state.step_counter, dtype=jnp.float32),
+                0.0,
+            )
+            time_remaining = remaining_steps
+            remaining_ratio = remaining_steps / total_decision_steps
+            time_remaining_scale = total_decision_steps
+            step_counter_scale = total_decision_steps
+        elif self.world_config.ep_type == "fixed_time":
+            episode_duration = jnp.maximum(
+                jnp.asarray(self.world_config.episode_time, dtype=jnp.float32),
+                1.0,
+            )
+            time_remaining = jnp.maximum(
+                jnp.asarray(self.world_config.episode_time, dtype=jnp.float32)
+                - time_elapsed,
+                0.0,
+            )
+            remaining_ratio = time_remaining / episode_duration
+            time_remaining_scale = episode_duration
+            step_counter_scale = 30.0
+        else:
+            raise ValueError(f"Unknown episode type: {self.world_config.ep_type}")
         obs = {
             "is_sell_task": agent_state.is_sell_task,
 
@@ -2934,13 +2963,13 @@ class ExecutionAgent():
 
             "time": time,
             "delta_time": world_state.delta_time,
-            "time_remaining": self.world_config.episode_time - time_elapsed,
+            "time_remaining": time_remaining,
             "init_price": agent_state.init_price,
             "current_task_size": agent_state.task_to_execute,
             "executed_quant": agent_state.quant_executed,
             "remaining_quant": agent_state.task_to_execute - agent_state.quant_executed,
             "step_counter": world_state.step_counter,
-            "remaining_ratio": jnp.where(world_state.max_steps_in_episode==0, 0., 1. - world_state.step_counter / world_state.max_steps_in_episode),#17
+            "remaining_ratio": remaining_ratio,
         }
         # --- CẤU HÌNH NORMALIZATION MỚI ---
         
@@ -2980,12 +3009,12 @@ class ExecutionAgent():
             # CÁC KEY CŨ GIỮ NGUYÊN
             "time": 1e5,
             "delta_time": 10,
-            "time_remaining": self.world_config.episode_time,
+            "time_remaining": time_remaining_scale,
             "init_price": 1e7,
             "current_task_size": self.cfg.task_size,
             "executed_quant": self.cfg.task_size,
             "remaining_quant": self.cfg.task_size,
-            "step_counter": 30,
+            "step_counter": step_counter_scale,
             "remaining_ratio": 1,
         }
         if normalize:
