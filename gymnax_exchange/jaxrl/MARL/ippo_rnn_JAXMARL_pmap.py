@@ -59,7 +59,7 @@ import gc
 from gymnax_exchange.jaxen.marl_env import MARLEnv
 from gymnax.environments import spaces
 from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig,Execution_EnvironmentConfig, World_EnvironmentConfig,MarketMaking_EnvironmentConfig
-from gymnax_exchange.networks.gate_fusion import EMASmoothing, StableGatedCrossAttention
+from gymnax_exchange.networks.gate_fusion import StableGatedCrossAttention
 from gymnax_exchange.networks.reliability_head import (
     LevelWiseReliabilityHead,
     build_side_id_from_tokens,
@@ -153,7 +153,7 @@ class ReliabilityFusionRNN(nn.Module):
     )
     @nn.compact
     def __call__(self, carry, x):
-        obs_exec_t, obs_exec_smoothed_t, z_tokens_t, mid_context_t, done_t = x
+        obs_exec_t, z_tokens_t, mid_context_t, done_t = x
         rnn_state = jnp.where(done_t[:, jnp.newaxis], jnp.zeros_like(carry), carry)
         side_id_t = build_side_id_from_tokens(z_tokens_t)
         use_h_prev_in_reliability = self.config.get("use_h_prev_in_reliability", True)
@@ -174,7 +174,7 @@ class ReliabilityFusionRNN(nn.Module):
         )
 
         fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
-        fused_t = fusion(obs_exec_smoothed_t, filtered_tokens_t)
+        fused_t = fusion(obs_exec_t, filtered_tokens_t)
         embedding_t = nn.Dense(
             self.config["FC_DIM_SIZE"],
             kernel_init=orthogonal(jnp.sqrt(2)),
@@ -203,14 +203,11 @@ class ActorCriticRNN(nn.Module):
             z_tokens = vision_encoder(obs_vision, return_tokens=True)
             z_vision = jnp.mean(z_tokens, axis=(-3, -2))
 
-            ema_module = EMASmoothing(alpha = 0.5)
-            obs_exec_smoothed = ema_module(obs_exec)
-
             use_reliability_head = self.config.get("use_reliability_head", False)
             if use_reliability_head:
                 hidden, (embedding, reliability_logits, reliability_scores) = ReliabilityFusionRNN(config=self.config)(
                     hidden,
-                    (obs_exec, obs_exec_smoothed, z_tokens, mid_context, dones),
+                    (obs_exec, z_tokens, mid_context, dones),
                 )
                 aux_info = {
                     "reliability_logits": reliability_logits,
@@ -222,7 +219,7 @@ class ActorCriticRNN(nn.Module):
                 }
             else:
                 fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
-                fused_obs = fusion(obs_exec_smoothed, z_tokens)
+                fused_obs = fusion(obs_exec, z_tokens)
                 embedding = nn.Dense(
                     self.config["FC_DIM_SIZE"], kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0)
                 )(fused_obs)

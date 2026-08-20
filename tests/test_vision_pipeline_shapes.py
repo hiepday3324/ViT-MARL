@@ -12,7 +12,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-from gymnax_exchange.networks.gate_fusion import EMASmoothing, StableGatedCrossAttention
+from gymnax_exchange.networks.gate_fusion import StableGatedCrossAttention
 from gymnax_exchange.networks.reliability_head import (
     LevelWiseReliabilityHead,
     build_side_id_from_tokens,
@@ -47,18 +47,13 @@ class VisionPipelineShapeTest(unittest.TestCase):
         self.assertEqual(pooled.shape, (time_steps, batch_size, embed_dim))
         self.assertTrue(bool(jnp.allclose(pooled, jnp.mean(tokens, axis=(-3, -2)), atol=1e-5)))
 
-        ema = EMASmoothing(alpha=0.5)
-        ema_params = ema.init(rng, exec_obs)
-        smoothed = ema.apply(ema_params, exec_obs)
-        self.assertEqual(smoothed.shape, exec_obs.shape)
-
         fusion = StableGatedCrossAttention(d_model=embed_dim)
-        fusion_params = fusion.init(rng, smoothed, tokens)
-        fused = fusion.apply(fusion_params, smoothed, tokens)
+        fusion_params = fusion.init(rng, exec_obs, tokens)
+        fused = fusion.apply(fusion_params, exec_obs, tokens)
         self.assertEqual(fused.shape, (time_steps, batch_size, embed_dim // 2))
 
         legacy_tokens = jnp.mean(tokens, axis=-2)
-        legacy_fused = fusion.apply(fusion_params, smoothed, legacy_tokens)
+        legacy_fused = fusion.apply(fusion_params, exec_obs, legacy_tokens)
         self.assertEqual(legacy_fused.shape, (time_steps, batch_size, embed_dim // 2))
 
         reliability = LevelWiseReliabilityHead(hidden_dim=64)
@@ -95,7 +90,7 @@ class VisionPipelineShapeTest(unittest.TestCase):
         self.assertTrue(bool(jnp.all(reliability_scores >= 0.0)))
         self.assertTrue(bool(jnp.all(reliability_scores <= 1.0)))
 
-        filtered_fused = fusion.apply(fusion_params, smoothed, filtered_tokens)
+        filtered_fused = fusion.apply(fusion_params, exec_obs, filtered_tokens)
         self.assertEqual(filtered_fused.shape, (time_steps, batch_size, embed_dim // 2))
 
         single_logits, single_scores, single_filtered = reliability.apply(
@@ -108,7 +103,7 @@ class VisionPipelineShapeTest(unittest.TestCase):
         self.assertEqual(single_logits.shape, (batch_size, 10, 2, 1))
         self.assertEqual(single_scores.shape, (batch_size, 10, 2, 1))
         self.assertEqual(single_filtered.shape, tokens[0].shape)
-        single_fused = fusion.apply(fusion_params, smoothed[0], single_filtered)
+        single_fused = fusion.apply(fusion_params, exec_obs[0], single_filtered)
         self.assertEqual(single_fused.shape, (batch_size, embed_dim // 2))
 
         labels = jnp.zeros((time_steps, batch_size), dtype=jnp.int32)
