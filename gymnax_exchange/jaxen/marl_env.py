@@ -80,6 +80,37 @@ import numpy as np
 np.set_printoptions(threshold=np.iinfo(np.int32).max, linewidth=200)
 
 
+def resolve_agent_lifecycle(
+    current_active: jnp.ndarray,
+    terminal_condition: jnp.ndarray,
+    world_horizon_done: jnp.ndarray,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Return current transition terminal events and next-step activity."""
+    current_active = jnp.asarray(current_active, dtype=jnp.bool_)
+    agent_done = current_active & (
+        jnp.asarray(terminal_condition, dtype=jnp.bool_)
+        | jnp.asarray(world_horizon_done, dtype=jnp.bool_)
+    )
+    next_active = jnp.where(
+        world_horizon_done,
+        jnp.ones_like(current_active),
+        current_active & ~agent_done,
+    )
+    return agent_done, next_active
+
+
+def mask_inactive_agent_value(value, current_active):
+    """Preserve terminal-step values and zero absorbing-step values."""
+    value = jnp.asarray(value)
+    current_active = jnp.asarray(current_active, dtype=jnp.bool_)
+    expands = (1,) * (value.ndim - current_active.ndim)
+    active_mask = jnp.reshape(
+        current_active,
+        current_active.shape + expands,
+    )
+    return jnp.where(active_mask, value, jnp.zeros_like(value))
+
+
 
 # define the MARL environment.
 class MARLEnv(MultiAgentEnv):
@@ -144,6 +175,24 @@ class MARLEnv(MultiAgentEnv):
         return (
             pre_step_world_state.ask_raw_orders,
             pre_step_world_state.bid_raw_orders,
+        )
+
+    def _world_horizon_done(self, world_state: WorldState) -> jnp.ndarray:
+        """Return the market-episode boundary independently of agent tasks."""
+        if self.multi_agent_config.world_config.ep_type == "fixed_steps":
+            return (
+                world_state.max_steps_in_episode - world_state.step_counter <= 1
+            )
+        if self.multi_agent_config.world_config.ep_type == "fixed_time":
+            elapsed_seconds = (world_state.time - world_state.init_time)[0]
+            return (
+                self.multi_agent_config.world_config.episode_time
+                - elapsed_seconds
+                <= self.multi_agent_config.world_config.last_step_seconds
+            )
+        raise ValueError(
+            "Unknown episode type: "
+            f"{self.multi_agent_config.world_config.ep_type}"
         )
 
     def _message_diagnostics(
@@ -346,6 +395,7 @@ class MARLEnv(MultiAgentEnv):
         all_action_msgs_list = [] # One element for each agent type
         all_cancel_msgs_list = [] # One element for each agent type
         all_message_diag_list = [] # Per-agent-type message diagnostics
+        current_agent_active_list = []
 
         #jax.debug.print("action: {}", actions)
 
@@ -358,6 +408,37 @@ class MARLEnv(MultiAgentEnv):
             if self.multi_agent_config.number_of_agents_per_type[agent_type_index]==1:
                 agent_actions=jnp.expand_dims(agent_actions,axis=0)
             action_msgs, cancel_msgs = vmapped_function(agent_actions, state.world_state, agent_state, agent_params)
+            if isinstance(self.instance_list[agent_type_index], ExecutionAgent):
+                current_agent_active = (
+                    agent_state.task_to_execute - agent_state.quant_executed > 0
+                )
+                absorbing_vmapped = vmap(
+                    self.instance_list[agent_type_index]._get_absorbing_messages,
+                    in_axes=(None, 0, 0),
+                    out_axes=(0, 0),
+                )
+                absorbing_action_msgs, absorbing_cancel_msgs = absorbing_vmapped(
+                    state.world_state,
+                    agent_state,
+                    agent_params,
+                )
+                message_mask = current_agent_active[:, None, None]
+                action_msgs = jnp.where(
+                    message_mask,
+                    action_msgs,
+                    absorbing_action_msgs,
+                )
+                cancel_msgs = jnp.where(
+                    message_mask,
+                    cancel_msgs,
+                    absorbing_cancel_msgs,
+                )
+            else:
+                current_agent_active = jnp.ones(
+                    (self.multi_agent_config.number_of_agents_per_type[agent_type_index],),
+                    dtype=jnp.bool_,
+                )
+            current_agent_active_list.append(current_agent_active)
             all_action_msgs_list.append(action_msgs)
             all_cancel_msgs_list.append(cancel_msgs)
             all_message_diag_list.append(self._message_diagnostics(action_msgs, cancel_msgs))
@@ -550,6 +631,11 @@ class MARLEnv(MultiAgentEnv):
                     new_bestbids,
                     final_time,
                 )
+            if isinstance(self.instance_list[agent_type_index], ExecutionAgent):
+                reward = mask_inactive_agent_value(
+                    reward,
+                    current_agent_active_list[agent_type_index],
+                )
             agent_reward_list.append(reward)
             agent_extras_list.append(extras)
 
@@ -591,6 +677,7 @@ class MARLEnv(MultiAgentEnv):
             mid_price=new_mid_price,
             delta_time=new_delta_time
         )
+        world_horizon_done = self._world_horizon_done(new_world_state)
 
 
         #jax.debug.print("new_world_state time: {}", new_world_state.time)
@@ -610,6 +697,7 @@ class MARLEnv(MultiAgentEnv):
 
         new_agent_states_list = []
         new_agent_dones_list = []
+        next_agent_active_list = []
         new_agent_infos_list = []
 
         for agent_type_index in range(len(self.instance_list)):
@@ -617,10 +705,66 @@ class MARLEnv(MultiAgentEnv):
             agent_state = state.agent_states[agent_type_index]
             extras = agent_extras_list[agent_type_index]
             vmapped_function = vmap(self.instance_list[agent_type_index].update_state_and_get_done_and_info, in_axes=(None,0,0), out_axes = (0,0,0))
-            states, dones, infos = vmapped_function(new_world_state, agent_state, extras)
-            infos = {**infos, **all_message_diag_list[agent_type_index]}
+            states, _raw_dones, infos = vmapped_function(new_world_state, agent_state, extras)
+            current_agent_active = current_agent_active_list[agent_type_index]
+            if isinstance(self.instance_list[agent_type_index], ExecutionAgent):
+                task_completed = states.task_to_execute - states.quant_executed <= 0
+                dones, next_agent_active = resolve_agent_lifecycle(
+                    current_agent_active,
+                    task_completed,
+                    world_horizon_done,
+                )
+            else:
+                world_terminal = jnp.broadcast_to(
+                    world_horizon_done,
+                    current_agent_active.shape,
+                )
+                dones, next_agent_active = resolve_agent_lifecycle(
+                    current_agent_active,
+                    world_terminal,
+                    world_horizon_done,
+                )
+            if isinstance(self.instance_list[agent_type_index], ExecutionAgent):
+                for reward_key in (
+                    "reward",
+                    "reward_main",
+                    "r_comp",
+                    "r_comp_raw",
+                    "r_mimic",
+                    "r_terminal",
+                    "drift",
+                    "advantage",
+                ):
+                    infos[reward_key] = mask_inactive_agent_value(
+                        infos[reward_key],
+                        current_agent_active,
+                    )
+                for terminal_key in (
+                    "terminal_full_completion",
+                    "terminal_realized_is_bps",
+                    "terminal_realized_is_valid",
+                    "terminal_forced_liquidation_is_bps",
+                    "terminal_forced_liquidation_is_valid",
+                    "terminal_twap_forced_liquidation_is_bps",
+                    "terminal_twap_forced_liquidation_is_valid",
+                    "terminal_twap_advantage_bps",
+                    "terminal_twap_comparison_valid",
+                    "terminal_twap_win",
+                ):
+                    infos[terminal_key] = jnp.where(
+                        dones,
+                        infos[terminal_key],
+                        jnp.zeros_like(infos[terminal_key]),
+                    )
+            infos = {
+                **infos,
+                **all_message_diag_list[agent_type_index],
+                "done": dones,
+                "agent_active": current_agent_active,
+            }
             new_agent_states_list.append(states)
             new_agent_dones_list.append(dones)
+            next_agent_active_list.append(next_agent_active)
             new_agent_infos_list.append(infos)
             # print(f"agent {agent_type_index} info: {infos}")
             # print(f"agent {agent_type_index} done: {dones}")
@@ -653,22 +797,13 @@ class MARLEnv(MultiAgentEnv):
 
         # print("dones: ", new_agent_dones_list)
 
-        # Flatten all done flags into a single array
-        if len(new_agent_dones_list) > 0:
-            all_dones_flat = jnp.concatenate(new_agent_dones_list)
-            overall_done = jnp.all(all_dones_flat) # Done if all agents are done
-
-        else:
-            all_dones_flat = jnp.array([])
-            overall_done = (new_world_state.time-new_world_state.init_time)[0]>=self.multi_agent_config.world_config.episode_time
-
-
-        # __all__ is True only if every agent is done
-
-        # print("overall_done: ", overall_done)
-        # print("all_dones_flat: ", all_dones_flat)
-
-        dones = {"__all__": overall_done, "agents": new_agent_dones_list}
+        overall_done = world_horizon_done
+        dones = {
+            "__all__": overall_done,
+            "agents": new_agent_dones_list,
+            "active": current_agent_active_list,
+            "next_active": next_agent_active_list,
+        }
 
         #jax.debug.print("dones agent: {}", dones["agents"])
         #jax.debug.print("dones __all__: {}", dones["__all__"])
@@ -709,6 +844,7 @@ class MARLEnv(MultiAgentEnv):
             "new_trades":new_trades,
             "trade_valid_mask":trade_valid_mask,
             "trade_buffer_saturated":trade_buffer_saturated,
+            "world_horizon_done":world_horizon_done,
         }
 
 
@@ -760,10 +896,10 @@ class MARLEnv(MultiAgentEnv):
             #jax.debug.print("obs before: {}", obs)
             #jax.debug.print(f"state {agent_state}:")
 
-            dones_temp = new_agent_dones_list[agent_type_index]
+            next_active = next_agent_active_list[agent_type_index]
             #jax.debug.print("dones_temp: {}", dones_temp)
             #jax.debug.print("__all__ done: {}", dones)
-            mask = jnp.logical_and(dones_temp, jnp.logical_not(dones["__all__"])) #only set obs to 0 if agent is done but overall env is not
+            mask = jnp.logical_not(next_active)
             #jax.debug.print("mask: {}", mask)
             def apply_mask_to_obs(obs):
                 expands = (1,) * (obs.ndim - mask.ndim)  # create tuple for broadcasting

@@ -1711,6 +1711,33 @@ class ExecutionAgent():
         # 6. Return
         return action_msgs, cancel_msgs
 
+    def _get_absorbing_messages(
+        self,
+        world_state: WorldState,
+        agent_state: ExecEnvState,
+        agent_params: ExecEnvParams,
+    ) -> Tuple[jax.Array, jax.Array]:
+        """Cancel the completed agent's resting orders without submitting new ones."""
+        side_for_exe = 1 - agent_state.is_sell_task * 2
+        raw_order_side = jax.lax.cond(
+            agent_state.is_sell_task,
+            lambda: world_state.ask_raw_orders,
+            lambda: world_state.bid_raw_orders,
+        )
+        cancel_msgs = job.getCancelMsgs(
+            bookside=raw_order_side,
+            agentID=agent_params.trader_id,
+            size=self.cfg.num_messages_by_agent // 2,
+            side=side_for_exe,
+            cancel_time=world_state.time[0],
+            cancel_time_ns=world_state.time[1],
+        )
+        action_msgs = jnp.zeros(
+            (self.cfg.num_action_messages_by_agent, 8),
+            dtype=jnp.int32,
+        )
+        return action_msgs, cancel_msgs
+
 
 
 

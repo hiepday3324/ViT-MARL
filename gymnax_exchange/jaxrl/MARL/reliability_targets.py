@@ -409,6 +409,7 @@ def build_liquidity_survival_targets(
     survival_min_volume,
     num_steps,
     episode_done=None,
+    agent_active=None,
     ask_raw_orders=None,
     bid_raw_orders=None,
     new_trades=None,
@@ -430,6 +431,8 @@ def build_liquidity_survival_targets(
     ``episode_done`` and ``trade_buffer_saturated`` are post-step transition
     flags. Any flagged transition in ``[t, t + Delta - 1]`` masks the complete
     target because those transitions connect ``S_t`` through ``S_{t+Delta}``.
+    ``agent_active`` describes whether the Execution action at ``S_t`` was a
+    real learning decision; absorbing post-completion states are always masked.
     """
     if survival_delta_steps < 1:
         raise ValueError("survival_delta_steps must be at least one.")
@@ -581,6 +584,17 @@ def build_liquidity_survival_targets(
         required_steps=required_steps,
         batch_size=vision_obs.shape[1],
     )
+    if agent_active is None:
+        agent_active = jnp.ones(
+            (num_steps, vision_obs.shape[1]),
+            dtype=jnp.bool_,
+        )
+    else:
+        agent_active = _normalize_episode_done(
+            agent_active,
+            required_steps=num_steps,
+            batch_size=vision_obs.shape[1],
+        )
     valid_horizon = _build_valid_horizon_mask(
         episode_done,
         num_steps=num_steps,
@@ -622,6 +636,7 @@ def build_liquidity_survival_targets(
         & finite_future_data
         & current_raw_finite
         & jnp.all(jnp.isfinite(current_mid), axis=-1)
+        & agent_active[:num_steps]
     )
     side_mask = (
         q0_valid

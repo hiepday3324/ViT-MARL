@@ -61,7 +61,7 @@ class RolloutOutputs(NamedTuple):
 class AuxiliaryBatch(NamedTuple):
     init_hstate: jax.Array
     obs: Any
-    done: jax.Array
+    rnn_reset: jax.Array
     labels: jax.Array
     mask: jax.Array
     reference_policy: PolicyStatistics
@@ -329,7 +329,7 @@ def build_rollout_outputs(
     params,
     init_hstate,
     obs,
-    done,
+    rnn_reset,
     *,
     is_discrete: bool,
 ) -> RolloutOutputs:
@@ -337,7 +337,7 @@ def build_rollout_outputs(
     _hidden, _pi, value, _z_vision, aux_info = apply_fn(
         params,
         init_hstate,
-        (obs, done),
+        (obs, rnn_reset),
     )
     return RolloutOutputs(
         policy=policy_statistics_from_aux(aux_info, is_discrete=is_discrete),
@@ -531,7 +531,7 @@ def run_phasic_auxiliary_phase(
     aux_tx,
     init_hstate,
     obs,
-    done,
+    rnn_reset,
     labels,
     mask,
     rng,
@@ -557,7 +557,7 @@ def run_phasic_auxiliary_phase(
             params,
             init_hstate,
             obs,
-            done,
+            rnn_reset,
             is_discrete=is_discrete,
         )
     )
@@ -574,7 +574,7 @@ def run_phasic_auxiliary_phase(
     full_batch = AuxiliaryBatch(
         init_hstate=init_hstate[jnp.newaxis, ...],
         obs=obs,
-        done=done,
+        rnn_reset=rnn_reset,
         labels=labels,
         mask=mask,
         reference_policy=reference.policy,
@@ -646,7 +646,7 @@ def run_phasic_auxiliary_phase(
                         candidate_params,
                         minibatch_init_hstate,
                         minibatch.obs,
-                        minibatch.done,
+                        minibatch.rnn_reset,
                         is_discrete=is_discrete,
                     )
                     survival_loss = masked_reliability_loss(
@@ -692,7 +692,7 @@ def run_phasic_auxiliary_phase(
                     candidate_params,
                     minibatch_init_hstate,
                     minibatch.obs,
-                    minibatch.done,
+                    minibatch.rnn_reset,
                     is_discrete=is_discrete,
                 )
                 candidate_kl = policy_kl(
@@ -801,7 +801,7 @@ def run_phasic_auxiliary_phase(
         final_params,
         init_hstate,
         obs,
-        done,
+        rnn_reset,
         is_discrete=is_discrete,
     )
     after_summary = _masked_summary(

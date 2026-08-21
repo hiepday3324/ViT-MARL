@@ -67,6 +67,7 @@ class ReliabilityTargetTest(unittest.TestCase):
         trade_valid_mask = jnp.zeros((time_steps, 1, n_trades), dtype=jnp.bool_)
         saturated = jnp.zeros((time_steps, 1), dtype=jnp.bool_)
         done = jnp.zeros((time_steps, 1), dtype=jnp.bool_)
+        active = jnp.ones((time_steps, 1), dtype=jnp.bool_)
         return {
             "vision_obs": vision_obs,
             "ask_orders": ask_orders,
@@ -75,6 +76,7 @@ class ReliabilityTargetTest(unittest.TestCase):
             "trade_valid_mask": trade_valid_mask,
             "saturated": saturated,
             "done": done,
+            "active": active,
             "delta": delta,
         }
 
@@ -135,6 +137,7 @@ class ReliabilityTargetTest(unittest.TestCase):
             survival_min_volume=1.0,
             num_steps=1,
             episode_done=case["done"],
+            agent_active=case["active"],
             ask_raw_orders=case["ask_orders"],
             bid_raw_orders=case["bid_orders"],
             new_trades=case["trades"],
@@ -315,6 +318,31 @@ class ReliabilityTargetTest(unittest.TestCase):
                 case["done"] = case["done"].at[done_index, 0].set(True)
                 _labels, mask = self._build_targets(case)
                 self.assertEqual(float(mask[0, 0, 0, 0]), expected_mask)
+
+    def test_inactive_execution_sample_is_always_masked(self):
+        case = self._make_case()
+        self._set_future_side_volume(case, tau=1, side="ask", quantity=100.0)
+        self._set_future_side_volume(case, tau=1, side="bid", quantity=100.0)
+        case["active"] = case["active"].at[0, 0].set(False)
+
+        _labels, mask = self._build_targets(case)
+
+        self.assertTrue(bool(jnp.all(mask == 0.0)))
+
+    def test_reliability_horizon_does_not_cross_execution_terminal(self):
+        case = self._make_case(delta=2)
+        for tau in (1, 2):
+            self._set_future_side_volume(
+                case,
+                tau=tau,
+                side="ask",
+                quantity=100.0,
+            )
+        case["done"] = case["done"].at[1, 0].set(True)
+
+        _labels, mask = self._build_targets(case)
+
+        self.assertEqual(float(mask[0, 0, 0, 0]), 0.0)
 
     def test_saturated_trade_buffer_masks_only_execution_horizon(self):
         for saturated_index, expected_mask in ((0, 0.0), (1, 0.0), (2, 1.0)):

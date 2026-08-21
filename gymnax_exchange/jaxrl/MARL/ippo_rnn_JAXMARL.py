@@ -63,6 +63,12 @@ from gymnax_exchange.jaxrl.MARL.execution_episode_metrics import (
     accumulate_execution_episode_metrics,
     empty_execution_episode_metrics,
 )
+from gymnax_exchange.jaxrl.MARL.ppo_lifecycle import (
+    calculate_gae,
+    compute_masked_ppo_terms,
+    masked_mean,
+    next_rnn_reset,
+)
 from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     GRADIENT_GROUPS,
     PARAMETER_GROUP_RULES,
@@ -350,7 +356,9 @@ class ActorCriticRNN(nn.Module):
 # FIXME: APPLY VISION
 class Transition(NamedTuple):
     global_done: jnp.ndarray
-    done: jnp.ndarray
+    agent_done: jnp.ndarray
+    rnn_reset: jnp.ndarray
+    agent_active: jnp.ndarray
     action: jnp.ndarray
     pre_tanh_action: jnp.ndarray
     value: jnp.ndarray
@@ -530,7 +538,7 @@ def make_train(config):
         )
         aux_opt_state = None
         num_agents_of_instance_list = []
-        init_dones_agents = []
+        init_rnn_resets_agents = []
         for i, instance in enumerate(env.instance_list):
             # print("Action space dimension for network i ",env.action_spaces[i])
             network = ActorCriticRNN(env.action_spaces[i], config=config)
@@ -602,7 +610,9 @@ def make_train(config):
             network_params_list.append(network_params)
             train_states.append(train_state)
             num_agents_of_instance_list.append(env.multi_agent_config.number_of_agents_per_type[i])
-            init_dones_agents.append(jnp.zeros((config["NUM_ACTORS_PERTYPE"][i]), dtype=bool))
+            init_rnn_resets_agents.append(
+                jnp.zeros((config["NUM_ACTORS_PERTYPE"][i]), dtype=bool)
+            )
 
         if phasic_mode and aux_opt_state is None:
             raise ValueError("Failed to initialize the Execution auxiliary optimizer state.")
@@ -613,7 +623,7 @@ def make_train(config):
                     runner_train_states,
                     runner_env_state,
                     runner_last_obs,
-                    runner_last_done,
+                    runner_rnn_reset,
                     runner_hstates,
                     runner_rng,
                     runner_aux_opt_state,
@@ -624,7 +634,7 @@ def make_train(config):
                     runner_train_states,
                     runner_env_state,
                     runner_last_obs,
-                    runner_last_done,
+                    runner_rnn_reset,
                     runner_hstates,
                     runner_rng,
                     runner_exe_episode_return,
@@ -634,7 +644,7 @@ def make_train(config):
                 runner_train_states,
                 runner_env_state,
                 runner_last_obs,
-                runner_last_done,
+                runner_rnn_reset,
                 runner_hstates,
                 runner_rng,
                 runner_aux_opt_state,
@@ -645,7 +655,7 @@ def make_train(config):
             runner_train_states,
             runner_env_state,
             runner_last_obs,
-            runner_last_done,
+            runner_rnn_reset,
             runner_hstates,
             runner_rng,
             runner_aux_opt_state,
@@ -655,7 +665,7 @@ def make_train(config):
                 runner_train_states,
                 runner_env_state,
                 runner_last_obs,
-                runner_last_done,
+                runner_rnn_reset,
                 runner_hstates,
                 runner_rng,
             )
@@ -688,7 +698,7 @@ def make_train(config):
                     train_states,
                     env_state,
                     last_obs,
-                    last_done,
+                    rnn_resets,
                     h_states,
                     rng,
                     current_aux_opt_state,
@@ -718,7 +728,7 @@ def make_train(config):
                     obs_i_batched = jax.tree.map(lambda x: x[jnp.newaxis, :], obs_i)
                     ac_in = (
                         obs_i_batched,
-                        last_done[i][jnp.newaxis, :],
+                        rnn_resets[i][jnp.newaxis, :],
                         # avail_actions,
                     )
                     h_states[i], pi, value, _, policy_aux_info = train_state.apply_fn(
@@ -772,10 +782,24 @@ def make_train(config):
                 '''
                 Ghi lại nhật kí 
                 '''
-                done_batch=done
+                next_rnn_resets=[]
                 transitions=[]
                 for i,train_state in enumerate(train_states):
-                    done_batch['agents'][i] = batchify(done["agents"][i],config["NUM_ACTORS_PERTYPE"][i]).squeeze()
+                    agent_done_batch = batchify(
+                        done["agents"][i],
+                        config["NUM_ACTORS_PERTYPE"][i],
+                    ).squeeze()
+                    agent_active_batch = batchify(
+                        done["active"][i],
+                        config["NUM_ACTORS_PERTYPE"][i],
+                    ).squeeze()
+                    global_done_batch = jnp.tile(
+                        done["__all__"],
+                        config["NUM_AGENTS_PER_TYPE"][i],
+                    )
+                    next_rnn_resets.append(
+                        next_rnn_reset(agent_done_batch, global_done_batch)
+                    )
                     obs_batch = batchify(last_obs[i],config["NUM_ACTORS_PERTYPE"][i])
                     action_batch = batchify_action(actions[i],config["NUM_ACTORS_PERTYPE"][i])
                     pre_tanh_action_batch = batchify_action(
@@ -796,8 +820,10 @@ def make_train(config):
 
 
                     transitions.append(Transition(
-                        jnp.tile(done["__all__"], config["NUM_AGENTS_PER_TYPE"][i]),
-                        last_done[i],
+                        global_done_batch,
+                        agent_done_batch,
+                        rnn_resets[i],
+                        agent_active_batch,
                         action_batch.squeeze(),
                         pre_tanh_action_batch.squeeze(),
                         value.squeeze(),
@@ -811,7 +837,7 @@ def make_train(config):
                     train_states,
                     env_state,
                     obsv,
-                    done_batch['agents'],
+                    next_rnn_resets,
                     h_states,
                     rng,
                     current_aux_opt_state,
@@ -1096,7 +1122,8 @@ def make_train(config):
                         trade_valid_mask=traj_batch_padded[i].info["world"]["trade_valid_mask"],
                         trade_buffer_saturated=traj_batch_padded[i].info["world"]["trade_buffer_saturated"],
                         num_steps=config["NUM_STEPS"],
-                        episode_done=traj_batch_padded[i].global_done,
+                        episode_done=traj_batch_padded[i].agent_done,
+                        agent_active=traj_batch_padded[i].agent_active,
                         return_diagnostics=True,
                         eps=config.get("survival_eps", 1e-8),
                     )
@@ -1134,7 +1161,7 @@ def make_train(config):
                 t_states,
                 e_state,
                 l_obs,
-                l_dones,
+                l_rnn_resets,
                 h_states,
                 _,
                 aux_opt_state,
@@ -1165,7 +1192,7 @@ def make_train(config):
                 ) = accumulate_execution_episode_metrics(
                     running_exe_episode_return,
                     execution_trajectory.reward,
-                    execution_trajectory.global_done,
+                    execution_trajectory.agent_done,
                     execution_quant_left,
                     execution_task_size,
                     full_completion=reshape_execution_info(
@@ -1208,7 +1235,7 @@ def make_train(config):
                 t_states,
                 e_state,
                 l_obs,
-                l_dones,
+                l_rnn_resets,
                 h_states,
                 fresh_rng,
                 aux_opt_state,
@@ -1220,36 +1247,12 @@ def make_train(config):
                 train_states,
                 env_state,
                 last_obs,
-                last_dones,
+                rnn_resets,
                 hstates_new,
                 rng,
                 aux_opt_state,
                 running_exe_episode_return,
             ) = _unpack_runner_state(runner_state)
-
-            def _calculate_gae(gamma,gae_lambda,traj_batch, last_val):
-                    def _get_advantages(gae_and_next_value, transition):
-                        gae, next_value = gae_and_next_value
-                        done, value, reward = (
-                            transition.global_done,
-                            transition.value,
-                            transition.reward,
-                        )
-                        delta = reward + gamma * next_value * (1 - done) - value
-                        gae = (
-                            delta
-                            + gamma * gae_lambda * (1 - done) * gae
-                        )
-                        return (gae, value), gae
-
-                    _, advantages = jax.lax.scan(
-                        _get_advantages,
-                        (jnp.zeros_like(last_val), last_val),
-                        traj_batch,
-                        reverse=True,
-                        unroll=16,
-                    )
-                    return advantages, advantages + traj_batch.value
 
             advantages=[]
             targets=[]
@@ -1261,13 +1264,20 @@ def make_train(config):
                 # )
                 ac_in = (
                     last_obs_batch_expanded,
-                    last_dones[i][jnp.newaxis, :],
+                    rnn_resets[i][jnp.newaxis, :],
                     # avail_actions,
                 )
                 _, _, last_val, _, _ = train_state.apply_fn(train_state.params, hstates_new[i], ac_in)
                 last_val = last_val.squeeze()
 
-                advantages_i, targets_i = _calculate_gae(config["GAMMA"][i],config["GAE_LAMBDA"][i],traj_batch[i], last_val)
+                advantages_i, targets_i = calculate_gae(
+                    config["GAMMA"][i],
+                    config["GAE_LAMBDA"][i],
+                    traj_batch[i].reward,
+                    traj_batch[i].value,
+                    traj_batch[i].agent_done,
+                    last_val,
+                )
                 advantages.append(advantages_i)
                 targets.append(targets_i)
 
@@ -1324,7 +1334,7 @@ def make_train(config):
                             _, pi, value, _z_vision, aux_info = train_state.apply_fn(
                                 params,
                                 init_hstate.squeeze(),
-                                (traj_batch.obs, traj_batch.done),
+                                (traj_batch.obs, traj_batch.rnn_reset),
                             )
                             replay_kwargs = {}
                             if isinstance(env.action_spaces[i], spaces.Box):
@@ -1346,30 +1356,30 @@ def make_train(config):
                             ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
                             value_losses = jnp.square(value - targets)
                             value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                            value_loss = 0.5 * jnp.maximum(
+                            value_loss_samples = 0.5 * jnp.maximum(
                                 value_losses, value_losses_clipped
-                            ).mean()
+                            )
 
                             # CALCULATE ACTOR LOSS
                             logratio = log_prob - traj_batch.log_prob
                             ratio = jnp.exp(logratio)
                             unnormalized_gae = gae
-                            gae = (gae - gae.mean()) / (gae.std() + 1e-8)
-                            loss_actor1 = ratio * gae
-                            loss_actor2 = (
-                                jnp.clip(
-                                    ratio,
-                                    1.0 - config["CLIP_EPS"],
-                                    1.0 + config["CLIP_EPS"],
-                                )
-                                * gae
-                            )
-                            loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
-                            loss_actor = loss_actor.mean()
                             if isinstance(env.action_spaces[i], spaces.Box):
-                                entropy = -log_prob.mean()
+                                entropy_samples = -log_prob
                             else:
-                                entropy = pi.entropy().mean()
+                                entropy_samples = pi.entropy()
+                            ppo_terms = compute_masked_ppo_terms(
+                                ratio=ratio,
+                                logratio=logratio,
+                                advantage=gae,
+                                value_loss_samples=value_loss_samples,
+                                entropy_samples=entropy_samples,
+                                agent_active=traj_batch.agent_active,
+                                clip_eps=config["CLIP_EPS"],
+                            )
+                            value_loss = ppo_terms.value_loss
+                            loss_actor = ppo_terms.actor_loss
+                            entropy = ppo_terms.entropy
 
                             # TỔNG HỢP PPO LOSS
                             weighted_value_loss = config["VF_COEF"][i] * value_loss
@@ -1383,19 +1393,69 @@ def make_train(config):
                             if reliability_logits.ndim == 4:
                                 reliability_logits = reliability_logits[..., None]
 
-                            reliability_mean = jnp.mean(reliability_scores)
-                            reliability_std = jnp.std(reliability_scores)
-                            reliability_min = jnp.min(reliability_scores)
-                            reliability_max = jnp.max(reliability_scores)
+                            score_active_mask = jnp.broadcast_to(
+                                traj_batch.agent_active[..., None, None, None],
+                                reliability_scores.shape,
+                            )
+                            reliability_mean = masked_mean(
+                                reliability_scores,
+                                score_active_mask,
+                            )
+                            reliability_std = jnp.sqrt(
+                                masked_mean(
+                                    jnp.square(
+                                        reliability_scores - reliability_mean
+                                    ),
+                                    score_active_mask,
+                                )
+                            )
+                            has_active_scores = jnp.any(score_active_mask)
+                            reliability_min = jnp.where(
+                                has_active_scores,
+                                jnp.min(
+                                    jnp.where(
+                                        score_active_mask,
+                                        reliability_scores,
+                                        jnp.inf,
+                                    )
+                                ),
+                                0.0,
+                            )
+                            reliability_max = jnp.where(
+                                has_active_scores,
+                                jnp.max(
+                                    jnp.where(
+                                        score_active_mask,
+                                        reliability_scores,
+                                        -jnp.inf,
+                                    )
+                                ),
+                                0.0,
+                            )
 
-                            reliability_level_mean = jnp.mean(reliability_scores, axis=(0, 1, 3, 4))
+                            def _masked_axis_mean(values, mask, axes):
+                                count = jnp.sum(mask, axis=axes)
+                                return jnp.sum(
+                                    jnp.where(mask, values, 0.0),
+                                    axis=axes,
+                                ) / jnp.maximum(count, 1.0)
+
+                            reliability_level_mean = _masked_axis_mean(
+                                reliability_scores,
+                                score_active_mask,
+                                (0, 1, 3, 4),
+                            )
                             reliability_level_mean = reliability_level_mean[:10]
                             reliability_level_mean = jnp.pad(
                                 reliability_level_mean,
                                 (0, 10 - reliability_level_mean.shape[0]),
                                 constant_values=0.0,
                             )
-                            reliability_side_mean = jnp.mean(reliability_scores, axis=(0, 1, 2, 4))
+                            reliability_side_mean = _masked_axis_mean(
+                                reliability_scores,
+                                score_active_mask,
+                                (0, 1, 2, 4),
+                            )
                             reliability_side_mean = reliability_side_mean[:2]
                             reliability_side_mean = jnp.pad(
                                 reliability_side_mean,
@@ -1463,6 +1523,11 @@ def make_train(config):
                                 and agent_is_execution
                                 and isinstance(traj_batch.obs, dict)
                             ):
+                                active_survival_mask = jnp.asarray(
+                                    traj_batch.agent_active,
+                                    dtype=surv_mask.dtype,
+                                )[..., None, None]
+                                surv_mask = surv_mask * active_survival_mask
                                 # Soft targets use the same auxiliary slot as the legacy survival loss.
                                 if not (
                                     reliability_scores.shape == surv_labels.shape
@@ -1502,8 +1567,12 @@ def make_train(config):
                             )
 
                             # debug
-                            approx_kl = ((ratio - 1) - logratio).mean()
-                            clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
+                            approx_kl = ppo_terms.approx_kl
+                            clip_frac = ppo_terms.clip_frac
+                            ratio_metric = masked_mean(
+                                ratio,
+                                traj_batch.agent_active,
+                            )
 
                             return {
                                 "total_loss": total_loss,
@@ -1535,7 +1604,7 @@ def make_train(config):
                                 value_loss,
                                 loss_actor,
                                 entropy,
-                                ratio,
+                                ratio_metric,
                                 approx_kl,
                                 clip_frac,
                                 survival_loss,
@@ -1887,7 +1956,7 @@ def make_train(config):
                             train_state.params,
                             initial_hstates[i],
                             traj_batch[i].obs,
-                            traj_batch[i].done,
+                            traj_batch[i].rnn_reset,
                             is_discrete=isinstance(
                                 env.action_spaces[i],
                                 spaces.Discrete,
@@ -1975,7 +2044,7 @@ def make_train(config):
                     aux_tx=aux_tx,
                     init_hstate=initial_hstates[execution_index],
                     obs=traj_batch[execution_index].obs,
-                    done=traj_batch[execution_index].done,
+                    rnn_reset=traj_batch[execution_index].rnn_reset,
                     labels=survival_labels[execution_index],
                     mask=survival_masks[execution_index],
                     rng=execution_post_ppo_rng,
@@ -2006,7 +2075,7 @@ def make_train(config):
                         train_state.params,
                         initial_hstates[i],
                         traj_batch[i].obs,
-                        traj_batch[i].done,
+                        traj_batch[i].rnn_reset,
                         is_discrete=isinstance(
                             env.action_spaces[i],
                             spaces.Discrete,
@@ -2168,7 +2237,7 @@ def make_train(config):
 
             if config["CALC_EVAL"]:
                 def _eval_step(eval_runner_state, unused):
-                    train_states, eval_env_state, last_obs, last_done,h_states, rng = eval_runner_state
+                    train_states, eval_env_state, last_obs, rnn_resets,h_states, rng = eval_runner_state
                     rng, _rng = jax.random.split(rng)
                 
                     actions=[]
@@ -2182,7 +2251,7 @@ def make_train(config):
                         obs_i_batched = jax.tree.map(lambda x: x[jnp.newaxis, :], obs_i)
                         ac_in = (
                             obs_i_batched,
-                            last_done[i][jnp.newaxis, :],
+                            rnn_resets[i][jnp.newaxis, :],
                             # avail_actions,
                         )
                         h_states[i], pi, value, _, policy_aux_info = train_state.apply_fn(
@@ -2233,11 +2302,25 @@ def make_train(config):
                     obsv, eval_env_state, reward, done, info = jax.vmap(
                         eval_env.step, in_axes=(0, 0, 0, None) # type: ignore
                     )(rng_step, eval_env_state, actions, eval_env_params)
-                    done_batch=done
+                    next_eval_rnn_resets=[]
                     transitions=[]    
 
                     for i, train_state in enumerate(train_states):
-                        done_batch['agents'][i] = batchify(done["agents"][i],config["NUM_ACTORS_PERTYPE"][i]).squeeze()
+                        agent_done_batch = batchify(
+                            done["agents"][i],
+                            config["NUM_ACTORS_PERTYPE"][i],
+                        ).squeeze()
+                        agent_active_batch = batchify(
+                            done["active"][i],
+                            config["NUM_ACTORS_PERTYPE"][i],
+                        ).squeeze()
+                        global_done_batch = jnp.tile(
+                            done["__all__"],
+                            config["NUM_AGENTS_PER_TYPE"][i],
+                        )
+                        next_eval_rnn_resets.append(
+                            next_rnn_reset(agent_done_batch, global_done_batch)
+                        )
                         obs_batch = batchify(last_obs[i],config["NUM_ACTORS_PERTYPE"][i])
                         action_batch = batchify_action(actions[i],config["NUM_ACTORS_PERTYPE"][i])
                         pre_tanh_action_batch = batchify_action(
@@ -2252,8 +2335,10 @@ def make_train(config):
 
 
                         transitions.append(Transition(
-                            jnp.tile(done["__all__"], config["NUM_AGENTS_PER_TYPE"][i]),
-                            last_done[i],
+                            global_done_batch,
+                            agent_done_batch,
+                            rnn_resets[i],
+                            agent_active_batch,
                             action_batch.squeeze(),
                             pre_tanh_action_batch.squeeze(),
                             value.squeeze(),
@@ -2263,7 +2348,14 @@ def make_train(config):
                             info_i,
                             # avail_actions,
                         ))
-                    eval_runner_state = (train_states, eval_env_state, obsv, done_batch['agents'], h_states, rng)
+                    eval_runner_state = (
+                        train_states,
+                        eval_env_state,
+                        obsv,
+                        next_eval_rnn_resets,
+                        h_states,
+                        rng,
+                    )
                     return eval_runner_state, transitions
 
                 rng, _rng = jax.random.split(rng)
@@ -2272,10 +2364,12 @@ def make_train(config):
 
 
                 eval_hstates=[]
-                init_dones_agents_eval=[]
+                init_rnn_resets_agents_eval=[]
                 for i, train_state in enumerate(train_states):
                     eval_hstates.append(ScannedRNN.initialize_carry(config["NUM_ACTORS_PERTYPE"][i], config["GRU_HIDDEN_DIM"]))
-                    init_dones_agents_eval.append(jnp.zeros((config["NUM_ACTORS_PERTYPE"][i]), dtype=bool))
+                    init_rnn_resets_agents_eval.append(
+                        jnp.zeros((config["NUM_ACTORS_PERTYPE"][i]), dtype=bool)
+                    )
 
 
                 
@@ -2283,7 +2377,7 @@ def make_train(config):
                 train_states,
                 eval_env_state,
                 eval_obsv,
-                init_dones_agents_eval,
+                init_rnn_resets_agents_eval,
                 eval_hstates,
                 _rng,
                 )
@@ -3201,7 +3295,7 @@ def make_train(config):
                 train_states,
                 env_state,
                 last_obs,
-                last_dones,
+                rnn_resets,
                 hstates_new,
                 rng,
                 aux_opt_state,
@@ -3221,7 +3315,7 @@ def make_train(config):
             train_states,
             env_state,
             obsv,
-            init_dones_agents,
+            init_rnn_resets_agents,
             hstates,
             _rng,
             aux_opt_state,
