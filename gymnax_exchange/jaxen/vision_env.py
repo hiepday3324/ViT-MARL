@@ -89,6 +89,7 @@ from gymnax.environments import environment, spaces
 sys.path.append(os.path.abspath('/home/duser/AlphaTrade'))
 sys.path.append('.')
 from gymnax_exchange.jaxob import JaxOrderBookArrays as job
+from gymnax_exchange.jaxob import jaxob_constants as cst
 # ---------------------------------------------- 
 import chex
 from jax import config
@@ -122,7 +123,7 @@ from gymnax_exchange.jaxen.base_env import BaseLOBEnv
 from gymnax_exchange.utils import utils
 import dataclasses
 from gymnax_exchange.jaxob.jaxob_config import Execution_EnvironmentConfig,World_EnvironmentConfig
-from gymnax_exchange.jaxen.StatesandParams import ExecEnvState, ExecEnvParams, WorldState, ITT_WINDOW_SIZE
+from gymnax_exchange.jaxen.StatesandParams import ExecEnvState, ExecEnvParams, WorldState
 from gymnax_exchange.jaxob.jaxob_config import World_EnvironmentConfig
 from gymnax_exchange.jaxen.StatesandParams import MultiAgentState, WorldState
 from gymnax_exchange.jaxen.shadow_twap import (
@@ -140,8 +141,178 @@ ACTION_LOW = jnp.array([-1.0, 0.0, 0.0], dtype=jnp.float32)
 ACTION_HIGH = jnp.array([3.0, 1.0, 1.0], dtype=jnp.float32)
 
 
-def _zero_itt_reward_window():
-    return jnp.zeros((ITT_WINDOW_SIZE,), dtype=jnp.float32)
+@partial(jax.jit, static_argnames=("cancel_capacity",))
+def _reconcile_policy_blending_messages(
+    action_msgs: jax.Array,
+    resting_orders: jax.Array,
+    trader_id: jax.Array,
+    resting_side: jax.Array,
+    cancel_time: jax.Array,
+    cancel_time_ns: jax.Array,
+    *,
+    cancel_capacity: int,
+) -> Tuple[jax.Array, jax.Array]:
+    """Reconcile policy-blending targets by exact ``(side, price)`` key."""
+    msg_side = cst.LOBMSGFEAT.Side.value
+    msg_quant = cst.LOBMSGFEAT.Quant.value
+    msg_price = cst.LOBMSGFEAT.Price.value
+    order_price = cst.OrderSideFeat.P.value
+    order_quant = cst.OrderSideFeat.Q.value
+    order_oid = cst.OrderSideFeat.OID.value
+    order_tid = cst.OrderSideFeat.TID.value
+    order_sec = cst.OrderSideFeat.SEC.value
+    order_nsec = cst.OrderSideFeat.NSEC.value
+
+    action_sides = action_msgs[:, msg_side]
+    action_prices = action_msgs[:, msg_price]
+    action_quants = jnp.maximum(action_msgs[:, msg_quant], 0)
+    action_valid = (action_sides != 0) & (action_prices > 0)
+    same_action_key = (
+        action_valid[:, None]
+        & action_valid[None, :]
+        & (action_sides[:, None] == action_sides[None, :])
+        & (action_prices[:, None] == action_prices[None, :])
+    )
+    target_by_action = jnp.sum(
+        jnp.where(same_action_key, action_quants[None, :], 0),
+        axis=1,
+    )
+    action_indices = jnp.arange(action_msgs.shape[0], dtype=jnp.int32)
+    first_action_index = jnp.min(
+        jnp.where(same_action_key, action_indices[None, :], action_msgs.shape[0]),
+        axis=1,
+    )
+    first_for_key = action_valid & (action_indices == first_action_index)
+
+    prices = resting_orders[:, order_price]
+    quantities = resting_orders[:, order_quant]
+    seconds = resting_orders[:, order_sec]
+    nanoseconds = resting_orders[:, order_nsec]
+    order_indices = jnp.arange(resting_orders.shape[0], dtype=jnp.int32)
+    own_order = (
+        (resting_orders[:, order_tid] == trader_id)
+        & (prices > 0)
+        & (quantities > 0)
+    )
+
+    action_to_order = (
+        action_valid[:, None]
+        & (action_sides[:, None] == resting_side)
+        & own_order[None, :]
+        & (action_prices[:, None] == prices[None, :])
+    )
+    resting_by_action = jnp.sum(
+        jnp.where(action_to_order, quantities[None, :], 0),
+        axis=1,
+    )
+    emitted_quantities = jnp.where(
+        first_for_key & (target_by_action > resting_by_action),
+        target_by_action,
+        0,
+    )
+    reconciled_actions = action_msgs.at[:, msg_quant].set(emitted_quantities)
+    reconciled_actions = jnp.where(
+        (emitted_quantities > 0)[:, None],
+        reconciled_actions,
+        jnp.zeros_like(reconciled_actions),
+    )
+
+    same_resting_price = (
+        own_order[:, None]
+        & own_order[None, :]
+        & (prices[:, None] == prices[None, :])
+    )
+    resting_total = jnp.sum(
+        jnp.where(same_resting_price, quantities[None, :], 0),
+        axis=1,
+    )
+    order_to_action = (
+        own_order[:, None]
+        & action_valid[None, :]
+        & (action_sides[None, :] == resting_side)
+        & (prices[:, None] == action_prices[None, :])
+    )
+    has_target = jnp.any(order_to_action, axis=1)
+    target_for_order = jnp.sum(
+        jnp.where(order_to_action, action_quants[None, :], 0),
+        axis=1,
+    )
+    cancel_total = jnp.where(
+        has_target,
+        jnp.where(
+            target_for_order < resting_total,
+            resting_total - target_for_order,
+            jnp.where(target_for_order > resting_total, resting_total, 0),
+        ),
+        resting_total,
+    )
+
+    # Match engine priority: timestamp first, then the first raw slot for ties.
+    candidate_is_newer = (
+        (seconds[None, :] > seconds[:, None])
+        | (
+            (seconds[None, :] == seconds[:, None])
+            & (nanoseconds[None, :] > nanoseconds[:, None])
+        )
+        | (
+            (seconds[None, :] == seconds[:, None])
+            & (nanoseconds[None, :] == nanoseconds[:, None])
+            & (order_indices[None, :] > order_indices[:, None])
+        )
+    )
+    newer_same_price = same_resting_price & candidate_is_newer
+    newer_quantity = jnp.sum(
+        jnp.where(newer_same_price, quantities[None, :], 0),
+        axis=1,
+    )
+    cancel_quantities = jnp.where(
+        own_order,
+        jnp.clip(cancel_total - newer_quantity, 0, quantities),
+        0,
+    )
+
+    cancel_candidate = cancel_quantities > 0
+    candidate_precedes = cancel_candidate[None, :] & (
+        (prices[None, :] < prices[:, None])
+        | ((prices[None, :] == prices[:, None]) & candidate_is_newer)
+    )
+    candidate_rank = jnp.sum(candidate_precedes.astype(jnp.int32), axis=1)
+    output_slots = jnp.arange(cancel_capacity, dtype=jnp.int32)
+    slot_matches = cancel_candidate[None, :] & (
+        candidate_rank[None, :] == output_slots[:, None]
+    )
+    slot_has_order = jnp.any(slot_matches, axis=1)
+    selected_indices = jnp.argmax(slot_matches, axis=1)
+
+    selected_orders = resting_orders[selected_indices]
+    selected_cancel_quantities = cancel_quantities[selected_indices]
+    selected_orders = jnp.where(
+        slot_has_order[:, None], selected_orders, jnp.zeros_like(selected_orders)
+    )
+    selected_cancel_quantities = jnp.where(
+        slot_has_order, selected_cancel_quantities, 0
+    )
+
+    cancel_msgs = jnp.zeros((cancel_capacity, 8), dtype=action_msgs.dtype)
+    cancel_msgs = cancel_msgs.at[:, cst.LOBMSGFEAT.Type.value].set(
+        cst.MessageType.CANCEL.value
+    )
+    cancel_msgs = cancel_msgs.at[:, msg_side].set(resting_side)
+    cancel_msgs = cancel_msgs.at[:, msg_quant].set(selected_cancel_quantities)
+    cancel_msgs = cancel_msgs.at[:, msg_price].set(selected_orders[:, order_price])
+    cancel_msgs = cancel_msgs.at[:, cst.LOBMSGFEAT.OID.value].set(
+        selected_orders[:, order_oid]
+    )
+    cancel_msgs = cancel_msgs.at[:, cst.LOBMSGFEAT.TID.value].set(
+        selected_orders[:, order_tid]
+    )
+    cancel_msgs = cancel_msgs.at[:, cst.LOBMSGFEAT.TS.value].set(cancel_time)
+    cancel_msgs = cancel_msgs.at[:, cst.LOBMSGFEAT.TNS.value].set(cancel_time_ns)
+    return reconciled_actions, cancel_msgs
+
+
+def _zero_itt_reward_window(window_size: int):
+    return jnp.zeros((window_size,), dtype=jnp.float32)
 
 
 def _update_itt_reward_window(
@@ -154,10 +325,11 @@ def _update_itt_reward_window(
         V_RL_step,
         C_RL_step,
         V_base_step,
-        C_base_step):
+        C_base_step,
+        window_size: int):
     reward_window_ptr = jnp.asarray(reward_window_ptr, dtype=jnp.int32)
     reward_window_count = jnp.asarray(reward_window_count, dtype=jnp.int32)
-    idx = reward_window_ptr % ITT_WINDOW_SIZE
+    idx = reward_window_ptr % window_size
 
     rl_vol_window = rl_vol_window.at[idx].set(jnp.asarray(V_RL_step, dtype=jnp.float32))
     rl_cost_window = rl_cost_window.at[idx].set(jnp.asarray(C_RL_step, dtype=jnp.float32))
@@ -167,7 +339,7 @@ def _update_itt_reward_window(
     reward_window_ptr = reward_window_ptr + jnp.array(1, dtype=jnp.int32)
     reward_window_count = jnp.minimum(
         reward_window_count + jnp.array(1, dtype=jnp.int32),
-        jnp.array(ITT_WINDOW_SIZE, dtype=jnp.int32),
+        jnp.array(window_size, dtype=jnp.int32),
     )
     return (
         rl_vol_window,
@@ -227,6 +399,9 @@ class ExecutionAgent():
         #Define the config
         self.cfg=cfg
         self.world_config = world_config
+        self.itt_window_size = int(self.cfg.itt_window_size)
+        if self.itt_window_size < 1:
+            raise ValueError("itt_window_size must be at least 1.")
 
          #----------------- Set the end function -----------------#
         # if self.cfg.end_fn=="force_market_order":
@@ -542,10 +717,10 @@ class ExecutionAgent():
             vwap_rm = 0.,
             is_sell_task = is_sell_task,
             trade_duration = 0.,
-            rl_vol_window = _zero_itt_reward_window(),
-            rl_cost_window = _zero_itt_reward_window(),
-            base_vol_window = _zero_itt_reward_window(),
-            base_cost_window = _zero_itt_reward_window(),
+            rl_vol_window = _zero_itt_reward_window(self.itt_window_size),
+            rl_cost_window = _zero_itt_reward_window(self.itt_window_size),
+            base_vol_window = _zero_itt_reward_window(self.itt_window_size),
+            base_cost_window = _zero_itt_reward_window(self.itt_window_size),
             reward_window_ptr = jnp.array(0, dtype=jnp.int32),
             reward_window_count = jnp.array(0, dtype=jnp.int32),
             shadow_cumulative_filled_quantity = jnp.array(0.0, dtype=jnp.float32),
@@ -673,10 +848,10 @@ class ExecutionAgent():
             vwap_rm=0.,
             is_sell_task=is_sell_task, # updated on reset
             trade_duration=0.,
-            rl_vol_window=_zero_itt_reward_window(),
-            rl_cost_window=_zero_itt_reward_window(),
-            base_vol_window=_zero_itt_reward_window(),
-            base_cost_window=_zero_itt_reward_window(),
+            rl_vol_window=_zero_itt_reward_window(self.itt_window_size),
+            rl_cost_window=_zero_itt_reward_window(self.itt_window_size),
+            base_vol_window=_zero_itt_reward_window(self.itt_window_size),
+            base_cost_window=_zero_itt_reward_window(self.itt_window_size),
             reward_window_ptr=jnp.array(0, dtype=jnp.int32),
             reward_window_count=jnp.array(0, dtype=jnp.int32),
             shadow_cumulative_filled_quantity=jnp.array(0.0, dtype=jnp.float32),
@@ -1692,6 +1867,17 @@ class ExecutionAgent():
             lambda: world_state.bid_raw_orders
         )
 
+        if self.cfg.action_space == "policy_blending":
+            return _reconcile_policy_blending_messages(
+                action_msgs,
+                raw_order_side,
+                agent_params.trader_id,
+                side_for_exe,
+                world_state.time[0],
+                world_state.time[1],
+                cancel_capacity=self.cfg.num_messages_by_agent // 2,
+            )
+
         # 4. Get cancel messages
         cancel_msgs = job.getCancelMsgs(
             bookside=raw_order_side,
@@ -2348,6 +2534,7 @@ class ExecutionAgent():
             C_RL_step,
             V_base_step,
             C_base_step,
+            self.itt_window_size,
         )
 
         V_RL_k = jnp.sum(rl_vol_window)
@@ -2409,7 +2596,7 @@ class ExecutionAgent():
         # R_comp: Lợi nhuận kiếm được từ việc đặt Limit Order so với Market Order
         # Buy: (Cost_Market - Cost_Limit) > 0
         # Sell: (Rev_Limit - Rev_Market) > 0
-        # r_comp/r_mimic/reward are computed from the rolling j=64 window above.
+        # r_comp/r_mimic/reward use the rolling window configured by cfg.itt_window_size.
 
         # 4. TÍNH R_MIMIC (HÌNH PHẠT KHỐI LƯỢNG)
         # Penalize deviations from the teacher's actual shadow execution volume.

@@ -361,11 +361,12 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
         self.assertAlmostEqual(float(step.cumulative_execution_cost), 704.0)
 
     def test_temporal_window_accumulates_actual_shadow_results(self):
+        window_size = 16
         windows = (
-            _zero_itt_reward_window(),
-            _zero_itt_reward_window(),
-            _zero_itt_reward_window(),
-            _zero_itt_reward_window(),
+            _zero_itt_reward_window(window_size),
+            _zero_itt_reward_window(window_size),
+            _zero_itt_reward_window(window_size),
+            _zero_itt_reward_window(window_size),
             jnp.asarray(0, dtype=jnp.int32),
             jnp.asarray(0, dtype=jnp.int32),
         )
@@ -376,6 +377,7 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
                 C_RL_step=0.0,
                 V_base_step=volume,
                 C_base_step=cost,
+                window_size=window_size,
             )
         self.assertAlmostEqual(float(jnp.sum(windows[2])), 16.0)
         self.assertAlmostEqual(float(jnp.sum(windows[3])), 1615.0)
@@ -598,6 +600,7 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
 
         @jax.jit
         def jitted_path(ask_orders, bid_orders):
+            window_size = 16
             step = simulate_shadow_twap_interval(
                 ask_orders,
                 bid_orders,
@@ -609,16 +612,17 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
                 1,
             )
             windows = _update_itt_reward_window(
-                _zero_itt_reward_window(),
-                _zero_itt_reward_window(),
-                _zero_itt_reward_window(),
-                _zero_itt_reward_window(),
+                _zero_itt_reward_window(window_size),
+                _zero_itt_reward_window(window_size),
+                _zero_itt_reward_window(window_size),
+                _zero_itt_reward_window(window_size),
                 jnp.asarray(0, dtype=jnp.int32),
                 jnp.asarray(0, dtype=jnp.int32),
                 20.0,
                 2015.0,
                 step.filled_quantity,
                 step.execution_cost,
+                window_size,
             )
             return _compute_windowed_itt_reward(
                 jnp.sum(windows[0]),
@@ -878,7 +882,7 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
             )
 
     @staticmethod
-    def _reward_fixture(task="buy", task_size=100):
+    def _reward_fixture(task="buy", task_size=100, itt_window_size=16):
         world_config = World_EnvironmentConfig(
             nOrders=3,
             episode_time=5,
@@ -889,6 +893,7 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
             observation_space="execution_policy",
             task=task,
             task_size=task_size,
+            itt_window_size=itt_window_size,
         )
         agent = ExecutionAgent(agent_config, world_config)
         asks = _orders([10000], [30], capacity=3)
@@ -923,10 +928,10 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
             vwap_rm=0.0,
             is_sell_task=(task == "sell"),
             trade_duration=0.0,
-            rl_vol_window=_zero_itt_reward_window(),
-            rl_cost_window=_zero_itt_reward_window(),
-            base_vol_window=_zero_itt_reward_window(),
-            base_cost_window=_zero_itt_reward_window(),
+            rl_vol_window=_zero_itt_reward_window(agent.itt_window_size),
+            rl_cost_window=_zero_itt_reward_window(agent.itt_window_size),
+            base_vol_window=_zero_itt_reward_window(agent.itt_window_size),
+            base_cost_window=_zero_itt_reward_window(agent.itt_window_size),
             reward_window_ptr=jnp.asarray(0, dtype=jnp.int32),
             reward_window_count=jnp.asarray(0, dtype=jnp.int32),
             shadow_cumulative_filled_quantity=0.0,
@@ -941,6 +946,144 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
             normalize=True,
         )
         return agent, world_state, agent_state, agent_params, trades
+
+
+class ITTWindowConfigTest(unittest.TestCase):
+    @staticmethod
+    def _run_window(window_size):
+        windows = (
+            _zero_itt_reward_window(window_size),
+            _zero_itt_reward_window(window_size),
+            _zero_itt_reward_window(window_size),
+            _zero_itt_reward_window(window_size),
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray(0, dtype=jnp.int32),
+        )
+        contributions = (
+            (1.0, 11.0, 1.0, 10.0),
+            (2.0, 23.0, 1.0, 10.0),
+            (3.0, 37.0, 1.0, 10.0),
+        )
+        for values in contributions:
+            windows = _update_itt_reward_window(
+                *windows,
+                *values,
+                window_size,
+            )
+        return windows
+
+    def test_default_config_propagates_sixteen_step_window(self):
+        config = Execution_EnvironmentConfig()
+        agent = ExecutionAgent(config, World_EnvironmentConfig())
+
+        self.assertEqual(config.itt_window_size, 16)
+        self.assertEqual(agent.itt_window_size, 16)
+        self.assertEqual(_zero_itt_reward_window(agent.itt_window_size).shape, (16,))
+
+    def test_config_controls_all_reward_window_shapes(self):
+        for window_size in (2, 4):
+            agent, _, agent_state, _, _ = ShadowTWAPTeacherTest._reward_fixture(
+                itt_window_size=window_size
+            )
+            windows = (
+                agent_state.rl_vol_window,
+                agent_state.rl_cost_window,
+                agent_state.base_vol_window,
+                agent_state.base_cost_window,
+            )
+            self.assertEqual(agent.itt_window_size, window_size)
+            self.assertTrue(all(window.shape == (window_size,) for window in windows))
+
+    def test_config_controls_circular_aggregates_and_reward_inputs(self):
+        expected = {
+            2: (5.0, 60.0, 2.0, 20.0, 2),
+            4: (6.0, 71.0, 3.0, 30.0, 3),
+        }
+        for window_size, expected_values in expected.items():
+            windows = self._run_window(window_size)
+            aggregates = tuple(float(jnp.sum(window)) for window in windows[:4])
+            count = int(windows[5])
+            self.assertEqual(aggregates + (count,), expected_values)
+
+            terms = _compute_windowed_itt_reward(
+                *aggregates,
+                p_benchmark_tick=10.0,
+                is_sell_task=False,
+                doom_quant=0.0,
+                task_to_execute=100.0,
+                reward_lambda=0.5,
+                terminal_penalty_beta=1.0,
+            )
+            matched_base_cost = aggregates[3] + (
+                aggregates[0] - aggregates[2]
+            ) * 10.0
+            expected_r_comp_raw = -(aggregates[1] - matched_base_cost)
+            expected_r_comp = expected_r_comp_raw / max(
+                aggregates[0], aggregates[2], 1.0
+            )
+            expected_r_mimic = -abs(aggregates[0] - aggregates[2]) / max(
+                aggregates[2], 1.0
+            )
+            self.assertAlmostEqual(float(terms["matched_base_cost"]), matched_base_cost)
+            self.assertAlmostEqual(float(terms["r_comp"]), expected_r_comp)
+            self.assertAlmostEqual(float(terms["r_mimic"]), expected_r_mimic)
+
+    def test_default_matches_previous_hard_coded_sixteen_step_behavior(self):
+        window_size = Execution_EnvironmentConfig().itt_window_size
+        windows = (
+            *(_zero_itt_reward_window(window_size) for _ in range(4)),
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray(0, dtype=jnp.int32),
+        )
+        for value in range(1, 21):
+            windows = _update_itt_reward_window(
+                *windows,
+                float(value),
+                float(value * 10),
+                float(value * 2),
+                float(value * 20),
+                window_size,
+            )
+
+        self.assertEqual(window_size, 16)
+        self.assertAlmostEqual(float(jnp.sum(windows[0])), sum(range(5, 21)))
+        self.assertAlmostEqual(float(jnp.sum(windows[1])), 10 * sum(range(5, 21)))
+        self.assertAlmostEqual(float(jnp.sum(windows[2])), 2 * sum(range(5, 21)))
+        self.assertAlmostEqual(float(jnp.sum(windows[3])), 20 * sum(range(5, 21)))
+        self.assertEqual(int(windows[5]), 16)
+
+    def test_window_update_is_jit_and_vmap_compatible(self):
+        window_size = 16
+
+        @jax.jit
+        def update_one(rl_vol, rl_cost, base_vol, base_cost, ptr, count, value):
+            return _update_itt_reward_window(
+                rl_vol,
+                rl_cost,
+                base_vol,
+                base_cost,
+                ptr,
+                count,
+                value,
+                value * 10.0,
+                value * 2.0,
+                value * 20.0,
+                window_size,
+            )
+
+        zeros = _zero_itt_reward_window(window_size)
+        single = update_one(zeros, zeros, zeros, zeros, 0, 0, 3.0)
+        self.assertAlmostEqual(float(jnp.sum(single[0])), 3.0)
+
+        batch_size = 3
+        batched = jax.vmap(update_one)(
+            *[jnp.zeros((batch_size, window_size), dtype=jnp.float32) for _ in range(4)],
+            jnp.zeros((batch_size,), dtype=jnp.int32),
+            jnp.zeros((batch_size,), dtype=jnp.int32),
+            jnp.asarray([1.0, 2.0, 3.0], dtype=jnp.float32),
+        )
+        np.testing.assert_allclose(np.asarray(jnp.sum(batched[0], axis=1)), [1.0, 2.0, 3.0])
+        np.testing.assert_array_equal(np.asarray(batched[5]), [1, 1, 1])
 
 
 if __name__ == "__main__":
