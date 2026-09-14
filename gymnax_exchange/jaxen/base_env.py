@@ -109,6 +109,8 @@ def pre_reset_cache_path(alphatrade_path, cfg):
         f"_stock_{cfg.stock}"
         f"_windowidx_{cfg.window_selector}"
         f"_nMsgPerStep_{cfg.n_data_msg_per_step}"
+        f"_day_start_{cfg.day_start}"
+        f"_day_end_{cfg.day_end}"
         f"_episode_time_{cfg.episode_time}"
         f"_TimePeriod_{cfg.timePeriod}.pkl"
     )

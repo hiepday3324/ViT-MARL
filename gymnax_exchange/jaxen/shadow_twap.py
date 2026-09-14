@@ -36,6 +36,15 @@ class TerminalExecutionBenchmark(NamedTuple):
     twap_win: jax.Array
 
 
+class ResidualExecutionCost(NamedTuple):
+    """Residual-only execution cost evaluated on a read-only terminal LOB."""
+
+    residual_cost_bps: jax.Array
+    valid: jax.Array
+    filled_quantity: jax.Array
+    priced_fraction: jax.Array
+
+
 def empty_terminal_execution_benchmark() -> TerminalExecutionBenchmark:
     return TerminalExecutionBenchmark(
         full_completion=jnp.asarray(False),
@@ -193,6 +202,91 @@ def signed_implementation_shortfall_bps(
     is_bps = direction * (realized_price - safe_arrival) / safe_arrival * 10_000.0
     is_bps = jnp.where(valid & jnp.isfinite(is_bps), is_bps, 0.0)
     return is_bps.astype(jnp.float32), valid
+
+
+def compute_residual_execution_cost_bps(
+    ask_raw_orders: jax.Array,
+    bid_raw_orders: jax.Array,
+    *,
+    residual_quantity: jax.Array,
+    task_quantity: jax.Array,
+    arrival_price: jax.Array,
+    is_sell_task: jax.Array,
+    tick_size: jax.Array,
+    quantity_tolerance: float = 1e-4,
+) -> ResidualExecutionCost:
+    """Price only the terminal residual against the terminal LOB.
+
+    The returned basis-point contribution is normalized by the full parent
+    task. Positive values are economically worse for both buy and sell tasks.
+    """
+    residual_quantity = jnp.asarray(residual_quantity, dtype=jnp.float32)
+    task_quantity = jnp.asarray(task_quantity, dtype=jnp.float32)
+    arrival_price = jnp.asarray(arrival_price, dtype=jnp.float32)
+    tick_size = jnp.asarray(tick_size, dtype=jnp.float32)
+    is_sell_task = jnp.asarray(is_sell_task, dtype=jnp.bool_)
+    tolerance = jnp.asarray(quantity_tolerance, dtype=jnp.float32)
+
+    requested_quantity = jnp.maximum(residual_quantity, 0.0)
+    terminal_side_orders = jax.lax.cond(
+        is_sell_task,
+        lambda: bid_raw_orders,
+        lambda: ask_raw_orders,
+    )
+    filled_quantity, liquidation_cost = shadow_market_order_sweep(
+        terminal_side_orders,
+        requested_quantity,
+        sweep_ascending=jnp.logical_not(is_sell_task),
+        tick_size=tick_size,
+    )
+
+    residual_is_zero = jnp.abs(requested_quantity) <= tolerance
+    safe_residual = jnp.where(requested_quantity > tolerance, requested_quantity, 1.0)
+    priced_fraction = jnp.where(
+        residual_is_zero,
+        1.0,
+        jnp.clip(filled_quantity / safe_residual, 0.0, 1.0),
+    )
+
+    safe_tick_size = jnp.where(tick_size > 0.0, tick_size, 1.0)
+    arrival_price_ticks = arrival_price / safe_tick_size
+    safe_task = jnp.where(task_quantity > 0.0, task_quantity, 1.0)
+    safe_arrival = jnp.where(arrival_price_ticks > 0.0, arrival_price_ticks, 1.0)
+    direction = jnp.where(is_sell_task, -1.0, 1.0)
+    residual_cost_bps = (
+        direction
+        * (liquidation_cost - filled_quantity * safe_arrival)
+        / (safe_task * safe_arrival)
+        * 10_000.0
+    )
+
+    finite = (
+        jnp.isfinite(residual_quantity)
+        & jnp.isfinite(task_quantity)
+        & jnp.isfinite(arrival_price)
+        & jnp.isfinite(tick_size)
+        & jnp.isfinite(filled_quantity)
+        & jnp.isfinite(liquidation_cost)
+        & jnp.isfinite(residual_cost_bps)
+        & jnp.isfinite(priced_fraction)
+    )
+    fully_priced = jnp.abs(filled_quantity - requested_quantity) <= tolerance
+    valid = (
+        finite
+        & (residual_quantity >= -tolerance)
+        & (task_quantity > 0.0)
+        & (arrival_price_ticks > 0.0)
+        & (tick_size > 0.0)
+        & fully_priced
+    )
+    residual_cost_bps = jnp.where(valid, residual_cost_bps, 0.0)
+    priced_fraction = jnp.where(finite, priced_fraction, 0.0)
+    return ResidualExecutionCost(
+        residual_cost_bps=residual_cost_bps.astype(jnp.float32),
+        valid=valid,
+        filled_quantity=filled_quantity.astype(jnp.float32),
+        priced_fraction=priced_fraction.astype(jnp.float32),
+    )
 
 
 def compute_terminal_execution_benchmark(

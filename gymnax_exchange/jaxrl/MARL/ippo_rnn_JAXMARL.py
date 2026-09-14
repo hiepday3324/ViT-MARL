@@ -3128,7 +3128,19 @@ def make_train(config):
                         r_comp_raw = _flat_info("r_comp_raw", np.nan)
                         r_comp = _flat_info("r_comp", np.nan)
                         r_mimic = _flat_info("r_mimic", np.nan)
+                        r_terminal_qty = _flat_info("r_terminal_qty", np.nan)
+                        r_terminal_cost = _flat_info("r_terminal_cost", np.nan)
                         r_terminal = _flat_info("r_terminal", np.nan)
+                        residual_cost_bps = _flat_info("residual_cost_bps", np.nan)
+                        residual_cost_valid = _flat_info(
+                            "residual_cost_valid"
+                        ).astype(bool)
+                        residual_priced_fraction = _flat_info(
+                            "residual_priced_fraction",
+                            np.nan,
+                        )
+                        residual_quant = _flat_info("residual_quant", np.nan)
+                        terminal_transition = _flat_info("done").astype(bool)
                         reward_main = _flat_info("reward_main", np.nan)
                         reward_info_values = _flat_info("reward", np.nan)
                         quant_left_before_unwind = _flat_info("quant_left_before_unwind", np.nan)
@@ -3154,6 +3166,52 @@ def make_train(config):
                         action_mean = np.mean(action_2d, axis=0)
                         action_min = np.min(action_2d, axis=0)
                         action_max = np.max(action_2d, axis=0)
+                        residual_terminal_valid = (
+                            terminal_transition & residual_cost_valid
+                        )
+                        terminal_count = int(np.sum(terminal_transition))
+                        residual_cost_valid_rate = float(
+                            np.sum(residual_terminal_valid) / max(terminal_count, 1)
+                        )
+                        residual_cost_bps_terminal_mean = (
+                            float(np.mean(residual_cost_bps[residual_terminal_valid]))
+                            if np.any(residual_terminal_valid)
+                            else 0.0
+                        )
+                        residual_priced_fraction_terminal_mean = (
+                            float(np.mean(residual_priced_fraction[terminal_transition]))
+                            if np.any(terminal_transition)
+                            else 0.0
+                        )
+                        logging_dict.update({
+                            "agent_EXE/r_terminal_qty_mean": float(
+                                np.nanmean(r_terminal_qty)
+                            ),
+                            "agent_EXE/r_terminal_qty_min": float(
+                                np.nanmin(r_terminal_qty)
+                            ),
+                            "agent_EXE/r_terminal_qty_max": float(
+                                np.nanmax(r_terminal_qty)
+                            ),
+                            "agent_EXE/r_terminal_cost_mean": float(
+                                np.nanmean(r_terminal_cost)
+                            ),
+                            "agent_EXE/r_terminal_cost_min": float(
+                                np.nanmin(r_terminal_cost)
+                            ),
+                            "agent_EXE/r_terminal_cost_max": float(
+                                np.nanmax(r_terminal_cost)
+                            ),
+                            "agent_EXE/residual_cost_bps_terminal_valid_mean": (
+                                residual_cost_bps_terminal_mean
+                            ),
+                            "agent_EXE/residual_cost_valid_rate": (
+                                residual_cost_valid_rate
+                            ),
+                            "agent_EXE/residual_priced_fraction_terminal_mean": (
+                                residual_priced_fraction_terminal_mean
+                            ),
+                        })
 
                         print("[EXECUTION REWARD]")
                         print(
@@ -3164,6 +3222,8 @@ def make_train(config):
                             f"V_base_k_mean={float(np.nanmean(V_base_k)):.6g} "
                             f"r_comp_mean={float(np.nanmean(r_comp)):.6g} "
                             f"r_mimic_mean={float(np.nanmean(r_mimic)):.6g} "
+                            f"r_terminal_qty_mean={float(np.nanmean(r_terminal_qty)):.6g} "
+                            f"r_terminal_cost_mean={float(np.nanmean(r_terminal_cost)):.6g} "
                             f"r_terminal_mean={float(np.nanmean(r_terminal)):.6g} "
                             f"reward_main_mean={float(np.nanmean(reward_main)):.6g} "
                             f"reward_mean={float(np.nanmean(reward_info_values)):.6g} "
@@ -3176,6 +3236,8 @@ def make_train(config):
                             f"{_stats_text('r_comp_raw', r_comp_raw)} "
                             f"{_stats_text('r_comp', r_comp)} "
                             f"{_stats_text('r_mimic', r_mimic)} "
+                            f"{_stats_text('r_terminal_qty', r_terminal_qty)} "
+                            f"{_stats_text('r_terminal_cost', r_terminal_cost)} "
                             f"{_stats_text('r_terminal', r_terminal)} "
                             f"{_stats_text('reward_main', reward_main)} "
                             f"{_stats_text('reward', reward_info_values)} "
@@ -3211,6 +3273,10 @@ def make_train(config):
                             f"quant_left_mean={float(np.mean(quant_left)):.6g} "
                             f"quant_left_max={float(np.max(quant_left)):.6g} "
                             f"terminal_left_before_unwind_mean={float(np.nanmean(quant_left_before_unwind)):.6g} "
+                            f"residual_quant_mean={float(np.nanmean(residual_quant)):.6g} "
+                            f"residual_cost_bps_terminal_valid_mean={residual_cost_bps_terminal_mean:.6g} "
+                            f"residual_cost_valid_rate={residual_cost_valid_rate:.6g} "
+                            f"residual_priced_fraction_terminal_mean={residual_priced_fraction_terminal_mean:.6g} "
                             f"agentQuant_mean={float(np.nanmean(agent_quant)):.6g} "
                             f"agentQuant_step_mean={float(np.nanmean(agent_quant_step)):.6g}"
                         )

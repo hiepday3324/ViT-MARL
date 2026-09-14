@@ -602,7 +602,19 @@ class MARLEnv(MultiAgentEnv):
             if isinstance(self.instance_list[agent_type_index], ExecutionAgent):
                 vmapped_function = vmap(
                     self.instance_list[agent_type_index]._get_reward,
-                    in_axes=(None, 0, 0, None, None, None, None, None, None),
+                    in_axes=(
+                        None,
+                        0,
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
                     out_axes=(0, 0),
                 )
                 reward, extras = vmapped_function(
@@ -612,6 +624,8 @@ class MARLEnv(MultiAgentEnv):
                     new_trades,
                     shadow_asks,
                     shadow_bids,
+                    new_asks,
+                    new_bids,
                     new_bestasks,
                     new_bestbids,
                     final_time,

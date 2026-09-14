@@ -205,3 +205,59 @@ def test_cache_schema_versions_saved_npz_and_pre_reset_paths(tmp_path):
     assert LOBSTER_CACHE_SCHEMA_VERSION in pkl_path.name
     assert npz_path.parent.name == "saved_npz"
     assert pkl_path.parent.name == "pre_reset_states"
+
+
+def _pre_reset_path_with(tmp_path, **overrides):
+    cfg = World_EnvironmentConfig()
+    for name, value in overrides.items():
+        object.__setattr__(cfg, name, value)
+    return Path(pre_reset_cache_path(str(tmp_path), cfg))
+
+
+def test_pre_reset_cache_identity_is_stable_for_identical_config(tmp_path):
+    path_a = _pre_reset_path_with(tmp_path)
+    path_b = _pre_reset_path_with(tmp_path)
+
+    assert path_a == path_b
+
+
+def test_pre_reset_cache_identity_includes_configured_day_bounds(tmp_path):
+    default_path = _pre_reset_path_with(
+        tmp_path,
+        day_start=34200,
+        day_end=57600,
+    )
+    later_start_path = _pre_reset_path_with(
+        tmp_path,
+        day_start=34300,
+        day_end=57600,
+    )
+    earlier_end_path = _pre_reset_path_with(
+        tmp_path,
+        day_start=34200,
+        day_end=57000,
+    )
+
+    assert default_path != later_start_path
+    assert default_path != earlier_end_path
+    assert "_day_start_34200_day_end_57600_" in default_path.name
+    assert "_day_start_34300_day_end_57600_" in later_start_path.name
+    assert "_day_start_34200_day_end_57000_" in earlier_end_path.name
+
+
+def test_pre_reset_cache_identity_preserves_upstream_capacity_limitations(tmp_path):
+    default_path = _pre_reset_path_with(tmp_path)
+
+    assert _pre_reset_path_with(tmp_path, nOrders=101) == default_path
+    assert _pre_reset_path_with(tmp_path, nTrades=101) == default_path
+    assert _pre_reset_path_with(tmp_path, init_id=-100) == default_path
+
+
+def test_pre_reset_cache_identity_preserves_local_extensions(tmp_path):
+    default_path = _pre_reset_path_with(tmp_path, window_selector=-1)
+    selected_window_path = _pre_reset_path_with(tmp_path, window_selector=0)
+
+    assert LOBSTER_CACHE_SCHEMA_VERSION in default_path.name
+    assert default_path != selected_window_path
+    assert "_windowidx_-1_" in default_path.name
+    assert "_windowidx_0_" in selected_window_path.name

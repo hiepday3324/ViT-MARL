@@ -127,6 +127,7 @@ from gymnax_exchange.jaxen.StatesandParams import ExecEnvState, ExecEnvParams, W
 from gymnax_exchange.jaxob.jaxob_config import World_EnvironmentConfig
 from gymnax_exchange.jaxen.StatesandParams import MultiAgentState, WorldState
 from gymnax_exchange.jaxen.shadow_twap import (
+    compute_residual_execution_cost_bps,
     compute_terminal_execution_benchmark,
     empty_terminal_execution_benchmark,
     simulate_shadow_twap_interval,
@@ -207,7 +208,7 @@ def _reconcile_policy_blending_messages(
     )
     emitted_quantities = jnp.where(
         first_for_key & (target_by_action > resting_by_action),
-        target_by_action,
+        target_by_action - resting_by_action,
         0,
     )
     reconciled_actions = action_msgs.at[:, msg_quant].set(emitted_quantities)
@@ -242,7 +243,7 @@ def _reconcile_policy_blending_messages(
         jnp.where(
             target_for_order < resting_total,
             resting_total - target_for_order,
-            jnp.where(target_for_order > resting_total, resting_total, 0),
+            0,
         ),
         resting_total,
     )
@@ -361,7 +362,10 @@ def _compute_windowed_itt_reward(
         doom_quant,
         task_to_execute,
         reward_lambda,
-        terminal_penalty_beta):
+        terminal_penalty_beta,
+        residual_cost_bps=0.0,
+        residual_cost_valid=True,
+        terminal_residual_cost_coef=0.0):
     matched_base_cost = C_base_k + (V_RL_k - V_base_k) * p_benchmark_tick
     direction_switch = jnp.where(is_sell_task, 1.0, -1.0)
     r_comp_raw = direction_switch * (C_RL_k - matched_base_cost)
@@ -372,7 +376,21 @@ def _compute_windowed_itt_reward(
     r_mimic = -jnp.abs(V_RL_k - V_base_k) / denom_base
 
     denom_task = jnp.maximum(jnp.asarray(task_to_execute, dtype=jnp.float32), 1.0)
-    r_terminal = -terminal_penalty_beta * jnp.asarray(doom_quant, dtype=jnp.float32) / denom_task
+    r_terminal_qty = (
+        -terminal_penalty_beta
+        * jnp.asarray(doom_quant, dtype=jnp.float32)
+        / denom_task
+    )
+    valid_residual_cost = jnp.where(
+        jnp.asarray(residual_cost_valid, dtype=jnp.bool_),
+        jnp.asarray(residual_cost_bps, dtype=jnp.float32),
+        0.0,
+    )
+    r_terminal_cost = (
+        -jnp.asarray(terminal_residual_cost_coef, dtype=jnp.float32)
+        * valid_residual_cost
+    )
+    r_terminal = r_terminal_qty + r_terminal_cost
 
     reward_main = r_comp + reward_lambda * r_mimic
     reward = reward_main + r_terminal
@@ -383,6 +401,8 @@ def _compute_windowed_itt_reward(
         "r_comp_raw": r_comp_raw,
         "r_comp": r_comp,
         "r_mimic": r_mimic,
+        "r_terminal_qty": r_terminal_qty,
+        "r_terminal_cost": r_terminal_cost,
         "r_terminal": r_terminal,
         "denom_comp": denom_comp,
         "denom_base": denom_base,
@@ -556,6 +576,10 @@ class ExecutionAgent():
         #     "quant_executed_this_step: {}, quant_left: {}, quant_executed_this_step {}",
         #     quant_executed_this_step, quant_left, quant_executed_this_step)
 
+        # Preserve the post-message, pre-unwind book for terminal evaluation.
+        terminal_ask_raw_orders = asks
+        terminal_bid_raw_orders = bids
+
         # TODO: check if episode time is over and force market order if necessary
         (asks, bids, trades), (new_bestask, new_bestbid), new_id_counter, new_time, mkt_exec_quant, doom_quant = \
             self.get_episode_end_fn(key,
@@ -578,6 +602,8 @@ class ExecutionAgent():
                                         trades=trades,
                                         decision_ask_raw_orders=state.ask_raw_orders,
                                         decision_bid_raw_orders=state.bid_raw_orders,
+                                        terminal_ask_raw_orders=terminal_ask_raw_orders,
+                                        terminal_bid_raw_orders=terminal_bid_raw_orders,
                                         bestasks=bestasks, 
                                         bestbids=bestbids, 
                                         time=time
@@ -2443,6 +2469,8 @@ class ExecutionAgent():
                     trades: chex.Array,
                     decision_ask_raw_orders: chex.Array,
                     decision_bid_raw_orders: chex.Array,
+                    terminal_ask_raw_orders: chex.Array,
+                    terminal_bid_raw_orders: chex.Array,
                     bestasks: chex.Array, 
                     bestbids: chex.Array, 
                     time: jax.Array) -> jnp.int32:
@@ -2487,6 +2515,32 @@ class ExecutionAgent():
             ep_is_over,
             jnp.maximum(quant_left_before_unwind, 0),
             0,
+        )
+        terminal_transition = ep_is_over | (quant_left_before_unwind <= 0)
+        residual_cost = compute_residual_execution_cost_bps(
+            terminal_ask_raw_orders,
+            terminal_bid_raw_orders,
+            residual_quantity=doom_quant,
+            task_quantity=agent_state.task_to_execute,
+            arrival_price=agent_state.init_price,
+            is_sell_task=agent_state.is_sell_task,
+            tick_size=self.world_config.tick_size,
+        )
+        residual_cost_valid = terminal_transition & residual_cost.valid
+        residual_cost_bps = jnp.where(
+            terminal_transition,
+            residual_cost.residual_cost_bps,
+            0.0,
+        )
+        residual_priced_fraction = jnp.where(
+            terminal_transition,
+            residual_cost.priced_fraction,
+            0.0,
+        )
+        residual_liquidation_fill = jnp.where(
+            terminal_transition,
+            residual_cost.filled_quantity,
+            0.0,
         )
         # C. Windowed imitate-then-transcend reward using only real step trades.
         V_RL_step = jnp.asarray(agentQuant_step, dtype=jnp.float32)
@@ -2553,6 +2607,9 @@ class ExecutionAgent():
             agent_state.task_to_execute,
             self.cfg.reward_lambda,
             self.cfg.terminal_penalty_beta,
+            residual_cost_bps,
+            residual_cost_valid,
+            self.cfg.terminal_residual_cost_coef,
         )
         reward = reward_terms["reward"]
         reward_main = reward_terms["reward_main"]
@@ -2560,6 +2617,8 @@ class ExecutionAgent():
         r_comp_raw = reward_terms["r_comp_raw"]
         r_comp = reward_terms["r_comp"]
         r_mimic = reward_terms["r_mimic"]
+        r_terminal_qty = reward_terms["r_terminal_qty"]
+        r_terminal_cost = reward_terms["r_terminal_cost"]
         r_terminal = reward_terms["r_terminal"]
         denom_comp = reward_terms["denom_comp"]
         denom_base = reward_terms["denom_base"]
@@ -2638,7 +2697,15 @@ class ExecutionAgent():
             "r_comp": r_comp,
             "r_comp_raw": r_comp_raw,
             "r_mimic": r_mimic,
+            "r_terminal_qty": r_terminal_qty,
+            "r_terminal_cost": r_terminal_cost,
             "r_terminal": r_terminal,
+            "residual_cost_bps": residual_cost_bps,
+            "residual_cost_valid": residual_cost_valid,
+            "residual_priced_fraction": residual_priced_fraction,
+            "residual_liquidation_fill": residual_liquidation_fill,
+            "residual_quant": doom_quant,
+            "terminal_residual_cost_coef": self.cfg.terminal_residual_cost_coef,
             "V_RL_step": V_RL_step,
             "C_RL_step": C_RL_step,
             "V_base_step": V_base_step,
@@ -2800,7 +2867,17 @@ class ExecutionAgent():
             "r_comp": extras["r_comp"],
             "r_comp_raw": extras["r_comp_raw"],
             "r_mimic": extras["r_mimic"],
+            "r_terminal_qty": extras["r_terminal_qty"],
+            "r_terminal_cost": extras["r_terminal_cost"],
             "r_terminal": extras["r_terminal"],
+            "residual_cost_bps": extras["residual_cost_bps"],
+            "residual_cost_valid": extras["residual_cost_valid"],
+            "residual_priced_fraction": extras["residual_priced_fraction"],
+            "residual_liquidation_fill": extras["residual_liquidation_fill"],
+            "residual_quant": extras["residual_quant"],
+            "terminal_residual_cost_coef": extras[
+                "terminal_residual_cost_coef"
+            ],
             "V_RL_step": extras["V_RL_step"],
             "C_RL_step": extras["C_RL_step"],
             "V_base_step": extras["V_base_step"],

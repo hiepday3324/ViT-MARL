@@ -16,8 +16,10 @@ from gymnax_exchange.jaxen.StatesandParams import (
 from gymnax_exchange.jaxen.marl_env import MARLEnv
 from gymnax_exchange.jaxen.mm_env import MarketMakingAgent
 from gymnax_exchange.jaxen.shadow_twap import (
+    compute_residual_execution_cost_bps,
     compute_terminal_execution_benchmark,
     shadow_market_order_sweep,
+    signed_implementation_shortfall_bps,
     simulate_shadow_twap_interval,
 )
 from gymnax_exchange.jaxen.twap_schedule import fixed_step_twap_child_quantity
@@ -393,6 +395,8 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
             trades,
             asks,
             bids,
+            asks,
+            bids,
             jnp.asarray([[10000, 30]], dtype=jnp.int32),
             jnp.asarray([[9900, 100]], dtype=jnp.int32),
             jnp.asarray([1, 0], dtype=jnp.int32),
@@ -424,6 +428,8 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
             trades,
             world_state.ask_raw_orders,
             world_state.bid_raw_orders,
+            world_state.ask_raw_orders,
+            world_state.bid_raw_orders,
             world_state.best_asks,
             world_state.best_bids,
             jnp.asarray([1, 0], dtype=jnp.int32),
@@ -447,6 +453,8 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
             agent_state,
             agent_params,
             trades,
+            _orders([10000, 10100, 10200], [5, 5, 20]),
+            _orders([9900], [100], capacity=3),
             _orders([10000, 10100, 10200], [5, 5, 20]),
             _orders([9900], [100], capacity=3),
             jnp.asarray([[10000, 30]], dtype=jnp.int32),
@@ -474,6 +482,8 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
             agent_state,
             agent_params,
             trades,
+            _orders([10100], [100], capacity=3),
+            _orders([10000, 9900, 9800], [3, 4, 10]),
             _orders([10100], [100], capacity=3),
             _orders([10000, 9900, 9800], [3, 4, 10]),
             jnp.asarray([[10100, 100]], dtype=jnp.int32),
@@ -538,6 +548,8 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
             agent_state,
             agent_params,
             trades,
+            _orders([10000, 10100], [5, 5], capacity=3),
+            _orders([9900, 9800], [5, 5], capacity=3),
             _orders([10000, 10100], [5, 5], capacity=3),
             _orders([9900, 9800], [5, 5], capacity=3),
             jnp.asarray([[10000, 5]], dtype=jnp.int32),
@@ -819,6 +831,8 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
             trades,
             pre_world.ask_raw_orders,
             pre_world.bid_raw_orders,
+            pre_world.ask_raw_orders,
+            pre_world.bid_raw_orders,
             pre_world.best_asks,
             pre_world.best_bids,
             jnp.asarray([4, 0], dtype=jnp.int32),
@@ -871,6 +885,299 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
             float(reset_result.forced_liquidation_is_bps),
         )
 
+    def test_zero_residual_has_zero_valid_economic_cost(self):
+        result = compute_residual_execution_cost_bps(
+            _orders([101], [100]),
+            _orders([99], [100]),
+            residual_quantity=0.0,
+            task_quantity=500.0,
+            arrival_price=100.0,
+            is_sell_task=False,
+            tick_size=1,
+        )
+        terms = _compute_windowed_itt_reward(
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            100.0,
+            False,
+            0.0,
+            500.0,
+            0.5,
+            1.0,
+            result.residual_cost_bps,
+            result.valid,
+            0.1,
+        )
+
+        self.assertTrue(bool(result.valid))
+        self.assertEqual(float(result.residual_cost_bps), 0.0)
+        self.assertEqual(float(result.filled_quantity), 0.0)
+        self.assertEqual(float(result.priced_fraction), 1.0)
+        self.assertEqual(float(terms["r_terminal_qty"]), 0.0)
+        self.assertEqual(float(terms["r_terminal_cost"]), 0.0)
+        self.assertEqual(float(terms["r_terminal"]), 0.0)
+
+    def test_residual_cost_sign_is_consistent_for_buy_and_sell(self):
+        cases = (
+            (False, 101, 99, 1.0),
+            (False, 99, 99, -1.0),
+            (True, 101, 99, 1.0),
+            (True, 101, 101, -1.0),
+        )
+        for is_sell, ask_price, bid_price, expected_sign in cases:
+            with self.subTest(is_sell=is_sell, ask=ask_price, bid=bid_price):
+                result = compute_residual_execution_cost_bps(
+                    _orders([ask_price], [100]),
+                    _orders([bid_price], [100]),
+                    residual_quantity=100.0,
+                    task_quantity=500.0,
+                    arrival_price=100.0,
+                    is_sell_task=is_sell,
+                    tick_size=1,
+                )
+                terms = _compute_windowed_itt_reward(
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    100.0,
+                    is_sell,
+                    100.0,
+                    500.0,
+                    0.5,
+                    1.0,
+                    result.residual_cost_bps,
+                    result.valid,
+                    0.1,
+                )
+
+                self.assertTrue(bool(result.valid))
+                self.assertEqual(
+                    np.sign(float(result.residual_cost_bps)),
+                    expected_sign,
+                )
+                self.assertEqual(
+                    np.sign(float(terms["r_terminal_cost"])),
+                    -expected_sign,
+                )
+
+    def test_same_residual_quantity_has_distinct_liquidity_cost(self):
+        cheaper = compute_residual_execution_cost_bps(
+            _orders([100], [100]),
+            _orders([99], [100]),
+            residual_quantity=100.0,
+            task_quantity=500.0,
+            arrival_price=100.0,
+            is_sell_task=False,
+            tick_size=1,
+        )
+        expensive = compute_residual_execution_cost_bps(
+            _orders([102], [100]),
+            _orders([99], [100]),
+            residual_quantity=100.0,
+            task_quantity=500.0,
+            arrival_price=100.0,
+            is_sell_task=False,
+            tick_size=1,
+        )
+        cheaper_terms = _compute_windowed_itt_reward(
+            0.0, 0.0, 0.0, 0.0, 100.0, False,
+            100.0, 500.0, 0.5, 1.0,
+            cheaper.residual_cost_bps, cheaper.valid, 0.1,
+        )
+        expensive_terms = _compute_windowed_itt_reward(
+            0.0, 0.0, 0.0, 0.0, 100.0, False,
+            100.0, 500.0, 0.5, 1.0,
+            expensive.residual_cost_bps, expensive.valid, 0.1,
+        )
+
+        self.assertEqual(
+            float(cheaper_terms["r_terminal_qty"]),
+            float(expensive_terms["r_terminal_qty"]),
+        )
+        self.assertLess(
+            float(expensive_terms["r_terminal_cost"]),
+            float(cheaper_terms["r_terminal_cost"]),
+        )
+
+    def test_insufficient_depth_disables_only_economic_terminal_term(self):
+        result = compute_residual_execution_cost_bps(
+            _orders([101], [40]),
+            _orders([99], [40]),
+            residual_quantity=100.0,
+            task_quantity=500.0,
+            arrival_price=100.0,
+            is_sell_task=False,
+            tick_size=1,
+        )
+        terms = _compute_windowed_itt_reward(
+            0.0, 0.0, 0.0, 0.0, 100.0, False,
+            100.0, 500.0, 0.5, 1.0,
+            result.residual_cost_bps, result.valid, 0.1,
+        )
+
+        self.assertFalse(bool(result.valid))
+        self.assertAlmostEqual(float(result.filled_quantity), 40.0)
+        self.assertAlmostEqual(float(result.priced_fraction), 0.4)
+        self.assertEqual(float(result.residual_cost_bps), 0.0)
+        self.assertAlmostEqual(float(terms["r_terminal_qty"]), -0.2)
+        self.assertEqual(float(terms["r_terminal_cost"]), 0.0)
+        self.assertAlmostEqual(float(terms["r_terminal"]), -0.2)
+        self.assertTrue(np.all(np.isfinite(np.asarray(result))))
+
+    def test_zero_cost_coefficient_reproduces_previous_reward(self):
+        self.assertEqual(
+            Execution_EnvironmentConfig().terminal_residual_cost_coef,
+            0.0,
+        )
+        terms = _compute_windowed_itt_reward(
+            25.0,
+            2500.0,
+            20.0,
+            2025.0,
+            100.0,
+            False,
+            100.0,
+            500.0,
+            0.5,
+            1.0,
+            250.0,
+            True,
+            0.0,
+        )
+        old_reward = (
+            float(terms["r_comp"])
+            + 0.5 * float(terms["r_mimic"])
+            - 100.0 / 500.0
+        )
+
+        self.assertAlmostEqual(float(terms["reward"]), old_reward)
+        self.assertEqual(float(terms["r_terminal_cost"]), 0.0)
+
+    def test_nonterminal_transition_has_no_terminal_reward(self):
+        agent, world_state, agent_state, agent_params, trades = self._reward_fixture(
+            task="buy",
+            task_size=100,
+            terminal_residual_cost_coef=0.1,
+        )
+        agent_state = agent_state.replace(init_price=10_000)
+        _, info = agent._get_reward(
+            world_state,
+            agent_state,
+            agent_params,
+            trades,
+            world_state.ask_raw_orders,
+            world_state.bid_raw_orders,
+            _orders([10_100], [100], capacity=3),
+            _orders([9_900], [100], capacity=3),
+            jnp.asarray([[10_100, 100]], dtype=jnp.int32),
+            jnp.asarray([[9_900, 100]], dtype=jnp.int32),
+            jnp.asarray([1, 0], dtype=jnp.int32),
+        )
+
+        self.assertFalse(bool(info["residual_cost_valid"]))
+        self.assertEqual(float(info["r_terminal_qty"]), 0.0)
+        self.assertEqual(float(info["r_terminal_cost"]), 0.0)
+        self.assertEqual(float(info["r_terminal"]), 0.0)
+
+    def test_residual_and_executed_contributions_sum_to_full_forced_is(self):
+        task_quantity = 500.0
+        arrival_price = 100.0
+        rl_filled = 400.0
+        rl_cost = 39_800.0
+        residual = compute_residual_execution_cost_bps(
+            _orders([101, 102], [50, 50]),
+            _orders([99], [100], capacity=2),
+            residual_quantity=100.0,
+            task_quantity=task_quantity,
+            arrival_price=arrival_price,
+            is_sell_task=False,
+            tick_size=1,
+        )
+        executed_contribution = (
+            (rl_cost - rl_filled * arrival_price)
+            / (task_quantity * arrival_price)
+            * 10_000.0
+        )
+        full_is, full_valid = signed_implementation_shortfall_bps(
+            rl_cost + 10_150.0,
+            task_quantity,
+            arrival_price,
+            False,
+            1,
+        )
+
+        self.assertTrue(bool(residual.valid))
+        self.assertTrue(bool(full_valid))
+        np.testing.assert_allclose(
+            float(full_is),
+            executed_contribution + float(residual.residual_cost_bps),
+            atol=1e-3,
+        )
+
+    def test_reward_uses_post_step_terminal_book_for_residual_cost(self):
+        agent, world_state, agent_state, agent_params, trades = self._reward_fixture(
+            task="buy",
+            task_size=100,
+            terminal_residual_cost_coef=0.1,
+        )
+        world_state = world_state.replace(step_counter=4)
+        agent_state = agent_state.replace(init_price=10_000)
+        decision_asks = _orders([9_900], [100], capacity=3)
+        decision_bids = _orders([9_800], [100], capacity=3)
+        terminal_asks = _orders([10_100], [100], capacity=3)
+        terminal_bids = _orders([9_900], [100], capacity=3)
+
+        reward, info = agent._get_reward(
+            world_state,
+            agent_state,
+            agent_params,
+            trades,
+            decision_asks,
+            decision_bids,
+            terminal_asks,
+            terminal_bids,
+            jnp.asarray([[10_100, 100]], dtype=jnp.int32),
+            jnp.asarray([[9_900, 100]], dtype=jnp.int32),
+            jnp.asarray([1, 0], dtype=jnp.int32),
+        )
+
+        self.assertTrue(bool(info["residual_cost_valid"]))
+        self.assertAlmostEqual(float(info["residual_cost_bps"]), 100.0, places=3)
+        self.assertAlmostEqual(float(info["r_terminal_qty"]), -1.0)
+        self.assertAlmostEqual(float(info["r_terminal_cost"]), -10.0, places=5)
+        self.assertAlmostEqual(float(info["r_terminal"]), -11.0, places=5)
+        self.assertAlmostEqual(
+            float(reward),
+            float(info["reward_main"] + info["r_terminal"]),
+        )
+
+    def test_residual_cost_helper_is_read_only_and_jittable(self):
+        asks = _orders([101, 102], [50, 50])
+        bids = _orders([99, 98], [50, 50])
+        asks_before = np.asarray(asks).copy()
+        bids_before = np.asarray(bids).copy()
+
+        @jax.jit
+        def evaluate(ask_orders, bid_orders, is_sell):
+            return compute_residual_execution_cost_bps(
+                ask_orders,
+                bid_orders,
+                residual_quantity=100.0,
+                task_quantity=500.0,
+                arrival_price=100.0,
+                is_sell_task=is_sell,
+                tick_size=1,
+            )
+
+        result = evaluate(asks, bids, False)
+        self.assertTrue(bool(result.valid))
+        self.assertTrue(np.all(np.isfinite(np.asarray(result))))
+        np.testing.assert_array_equal(np.asarray(asks), asks_before)
+        np.testing.assert_array_equal(np.asarray(bids), bids_before)
+
     def _assert_tree_equal(self, actual, expected):
         actual_leaves, actual_tree = jax.tree_util.tree_flatten(actual)
         expected_leaves, expected_tree = jax.tree_util.tree_flatten(expected)
@@ -882,7 +1189,12 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
             )
 
     @staticmethod
-    def _reward_fixture(task="buy", task_size=100, itt_window_size=16):
+    def _reward_fixture(
+        task="buy",
+        task_size=100,
+        itt_window_size=16,
+        terminal_residual_cost_coef=0.0,
+    ):
         world_config = World_EnvironmentConfig(
             nOrders=3,
             episode_time=5,
@@ -894,6 +1206,7 @@ class ShadowTWAPTeacherTest(unittest.TestCase):
             task=task,
             task_size=task_size,
             itt_window_size=itt_window_size,
+            terminal_residual_cost_coef=terminal_residual_cost_coef,
         )
         agent = ExecutionAgent(agent_config, world_config)
         asks = _orders([10000], [30], capacity=3)
