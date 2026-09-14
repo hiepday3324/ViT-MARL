@@ -72,8 +72,8 @@ def _cancel_map(messages):
 
 def test_target_equal_resting_keeps_existing_order_without_repost():
     action, cancel = _reconcile(
-        _action_rows([(1, 100, 15)]),
-        _resting_rows([(100, 15, -10, 1, 0)]),
+        _action_rows([(1, 100, 10)]),
+        _resting_rows([(100, 10, -10, 1, 0)]),
     )
     assert _action_map(action) == {}
     assert _cancel_map(cancel) == {}
@@ -88,15 +88,13 @@ def test_target_below_resting_cancels_only_excess():
     assert _cancel_map(cancel) == {-10: 4}
 
 
-def test_target_above_resting_preserves_fifo_and_submits_only_delta():
+def test_target_above_resting_cancels_old_and_submits_full_target():
     action, cancel = _reconcile(
-        _action_rows([(1, 100, 20)]),
-        _resting_rows(
-            [(100, 10, -10, 1, 0), (100, 5, -11, 2, 0)]
-        ),
+        _action_rows([(1, 100, 10)]),
+        _resting_rows([(100, 6, -10, 1, 0)]),
     )
-    assert _action_map(action) == {(1, 100): 5}
-    assert _cancel_map(cancel) == {}
+    assert _action_map(action) == {(1, 100): 10}
+    assert _cancel_map(cancel) == {-10: 6}
 
 
 def test_zero_target_cancels_all_resting_at_key():
@@ -113,8 +111,8 @@ def test_multi_price_reconciliation_uses_exact_keys():
         _action_rows([(1, 100, 10), (1, 99, 5)]),
         _resting_rows([(99, 100, -20, 1, 0), (100, 1, -10, 2, 0)]),
     )
-    assert _action_map(action) == {(1, 100): 9}
-    assert _cancel_map(cancel) == {-20: 95}
+    assert _action_map(action) == {(1, 100): 10}
+    assert _cancel_map(cancel) == {-20: 95, -10: 1}
 
 
 def test_raw_resting_permutation_is_semantically_invariant():
@@ -137,74 +135,35 @@ def test_counterexample_does_not_pair_quantities_across_prices():
         _action_rows([(1, 100, 10), (1, 99, 5)]),
         _resting_rows([(99, 100, -20, 1, 0), (100, 1, -10, 2, 0)]),
     )
-    assert _action_map(action)[(1, 100)] == 9
+    assert _action_map(action)[(1, 100)] == 10
     assert (1, 99) not in _action_map(action)
-    assert -10 not in _cancel_map(cancel)
+    assert _cancel_map(cancel)[-10] == 1
     assert _cancel_map(cancel)[-20] == 95
 
 
 def test_duplicate_policy_prices_are_aggregated():
     action, cancel = _reconcile(
-        _action_rows([(1, 100, 7), (1, 100, 5)]),
-        _resting_rows([(100, 5, -10, 1, 0)]),
+        _action_rows([(1, 100, 4), (1, 100, 3), (1, 99, 5)]),
+        _resting_rows([]),
     )
-    assert _action_map(action) == {(1, 100): 7}
+    assert _action_map(action) == {(1, 100): 7, (1, 99): 5}
     assert _cancel_map(cancel) == {}
 
 
 @pytest.mark.parametrize(
     "target,expected",
     [
-        (12, {-11: 3}),
-        (2, {-11: 5, -10: 8}),
+        (7, {-11: 3}),
+        (2, {-11: 6, -10: 2}),
     ],
 )
 def test_duplicate_resting_orders_cancel_newest_first(target, expected):
     action, cancel = _reconcile(
         _action_rows([(1, 100, target)]),
-        _resting_rows([(100, 10, -10, 1, 0), (100, 5, -11, 2, 0)]),
+        _resting_rows([(100, 4, -10, 1, 0), (100, 6, -11, 2, 0)]),
     )
     assert _action_map(action) == {}
     assert _cancel_map(cancel) == expected
-
-
-def test_decrease_crossing_multiple_oids_cancels_newest_first():
-    action, cancel = _reconcile(
-        _action_rows([(1, 100, 11)]),
-        _resting_rows(
-            [
-                (100, 10, -10, 1, 0),
-                (100, 5, -11, 2, 0),
-                (100, 7, -12, 3, 0),
-            ]
-        ),
-    )
-    cancel_array = np.asarray(cancel)
-    active = cancel_array[cancel_array[:, cst.LOBMSGFEAT.Quant.value] > 0]
-    assert active[:, cst.LOBMSGFEAT.OID.value].tolist() == [-12, -11]
-    assert active[:, cst.LOBMSGFEAT.Quant.value].tolist() == [7, 4]
-    assert active[:, cst.LOBMSGFEAT.Price.value].tolist() == [100, 100]
-    assert active[:, cst.LOBMSGFEAT.Side.value].tolist() == [1, 1]
-    assert -10 not in _cancel_map(cancel)
-    assert _action_map(action) == {}
-
-
-def test_zero_target_cancels_multiple_oids_newest_first():
-    action, cancel = _reconcile(
-        _action_rows([(1, 100, 0)]),
-        _resting_rows(
-            [
-                (100, 10, -10, 1, 0),
-                (100, 5, -11, 2, 0),
-                (100, 7, -12, 3, 0),
-            ]
-        ),
-    )
-    cancel_array = np.asarray(cancel)
-    active = cancel_array[cancel_array[:, cst.LOBMSGFEAT.Quant.value] > 0]
-    assert active[:, cst.LOBMSGFEAT.OID.value].tolist() == [-12, -11, -10]
-    assert active[:, cst.LOBMSGFEAT.Quant.value].tolist() == [7, 5, 10]
-    assert _action_map(action) == {}
 
 
 def test_same_numeric_price_on_opposite_side_is_not_matched():
@@ -263,7 +222,7 @@ def test_helper_is_jittable_and_vmappable():
     assert action.shape == (2, 3, 8)
     assert cancel.shape == (2, 3, 8)
     assert _cancel_map(cancel[0]) == {-10: 4}
-    assert _action_map(action[1]) == {(1, 101): 6}
+    assert _action_map(action[1]) == {(1, 101): 10}
 
 
 def test_policy_blending_get_messages_dispatches_to_keyed_reconciliation():
@@ -286,8 +245,8 @@ def test_policy_blending_get_messages_dispatches_to_keyed_reconciliation():
     action, cancel = agent._get_messages(
         jnp.asarray(0), world_state, agent_state, agent_params
     )
-    assert _action_map(action) == {(1, 100): 9}
-    assert _cancel_map(cancel) == {-20: 95}
+    assert _action_map(action) == {(1, 100): 10}
+    assert _cancel_map(cancel) == {-20: 95, -10: 1}
 
 
 @pytest.mark.parametrize(

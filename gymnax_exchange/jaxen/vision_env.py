@@ -208,7 +208,7 @@ def _reconcile_policy_blending_messages(
     )
     emitted_quantities = jnp.where(
         first_for_key & (target_by_action > resting_by_action),
-        target_by_action - resting_by_action,
+        target_by_action,
         0,
     )
     reconciled_actions = action_msgs.at[:, msg_quant].set(emitted_quantities)
@@ -243,7 +243,7 @@ def _reconcile_policy_blending_messages(
         jnp.where(
             target_for_order < resting_total,
             resting_total - target_for_order,
-            0,
+            jnp.where(target_for_order > resting_total, resting_total, 0),
         ),
         resting_total,
     )
