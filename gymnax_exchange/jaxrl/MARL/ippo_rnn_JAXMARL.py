@@ -70,16 +70,37 @@ from gymnax_exchange.jaxrl.MARL.ppo_lifecycle import (
     next_rnn_reset,
 )
 from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
+    ACTOR_CRITIC_GRADIENT_GROUPS,
+    CRITIC_OPTIMIZER_PARAMETER_GROUPS,
     GRADIENT_GROUPS,
     PARAMETER_GROUP_RULES,
+    actor_critic_grad_diag_should_run,
+    critic_optimizer_diag_should_run,
+    empty_actor_critic_gradient_diagnostics,
+    empty_critic_optimizer_diagnostics,
     empty_gradient_interaction_diagnostics,
+    empty_value_representation_probe_diagnostics,
+    empty_value_clip_diagnostics,
+    format_actor_critic_gradient_diagnostics,
+    format_critic_optimizer_diagnostics,
     format_gradient_interaction_diagnostics,
+    format_value_representation_probe_diagnostics,
+    format_value_clip_diagnostics,
     gradient_diag_should_run,
     subtract_gradient_trees,
+    summarize_actor_critic_gradient_interaction,
+    summarize_critic_optimizer_diagnostics,
     summarize_gradient_interaction,
     summarize_phasic_gradient_interaction,
+    run_value_representation_probe,
+    summarize_value_clip_diagnostics,
+    validate_actor_critic_grad_diag_config,
+    validate_critic_optimizer_diag_config,
     validate_gradient_diag_config,
     validate_required_parameter_groups,
+    validate_value_representation_probe_config,
+    validate_value_clip_diag_config,
+    value_clip_diag_should_run,
 )
 from gymnax_exchange.jaxrl.MARL.box_ppo import (
     FIRST_NONFINITE_STAGE_NAME,
@@ -399,6 +420,28 @@ def make_train(config):
     # scenario = map_name_to_scenario(config["MAP_NAME"])
     grad_diag_cadence = validate_gradient_diag_config(config)
     grad_diag_enabled = bool(config.get("enable_grad_interaction_diag", False))
+    actor_critic_grad_diag_cadence = validate_actor_critic_grad_diag_config(
+        config
+    )
+    actor_critic_grad_diag_enabled = bool(
+        config.get("enable_actor_critic_grad_diag", False)
+    )
+    value_clip_diag_cadence = validate_value_clip_diag_config(config)
+    value_clip_diag_enabled = bool(
+        config.get("enable_value_clip_diag", False)
+    )
+    critic_optimizer_diag_cadence = validate_critic_optimizer_diag_config(
+        config
+    )
+    critic_optimizer_diag_enabled = bool(
+        config.get("enable_critic_optimizer_diag", False)
+    )
+    value_representation_probe_enabled = bool(
+        config.get("enable_value_representation_probe", False)
+    )
+    value_representation_probe_config = (
+        validate_value_representation_probe_config(config)
+    )
     box_ppo_diag_enabled = bool(config.get("enable_box_ppo_numerics_diag", False))
     init_key = jax.random.PRNGKey(config["SEED"])
     config_dict={"MarketMaking": MarketMaking_EnvironmentConfig,"Execution": Execution_EnvironmentConfig}
@@ -586,6 +629,50 @@ def make_train(config):
                         f"param_leaf_count={group_counts[group]}",
                         f"rule={PARAMETER_GROUP_RULES[group]}",
                     )
+            if actor_critic_grad_diag_enabled and _is_execution_agent(
+                env.list_of_agents_configs[i]
+            ):
+                actor_critic_group_counts = validate_required_parameter_groups(
+                    network_params,
+                    required_groups=ACTOR_CRITIC_GRADIENT_GROUPS,
+                )
+                for group in ACTOR_CRITIC_GRADIENT_GROUPS:
+                    print(
+                        "ACTOR_CRITIC_GRAD_DIAG_GROUP_RULE",
+                        f"agent=EXE group={group}",
+                        f"param_leaf_count={actor_critic_group_counts[group]}",
+                        f"rule={PARAMETER_GROUP_RULES[group]}",
+                    )
+            if critic_optimizer_diag_enabled and _is_execution_agent(
+                env.list_of_agents_configs[i]
+            ):
+                critic_optimizer_group_counts = (
+                    validate_required_parameter_groups(
+                        network_params,
+                        required_groups=CRITIC_OPTIMIZER_PARAMETER_GROUPS,
+                    )
+                )
+                for group in CRITIC_OPTIMIZER_PARAMETER_GROUPS:
+                    print(
+                        "CRITIC_OPTIMIZER_DIAG_GROUP_RULE",
+                        f"agent=EXE group={group}",
+                        f"param_leaf_count={critic_optimizer_group_counts[group]}",
+                        f"rule={PARAMETER_GROUP_RULES[group]}",
+                    )
+            if value_representation_probe_enabled and _is_execution_agent(
+                env.list_of_agents_configs[i]
+            ):
+                probe_group_counts = validate_required_parameter_groups(
+                    network_params,
+                    required_groups=GRADIENT_GROUPS,
+                )
+                print(
+                    "VALUE_REP_PROBE_GROUPS",
+                    "agent=EXE",
+                    "probe_a=critic_head",
+                    "probe_b=all_except_actor_head",
+                    f"counts={probe_group_counts}",
+                )
             if phasic_mode and i == execution_index:
                 aux_opt_state = aux_tx.init(network_params)
             if config["ANNEAL_LR"][i]:
@@ -1281,10 +1368,89 @@ def make_train(config):
                 advantages.append(advantages_i)
                 targets.append(targets_i)
 
+            value_representation_probe_diag = (
+                empty_value_representation_probe_diagnostics(
+                    enabled=value_representation_probe_enabled,
+                    not_applicable=(
+                        value_representation_probe_enabled
+                        and execution_index is None
+                    ),
+                    steps=value_representation_probe_config["steps"],
+                    learning_rate=value_representation_probe_config[
+                        "learning_rate"
+                    ],
+                    train_fraction=value_representation_probe_config[
+                        "train_fraction"
+                    ],
+                )
+            )
+            if value_representation_probe_enabled and execution_index is not None:
+                probe_updates = jnp.asarray(
+                    value_representation_probe_config["updates"],
+                    dtype=jnp.int32,
+                )
+                probe_scheduled = jnp.any(
+                    jnp.asarray(update_steps, dtype=jnp.int32) == probe_updates
+                )
+                execution_probe_state = train_states[execution_index]
+                execution_probe_trajectory = traj_batch[execution_index]
+
+                def _probe_value_apply(
+                    probe_params,
+                    probe_hstate,
+                    probe_obs,
+                    probe_rnn_reset,
+                ):
+                    _, _, probe_value, _, _ = execution_probe_state.apply_fn(
+                        probe_params,
+                        probe_hstate,
+                        (probe_obs, probe_rnn_reset),
+                    )
+                    return probe_value
+
+                def _run_value_representation_probe(_):
+                    return run_value_representation_probe(
+                        _probe_value_apply,
+                        execution_probe_state.params,
+                        initial_hstates[execution_index],
+                        execution_probe_trajectory.obs,
+                        execution_probe_trajectory.rnn_reset,
+                        targets[execution_index],
+                        execution_probe_trajectory.agent_active,
+                        num_environments=config["NUM_ENVS"],
+                        steps=value_representation_probe_config["steps"],
+                        learning_rate=value_representation_probe_config[
+                            "learning_rate"
+                        ],
+                        train_fraction=value_representation_probe_config[
+                            "train_fraction"
+                        ],
+                    )
+
+                value_representation_probe_diag = jax.lax.cond(
+                    probe_scheduled,
+                    _run_value_representation_probe,
+                    lambda _: empty_value_representation_probe_diagnostics(
+                        enabled=True,
+                        skipped_by_schedule=True,
+                        steps=value_representation_probe_config["steps"],
+                        learning_rate=value_representation_probe_config[
+                            "learning_rate"
+                        ],
+                        train_fraction=value_representation_probe_config[
+                            "train_fraction"
+                        ],
+                    ),
+                    operand=None,
+                )
+
             # UPDATE NETWORKS
             # FIXME: APPLY VISION, GATED-FUSION
             loss_infos = []
             grad_interaction_diags = []
+            actor_critic_grad_diags = []
+            value_clip_diags = []
+            critic_optimizer_diags = []
             phasic_aux_diags = []
             ppo_safety_diags = []
             box_ppo_numerics_diags = []
@@ -1308,6 +1474,9 @@ def make_train(config):
                         (
                             train_state,
                             grad_interaction_diag,
+                            actor_critic_grad_diag,
+                            value_clip_diag,
+                            critic_optimizer_diag,
                             ppo_safety_state,
                         ) = update_carry
                         batch_info, minibatch_index = scan_input
@@ -1384,6 +1553,7 @@ def make_train(config):
                             # TỔNG HỢP PPO LOSS
                             weighted_value_loss = config["VF_COEF"][i] * value_loss
                             weighted_entropy_term = -config["ENT_COEF"][i] * entropy
+                            policy_objective = loss_actor + weighted_entropy_term
                             ppo_loss = loss_actor + weighted_value_loss + weighted_entropy_term
 
                             reliability_scores = aux_info["reliability_scores"]
@@ -1577,8 +1747,19 @@ def make_train(config):
                             return {
                                 "total_loss": total_loss,
                                 "ppo_loss": ppo_loss,
+                                "policy_objective": policy_objective,
+                                "value_loss_raw": value_loss,
                                 "survival_loss": survival_loss,
                                 "weighted_survival_loss": weighted_survival_loss,
+                                "value_clip_inputs": {
+                                    "old_value": traj_batch.value,
+                                    "new_value": value,
+                                    "target": targets,
+                                    "value_pred_clipped": value_pred_clipped,
+                                    "value_losses": value_losses,
+                                    "value_losses_clipped": value_losses_clipped,
+                                    "agent_active": traj_batch.agent_active,
+                                },
                                 "ppo_numerics_inputs": {
                                     "loc": aux_info.get(
                                         "policy_loc",
@@ -1674,9 +1855,33 @@ def make_train(config):
                                 surv_mask,
                                 objective_survival_weight,
                             )
+                            computed_value_clip_diag = value_clip_diag
+                            if value_clip_diag_enabled and agent_is_execution:
+                                should_compute_value_clip_diag = (
+                                    value_clip_diag_should_run(
+                                        update_steps,
+                                        value_clip_diag_cadence,
+                                        epoch_index,
+                                        minibatch_index,
+                                    )
+                                )
+
+                                def _compute_value_clip_diag(_):
+                                    return summarize_value_clip_diagnostics(
+                                        **components["value_clip_inputs"],
+                                        clip_eps=config["CLIP_EPS"],
+                                    )
+
+                                computed_value_clip_diag = jax.lax.cond(
+                                    should_compute_value_clip_diag,
+                                    _compute_value_clip_diag,
+                                    lambda _: value_clip_diag,
+                                    operand=None,
+                                )
                             return components["total_loss"], (
                                 components["metrics"],
                                 components["ppo_numerics_inputs"],
+                                computed_value_clip_diag,
                             )
 
                         def _ppo_objective(
@@ -1719,6 +1924,46 @@ def make_train(config):
                                 0.0,
                             )["survival_loss"]
 
+                        def _policy_objective(
+                            params,
+                            init_hstate,
+                            traj_batch,
+                            gae,
+                            targets,
+                            surv_labels,
+                            surv_mask,
+                        ):
+                            return _compute_loss_components(
+                                params,
+                                init_hstate,
+                                traj_batch,
+                                gae,
+                                targets,
+                                surv_labels,
+                                surv_mask,
+                                0.0,
+                            )["policy_objective"]
+
+                        def _value_objective_raw(
+                            params,
+                            init_hstate,
+                            traj_batch,
+                            gae,
+                            targets,
+                            surv_labels,
+                            surv_mask,
+                        ):
+                            return _compute_loss_components(
+                                params,
+                                init_hstate,
+                                traj_batch,
+                                gae,
+                                targets,
+                                surv_labels,
+                                surv_mask,
+                                0.0,
+                            )["value_loss_raw"]
+
                         grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                         total_loss, grads = grad_fn(
                             train_state.params,
@@ -1731,7 +1976,11 @@ def make_train(config):
                             ppo_objective_survival_weight,
                         )
                         loss_value, loss_aux = total_loss
-                        loss_metrics, ppo_numerics_inputs = loss_aux
+                        (
+                            loss_metrics,
+                            ppo_numerics_inputs,
+                            value_clip_diag,
+                        ) = loss_aux
                         if grad_diag_enabled and grad_diag_applicable:
                             should_compute_grad_diag = gradient_diag_should_run(
                                 update_steps,
@@ -1813,6 +2062,109 @@ def make_train(config):
                                 lambda _: grad_interaction_diag,
                                 operand=None,
                             )
+                        if actor_critic_grad_diag_enabled and agent_is_execution:
+                            should_compute_actor_critic_grad_diag = (
+                                actor_critic_grad_diag_should_run(
+                                    update_steps,
+                                    actor_critic_grad_diag_cadence,
+                                    epoch_index,
+                                    minibatch_index,
+                                )
+                            )
+
+                            def _compute_actor_critic_grad_diag(_):
+                                policy_grads = jax.grad(_policy_objective)(
+                                    train_state.params,
+                                    init_hstate,
+                                    traj_batch,
+                                    advantages,
+                                    targets,
+                                    surv_labels,
+                                    surv_mask,
+                                )
+                                value_grads_raw = jax.grad(
+                                    _value_objective_raw
+                                )(
+                                    train_state.params,
+                                    init_hstate,
+                                    traj_batch,
+                                    advantages,
+                                    targets,
+                                    surv_labels,
+                                    surv_mask,
+                                )
+                                ppo_grads = jax.grad(_ppo_objective)(
+                                    train_state.params,
+                                    init_hstate,
+                                    traj_batch,
+                                    advantages,
+                                    targets,
+                                    surv_labels,
+                                    surv_mask,
+                                )
+                                return summarize_actor_critic_gradient_interaction(
+                                    train_state.params,
+                                    grads,
+                                    ppo_grads,
+                                    policy_grads,
+                                    value_grads_raw,
+                                    config["VF_COEF"][i],
+                                    config["MAX_GRAD_NORM"][i],
+                                )
+
+                            actor_critic_grad_diag = jax.lax.cond(
+                                should_compute_actor_critic_grad_diag,
+                                _compute_actor_critic_grad_diag,
+                                lambda _: actor_critic_grad_diag,
+                                operand=None,
+                            )
+                        if critic_optimizer_diag_enabled and agent_is_execution:
+                            should_compute_critic_optimizer_diag = (
+                                critic_optimizer_diag_should_run(
+                                    update_steps,
+                                    critic_optimizer_diag_cadence,
+                                    epoch_index,
+                                    minibatch_index,
+                                )
+                            )
+
+                            def _compute_critic_optimizer_diag(_):
+                                policy_grads = jax.grad(_policy_objective)(
+                                    train_state.params,
+                                    init_hstate,
+                                    traj_batch,
+                                    advantages,
+                                    targets,
+                                    surv_labels,
+                                    surv_mask,
+                                )
+                                value_grads_raw = jax.grad(
+                                    _value_objective_raw
+                                )(
+                                    train_state.params,
+                                    init_hstate,
+                                    traj_batch,
+                                    advantages,
+                                    targets,
+                                    surv_labels,
+                                    surv_mask,
+                                )
+                                return summarize_critic_optimizer_diagnostics(
+                                    params=train_state.params,
+                                    optimizer_state=train_state.opt_state,
+                                    optimizer=train_state.tx,
+                                    policy_gradients=policy_grads,
+                                    value_gradients_raw=value_grads_raw,
+                                    current_vf_coef=config["VF_COEF"][i],
+                                    max_grad_norm=config["MAX_GRAD_NORM"][i],
+                                )
+
+                            critic_optimizer_diag = jax.lax.cond(
+                                should_compute_critic_optimizer_diag,
+                                _compute_critic_optimizer_diag,
+                                lambda _: critic_optimizer_diag,
+                                operand=None,
+                            )
                         guarded_update = guarded_ppo_apply_gradients(
                             train_state,
                             grads,
@@ -1874,6 +2226,9 @@ def make_train(config):
                         return (
                             train_state_after,
                             grad_interaction_diag,
+                            actor_critic_grad_diag,
+                            value_clip_diag,
+                            critic_optimizer_diag,
                             ppo_safety_state,
                         ), total_loss
                     (
@@ -1886,6 +2241,9 @@ def make_train(config):
                         surv_mask,
                         rng,
                         grad_interaction_diag,
+                        actor_critic_grad_diag,
+                        value_clip_diag,
+                        critic_optimizer_diag,
                         ppo_safety_state,
                     ) = update_state
                     rng, _rng = jax.random.split(rng)
@@ -1924,10 +2282,20 @@ def make_train(config):
                     (
                         train_state,
                         grad_interaction_diag,
+                        actor_critic_grad_diag,
+                        value_clip_diag,
+                        critic_optimizer_diag,
                         ppo_safety_state,
                     ), total_loss = jax.lax.scan(
                         _update_minbatch,
-                        (train_state, grad_interaction_diag, ppo_safety_state),
+                        (
+                            train_state,
+                            grad_interaction_diag,
+                            actor_critic_grad_diag,
+                            value_clip_diag,
+                            critic_optimizer_diag,
+                            ppo_safety_state,
+                        ),
                         (
                             minibatches,
                             jnp.arange(config["NUM_MINIBATCHES"], dtype=jnp.int32),
@@ -1943,6 +2311,9 @@ def make_train(config):
                         surv_mask,
                         rng,
                         grad_interaction_diag,
+                        actor_critic_grad_diag,
+                        value_clip_diag,
+                        critic_optimizer_diag,
                         ppo_safety_state,
                     )
                     return update_state, total_loss
@@ -1999,6 +2370,69 @@ def make_train(config):
                     ),
                     survival_loss_pre_ppo=survival_loss_pre_ppo,
                 )
+                actor_critic_cadence_due = (
+                    update_steps % actor_critic_grad_diag_cadence == 0
+                )
+                initial_actor_critic_grad_diag = (
+                    empty_actor_critic_gradient_diagnostics(
+                        train_state.params,
+                        enabled=actor_critic_grad_diag_enabled,
+                        skipped_by_cadence=(
+                            actor_critic_grad_diag_enabled
+                            and agent_is_execution
+                            and ~actor_critic_cadence_due
+                        ),
+                        not_applicable=(
+                            actor_critic_grad_diag_enabled
+                            and not agent_is_execution
+                        ),
+                        reason_not_execution=(
+                            actor_critic_grad_diag_enabled
+                            and not agent_is_execution
+                        ),
+                        max_grad_norm=config["MAX_GRAD_NORM"][i],
+                    )
+                )
+                value_clip_cadence_due = (
+                    update_steps % value_clip_diag_cadence == 0
+                )
+                initial_value_clip_diag = empty_value_clip_diagnostics(
+                    enabled=value_clip_diag_enabled,
+                    skipped_by_cadence=(
+                        value_clip_diag_enabled
+                        and agent_is_execution
+                        and ~value_clip_cadence_due
+                    ),
+                    not_applicable=(
+                        value_clip_diag_enabled and not agent_is_execution
+                    ),
+                    reason_not_execution=(
+                        value_clip_diag_enabled and not agent_is_execution
+                    ),
+                    clip_eps=config["CLIP_EPS"],
+                )
+                critic_optimizer_cadence_due = (
+                    update_steps % critic_optimizer_diag_cadence == 0
+                )
+                initial_critic_optimizer_diag = (
+                    empty_critic_optimizer_diagnostics(
+                        enabled=critic_optimizer_diag_enabled,
+                        skipped_by_cadence=(
+                            critic_optimizer_diag_enabled
+                            and agent_is_execution
+                            and ~critic_optimizer_cadence_due
+                        ),
+                        not_applicable=(
+                            critic_optimizer_diag_enabled
+                            and not agent_is_execution
+                        ),
+                        reason_not_execution=(
+                            critic_optimizer_diag_enabled
+                            and not agent_is_execution
+                        ),
+                        max_grad_norm=config["MAX_GRAD_NORM"][i],
+                    )
+                )
                 update_state = (
                     train_state,
                     initial_hstates[i],
@@ -2009,6 +2443,9 @@ def make_train(config):
                     survival_masks[i],
                     rng,
                     initial_grad_interaction_diag,
+                    initial_actor_critic_grad_diag,
+                    initial_value_clip_diag,
+                    initial_critic_optimizer_diag,
                     empty_ppo_safety_state(),
                 )
                 update_state, loss_info = jax.lax.scan(
@@ -2019,7 +2456,10 @@ def make_train(config):
                 train_states[i] = update_state[0]
                 loss_infos.append(loss_info)
                 grad_interaction_diags.append(update_state[8])
-                ppo_safety_diags.append(update_state[9])
+                actor_critic_grad_diags.append(update_state[9])
+                value_clip_diags.append(update_state[10])
+                critic_optimizer_diags.append(update_state[11])
+                ppo_safety_diags.append(update_state[12])
                 box_ppo_numerics_diags.append(loss_info[1][-1])
                 phasic_aux_diags.append(
                     empty_phasic_aux_diagnostics(
@@ -2140,6 +2580,12 @@ def make_train(config):
             metrics["execution_target_diag"] = survival_target_diags
             metrics["reliability_alignment_diag"] = reliability_alignment_diags
             metrics["grad_interaction_diag"] = grad_interaction_diags
+            metrics["actor_critic_grad_diag"] = actor_critic_grad_diags
+            metrics["value_clip_diag"] = value_clip_diags
+            metrics["critic_optimizer_diag"] = critic_optimizer_diags
+            metrics["value_representation_probe"] = (
+                value_representation_probe_diag
+            )
             metrics["phasic_aux_diag"] = phasic_aux_diags
             metrics["ppo_safety_diag"] = ppo_safety_diags
             metrics["box_ppo_numerics_diag"] = box_ppo_numerics_diags
@@ -2945,6 +3391,10 @@ def make_train(config):
 
                 print("[GRADIENTS]")
                 grad_wandb_metrics = {}
+                actor_critic_grad_wandb_metrics = {}
+                value_clip_wandb_metrics = {}
+                critic_optimizer_wandb_metrics = {}
+                value_representation_probe_wandb_metrics = {}
                 phasic_wandb_metrics = {}
                 if exe_agent_index is not None:
                     execution_grad_diag = metric["grad_interaction_diag"][
@@ -2961,6 +3411,58 @@ def make_train(config):
                     grad_wandb_metrics = {
                         f"agent_EXE/gradient_interaction/{key}": value
                         for key, value in grad_values.items()
+                    }
+                    actor_critic_grad_lines, actor_critic_grad_values = (
+                        format_actor_critic_gradient_diagnostics(
+                            metric["actor_critic_grad_diag"][exe_agent_index],
+                            update=update_idx,
+                            agent="EXE",
+                        )
+                    )
+                    for line in actor_critic_grad_lines:
+                        print(line)
+                    actor_critic_grad_wandb_metrics = {
+                        f"actor_critic_grad/{key}": value
+                        for key, value in actor_critic_grad_values.items()
+                    }
+                    value_clip_lines, value_clip_values = (
+                        format_value_clip_diagnostics(
+                            metric["value_clip_diag"][exe_agent_index],
+                            update=update_idx,
+                            agent="EXE",
+                        )
+                    )
+                    for line in value_clip_lines:
+                        print(line)
+                    value_clip_wandb_metrics = {
+                        f"value_clip_diag/{key}": value
+                        for key, value in value_clip_values.items()
+                    }
+                    critic_optimizer_lines, critic_optimizer_values = (
+                        format_critic_optimizer_diagnostics(
+                            metric["critic_optimizer_diag"][exe_agent_index],
+                            update=update_idx,
+                            agent="EXE",
+                        )
+                    )
+                    for line in critic_optimizer_lines:
+                        print(line)
+                    critic_optimizer_wandb_metrics = {
+                        f"critic_optimizer_diag/{key}": value
+                        for key, value in critic_optimizer_values.items()
+                    }
+                    value_probe_lines, value_probe_values = (
+                        format_value_representation_probe_diagnostics(
+                            metric["value_representation_probe"],
+                            update=update_idx,
+                            agent="EXE",
+                        )
+                    )
+                    for line in value_probe_lines:
+                        print(line)
+                    value_representation_probe_wandb_metrics = {
+                        f"value_representation_probe/{key}": value
+                        for key, value in value_probe_values.items()
                     }
                     survival_loss_pre_ppo = None
                     if (
@@ -2993,6 +3495,22 @@ def make_train(config):
                         f"GRAD_DIAG update={update_idx} status=not_applicable "
                         "reason=no_execution_agent"
                     )
+                    print(
+                        f"ACTOR_CRITIC_GRAD_DIAG update={update_idx} "
+                        "status=not_applicable reason=no_execution_agent"
+                    )
+                    print(
+                        f"VALUE_CLIP_DIAG update={update_idx} "
+                        "status=not_applicable reason=no_execution_agent"
+                    )
+                    print(
+                        f"CRITIC_OPTIMIZER_DIAG update={update_idx} "
+                        "status=not_applicable reason=no_execution_agent"
+                    )
+                    print(
+                        f"VALUE_REP_PROBE update={update_idx} "
+                        "status=not_applicable reason=no_execution_agent"
+                    )
 
                 for agent_index, tr in enumerate(metric["traj_batch"]):
                     agent_name = agent_type_names[agent_index]
@@ -3019,6 +3537,12 @@ def make_train(config):
                     }
                     if agent_name == "EXE":
                         logging_dict.update(grad_wandb_metrics)
+                        logging_dict.update(actor_critic_grad_wandb_metrics)
+                        logging_dict.update(value_clip_wandb_metrics)
+                        logging_dict.update(critic_optimizer_wandb_metrics)
+                        logging_dict.update(
+                            value_representation_probe_wandb_metrics
+                        )
                         logging_dict.update(phasic_wandb_metrics)
                         logging_dict.update(box_ppo_wandb_metrics)
                         exe_episode_metrics = metric["execution_episode_metrics"]

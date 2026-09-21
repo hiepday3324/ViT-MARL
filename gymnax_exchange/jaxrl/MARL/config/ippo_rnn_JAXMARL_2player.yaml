@@ -16,8 +16,19 @@
 "use_survival_loss": False
 "lambda_surv": 0.0
 "enable_grad_interaction_diag": False
+"enable_actor_critic_grad_diag": False
+"enable_value_clip_diag": False
+"enable_critic_optimizer_diag": False
+"enable_value_representation_probe": False
+"value_representation_probe_updates": [5, 10, 15]
+"value_representation_probe_steps": 150
+"value_representation_probe_lr": 0.001
+"value_representation_probe_train_fraction": 0.8
 "enable_box_ppo_numerics_diag": False
 "grad_interaction_diag_every_updates": 1
+"actor_critic_grad_diag_every_updates": 1
+"value_clip_diag_every_updates": 1
+"critic_optimizer_diag_every_updates": 1
 "reliability_optimization_mode": "joint"
 "aux_reliability_epochs": 1
 "aux_reliability_num_minibatches": null
@@ -64,6 +75,4 @@
 "EvalTimePeriod" : "2024_Eval"
 "Calculate Baseline" : False
 "Timing" : False
-
-
 
