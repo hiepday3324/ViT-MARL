@@ -24,6 +24,7 @@
 "value_representation_probe_steps": 150
 "value_representation_probe_lr": 0.001
 "value_representation_probe_train_fraction": 0.8
+"value_representation_probe_split_seed": 0
 "enable_box_ppo_numerics_diag": False
 "grad_interaction_diag_every_updates": 1
 "actor_critic_grad_diag_every_updates": 1

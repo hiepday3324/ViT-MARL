@@ -474,6 +474,7 @@ def validate_value_representation_probe_config(
     train_fraction = float(
         config.get("value_representation_probe_train_fraction", 0.8)
     )
+    split_seed = int(config.get("value_representation_probe_split_seed", 0))
     if not updates or any(update < 0 for update in updates):
         raise ValueError(
             "value_representation_probe_updates must contain non-negative "
@@ -489,11 +490,16 @@ def validate_value_representation_probe_config(
         raise ValueError(
             "value_representation_probe_train_fraction must be between 0 and 1."
         )
+    if split_seed < 0:
+        raise ValueError(
+            "value_representation_probe_split_seed must be non-negative."
+        )
     return {
         "updates": updates,
         "steps": steps,
         "learning_rate": learning_rate,
         "train_fraction": train_fraction,
+        "split_seed": split_seed,
     }
 
 
@@ -502,6 +508,7 @@ def trajectory_train_holdout_masks(
     *,
     num_environments: int,
     train_fraction: float,
+    split_seed: int,
 ) -> tuple[jax.Array, jax.Array, int, int]:
     """Split complete recurrent trajectories by environment identity."""
     active = jnp.asarray(agent_active, dtype=jnp.bool_)
@@ -523,7 +530,14 @@ def trajectory_train_holdout_masks(
     environment_ids = (
         jnp.arange(actor_count, dtype=jnp.int32) // actors_per_environment
     )
-    train_actor = environment_ids < train_environment_count
+    environment_permutation = np.random.default_rng(int(split_seed)).permutation(
+        num_environments
+    )
+    train_environment_membership = np.zeros(num_environments, dtype=np.bool_)
+    train_environment_membership[
+        environment_permutation[:train_environment_count]
+    ] = True
+    train_actor = jnp.asarray(train_environment_membership)[environment_ids]
     train_mask = active & train_actor[jnp.newaxis, :]
     holdout_mask = active & ~train_actor[jnp.newaxis, :]
     return (
@@ -703,6 +717,7 @@ def empty_value_representation_probe_diagnostics(
     steps=0,
     learning_rate=0.0,
     train_fraction=0.0,
+    split_seed=0,
 ):
     return {
         "enabled": jnp.asarray(enabled, dtype=jnp.bool_),
@@ -715,6 +730,7 @@ def empty_value_representation_probe_diagnostics(
         "steps": jnp.asarray(steps, dtype=jnp.int32),
         "learning_rate": jnp.asarray(learning_rate, dtype=jnp.float32),
         "train_fraction": jnp.asarray(train_fraction, dtype=jnp.float32),
+        "split_seed": jnp.asarray(split_seed, dtype=jnp.int32),
         "train_environment_count": jnp.array(0, dtype=jnp.int32),
         "holdout_environment_count": jnp.array(0, dtype=jnp.int32),
         "probes_start_identical": jnp.array(False),
@@ -762,6 +778,7 @@ def run_value_representation_probe(
     steps: int,
     learning_rate: float,
     train_fraction: float,
+    split_seed: int,
     eps=1e-12,
 ):
     """Run isolated head-only and shared-representation value probes."""
@@ -770,6 +787,7 @@ def run_value_representation_probe(
             agent_active,
             num_environments=num_environments,
             train_fraction=train_fraction,
+            split_seed=split_seed,
         )
     )
     initial_prediction = value_apply_fn(
@@ -865,6 +883,7 @@ def run_value_representation_probe(
         "steps": jnp.asarray(steps, dtype=jnp.int32),
         "learning_rate": jnp.asarray(learning_rate, dtype=jnp.float32),
         "train_fraction": jnp.asarray(train_fraction, dtype=jnp.float32),
+        "split_seed": jnp.asarray(split_seed, dtype=jnp.int32),
         "train_environment_count": jnp.asarray(train_count, dtype=jnp.int32),
         "holdout_environment_count": jnp.asarray(
             holdout_count,
@@ -2178,6 +2197,7 @@ def format_value_representation_probe_diagnostics(
         "steps": _host_scalar(diagnostics["steps"]),
         "learning_rate": _host_scalar(diagnostics["learning_rate"]),
         "train_fraction": _host_scalar(diagnostics["train_fraction"]),
+        "split_seed": _host_scalar(diagnostics["split_seed"]),
         "train_environment_count": _host_scalar(
             diagnostics["train_environment_count"]
         ),

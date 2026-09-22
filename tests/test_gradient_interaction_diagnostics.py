@@ -1285,26 +1285,57 @@ def _value_probe_data():
 
 
 def test_value_probe_trajectory_split_is_deterministic_and_disjoint():
-    active = jnp.ones((4, 10), dtype=jnp.bool_).at[2, 8].set(False)
+    active = jnp.ones((4, 12), dtype=jnp.bool_).at[2, 8].set(False)
+    training_key = jax.random.PRNGKey(123)
+    training_key_before = np.asarray(training_key).copy()
     first = trajectory_train_holdout_masks(
         active,
-        num_environments=5,
-        train_fraction=0.8,
+        num_environments=6,
+        train_fraction=2.0 / 3.0,
+        split_seed=0,
     )
     second = trajectory_train_holdout_masks(
         active,
-        num_environments=5,
-        train_fraction=0.8,
+        num_environments=6,
+        train_fraction=2.0 / 3.0,
+        split_seed=0,
     )
     train_mask, holdout_mask, train_count, holdout_count = first
     _assert_tree_allclose(first, second, atol=0.0, rtol=0.0)
     assert train_count == 4
-    assert holdout_count == 1
+    assert holdout_count == 2
     assert not bool(jnp.any(train_mask & holdout_mask))
     np.testing.assert_array_equal(train_mask | holdout_mask, active)
-    assert bool(jnp.all(train_mask[:, :8]))
-    assert not bool(jnp.any(train_mask[:, 8:]))
-    assert not bool(jnp.any(holdout_mask[:, :8]))
+    for environment_id in range(6):
+        actor_slice = slice(2 * environment_id, 2 * environment_id + 2)
+        assert bool(jnp.all(train_mask[0, actor_slice])) or bool(
+            jnp.all(holdout_mask[0, actor_slice])
+        )
+    for actor_index in range(active.shape[1]):
+        active_timesteps = active[:, actor_index]
+        assert not (
+            bool(jnp.any(train_mask[:, actor_index] & active_timesteps))
+            and bool(jnp.any(holdout_mask[:, actor_index] & active_timesteps))
+        )
+    np.testing.assert_array_equal(training_key, training_key_before)
+
+
+def test_value_probe_trajectory_split_changes_with_seed():
+    active = jnp.ones((3, 40), dtype=jnp.bool_)
+    seed_zero = trajectory_train_holdout_masks(
+        active,
+        num_environments=20,
+        train_fraction=0.8,
+        split_seed=0,
+    )
+    seed_one = trajectory_train_holdout_masks(
+        active,
+        num_environments=20,
+        train_fraction=0.8,
+        split_seed=1,
+    )
+    assert not np.array_equal(np.asarray(seed_zero[0]), np.asarray(seed_one[0]))
+    assert seed_zero[2:] == seed_one[2:] == (16, 4)
 
 
 def test_value_probe_statistics_mse_mae_and_explained_variance():
@@ -1335,6 +1366,7 @@ def test_value_probe_a_changes_only_critic_and_b_freezes_actor_parameters():
         data["active"],
         num_environments=10,
         train_fraction=0.8,
+        split_seed=0,
     )
     params_a, params_b = fit_value_representation_probe_variants(
         _value_probe_apply,
@@ -1423,9 +1455,11 @@ def test_value_probe_b_outperforms_a_when_frozen_features_are_insufficient():
         steps=150,
         learning_rate=0.03,
         train_fraction=0.8,
+        split_seed=0,
     )
     holdout_a = diagnostics["probe_a"]["holdout"]["final"]
     holdout_b = diagnostics["probe_b"]["holdout"]["final"]
+    assert int(diagnostics["split_seed"]) == 0
     assert bool(diagnostics["probes_start_identical"])
     assert float(holdout_b["explained_variance"]) > (
         float(holdout_a["explained_variance"]) + 0.5
@@ -1460,6 +1494,7 @@ def test_value_probe_sufficient_features_fit_and_disabled_path_is_static():
             steps=100,
             learning_rate=0.03,
             train_fraction=0.8,
+            split_seed=0,
         )
 
     diagnostics = run_probe(params)
@@ -1474,6 +1509,7 @@ def test_value_probe_sufficient_features_fit_and_disabled_path_is_static():
         steps=150,
         learning_rate=0.001,
         train_fraction=0.8,
+        split_seed=0,
     )
     assert jax.tree_util.tree_structure(disabled) == jax.tree_util.tree_structure(
         skipped
@@ -1488,3 +1524,7 @@ def test_value_probe_sufficient_features_fit_and_disabled_path_is_static():
     assert validated["steps"] == 150
     np.testing.assert_allclose(validated["learning_rate"], 0.001)
     np.testing.assert_allclose(validated["train_fraction"], 0.8)
+    assert validated["split_seed"] == 0
+    assert validate_value_representation_probe_config(
+        {"value_representation_probe_split_seed": 17}
+    )["split_seed"] == 17

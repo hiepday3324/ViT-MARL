@@ -1382,6 +1382,9 @@ def make_train(config):
                     train_fraction=value_representation_probe_config[
                         "train_fraction"
                     ],
+                    split_seed=value_representation_probe_config[
+                        "split_seed"
+                    ],
                 )
             )
             if value_representation_probe_enabled and execution_index is not None:
@@ -1425,6 +1428,9 @@ def make_train(config):
                         train_fraction=value_representation_probe_config[
                             "train_fraction"
                         ],
+                        split_seed=value_representation_probe_config[
+                            "split_seed"
+                        ],
                     )
 
                 value_representation_probe_diag = jax.lax.cond(
@@ -1439,6 +1445,9 @@ def make_train(config):
                         ],
                         train_fraction=value_representation_probe_config[
                             "train_fraction"
+                        ],
+                        split_seed=value_representation_probe_config[
+                            "split_seed"
                         ],
                     ),
                     operand=None,
