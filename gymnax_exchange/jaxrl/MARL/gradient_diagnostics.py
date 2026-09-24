@@ -59,6 +59,7 @@ ACTOR_CRITIC_GRADIENT_GROUPS = (
     "reliability_head",
     "vision_encoder",
     "fusion_shared_trunk",
+    "critic_representation",
 )
 
 ACTOR_CRITIC_GRADIENT_METRICS = (
@@ -131,6 +132,7 @@ CRITIC_OPTIMIZER_DIAGNOSTIC_GROUPS = (
     "fusion_shared_trunk",
     "vision_encoder",
     "reliability_head",
+    "critic_representation",
 )
 
 CRITIC_OPTIMIZER_PARAMETER_GROUPS = (
@@ -139,6 +141,7 @@ CRITIC_OPTIMIZER_PARAMETER_GROUPS = (
     "fusion_shared_trunk",
     "vision_encoder",
     "reliability_head",
+    "critic_representation",
 )
 
 CRITIC_OPTIMIZER_VARIANT_METRICS = (
@@ -172,6 +175,7 @@ _CRITIC_OPTIMIZER_GROUP_RULE_NAMES = {
     "fusion_shared_trunk": "fusion_shared_trunk",
     "vision_encoder": "vision_encoder",
     "reliability_head": "reliability_head",
+    "critic_representation": "critic_representation",
 }
 
 _PARAMS = ("params",)
@@ -181,6 +185,7 @@ _RELIABILITY_HEAD = _PARAMS + (
 )
 _VISION_ENCODER = _PARAMS + ("VisionAgent_0",)
 _RELIABILITY_FUSION = _PARAMS + ("ReliabilityFusionRNN_0",)
+_CRITIC_REPRESENTATION = _PARAMS + ("CriticValueRNN_0",)
 _ACTOR_DENSE_MODULES = frozenset(("Dense_0", "Dense_1"))
 _CRITIC_DENSE_MODULES = frozenset(("Dense_2", "Dense_3"))
 
@@ -191,10 +196,12 @@ PARAMETER_GROUP_RULES = {
     "vision_encoder": "prefix=params/VisionAgent_0",
     "fusion_shared_trunk": (
         "prefix=params/ReliabilityFusionRNN_0 excluding "
-        "LevelWiseReliabilityHead_0"
+        "LevelWiseReliabilityHead_0; or actor-only ActorEmbedding, "
+        "StableGatedCrossAttention_0, ScannedRNN_0"
     ),
     "actor_head": "prefix=params/Dense_0 or params/Dense_1; exact=params/log_std",
     "critic_head": "prefix=params/Dense_2 or params/Dense_3",
+    "critic_representation": "prefix=params/CriticValueRNN_0",
 }
 
 AUXILIARY_TRAINABLE_GROUPS = (
@@ -205,6 +212,9 @@ AUXILIARY_TRAINABLE_GROUPS = (
 
 VALUE_PROBE_A_TRAINABLE_GROUPS = ("critic_head",)
 VALUE_PROBE_B_FROZEN_GROUPS = ("actor_head",)
+VALUE_PROBE_B_SEPARATE_TRAINABLE_GROUPS = (
+    "critic_representation", "critic_head", "vision_encoder",
+)
 
 
 def _string_path(path: Sequence[Any]) -> tuple[str, ...]:
@@ -225,10 +235,15 @@ def parameter_path_in_group(path: Sequence[Any], group: str) -> bool:
     if group == "vision_encoder":
         return _has_prefix(path, _VISION_ENCODER)
     if group == "fusion_shared_trunk":
-        return _has_prefix(path, _RELIABILITY_FUSION) and not _has_prefix(
+        return (_has_prefix(path, _RELIABILITY_FUSION) and not _has_prefix(
             path,
             _RELIABILITY_HEAD,
+        )) or any(
+            _has_prefix(path, _PARAMS + (module,))
+            for module in ("ActorEmbedding", "StableGatedCrossAttention_0", "ScannedRNN_0")
         )
+    if group == "critic_representation":
+        return _has_prefix(path, _CRITIC_REPRESENTATION)
     if group == "actor_head":
         return (
             len(path) >= 2
@@ -339,7 +354,7 @@ def matching_parameter_paths(
 def parameter_group_leaf_counts(tree: Mapping[str, Any]) -> dict[str, int]:
     return {
         group: len(matching_parameter_paths(tree, group))
-        for group in GRADIENT_GROUPS
+        for group in GRADIENT_GROUPS + ("critic_representation",)
     }
 
 
@@ -614,15 +629,22 @@ def fit_value_representation_probe_variants(
     *,
     steps: int,
     learning_rate: float,
+    use_separate_critic_representation: bool = False,
 ):
     """Fit isolated Probe A/B parameter copies and discard optimizer states."""
     params_a = jax.tree_util.tree_map(lambda value: value + 0, params)
     params_b = jax.tree_util.tree_map(lambda value: value + 0, params)
     mask_a = parameter_groups_mask(params, VALUE_PROBE_A_TRAINABLE_GROUPS)
+    groups_b = (
+        VALUE_PROBE_B_SEPARATE_TRAINABLE_GROUPS
+        if use_separate_critic_representation else VALUE_PROBE_B_FROZEN_GROUPS
+    )
     mask_b = parameter_groups_mask(
-        params,
-        VALUE_PROBE_B_FROZEN_GROUPS,
-        invert=True,
+        params, groups_b, invert=not use_separate_critic_representation,
+    )
+    mask_b_tree = (
+        mask_tree_to_groups
+        if use_separate_critic_representation else mask_tree_excluding_groups
     )
     adam = optax.adam(learning_rate=learning_rate, eps=1e-5)
     optimizer_a = optax.masked(adam, mask_a)
@@ -648,9 +670,9 @@ def fit_value_representation_probe_variants(
             jax.grad(probe_loss)(probe_params_a),
             VALUE_PROBE_A_TRAINABLE_GROUPS,
         )
-        gradients_b = mask_tree_excluding_groups(
+        gradients_b = mask_b_tree(
             jax.grad(probe_loss)(probe_params_b),
-            VALUE_PROBE_B_FROZEN_GROUPS,
+            groups_b,
         )
         updates_a, state_a = optimizer_a.update(
             gradients_a,
@@ -666,9 +688,9 @@ def fit_value_representation_probe_variants(
             updates_a,
             VALUE_PROBE_A_TRAINABLE_GROUPS,
         )
-        updates_b = mask_tree_excluding_groups(
+        updates_b = mask_b_tree(
             updates_b,
-            VALUE_PROBE_B_FROZEN_GROUPS,
+            groups_b,
         )
         return (
             optax.apply_updates(probe_params_a, updates_a),
@@ -749,6 +771,7 @@ def empty_value_representation_probe_diagnostics(
                 "fusion_shared_trunk": jnp.array(0.0, dtype=jnp.float32),
                 "vision_encoder": jnp.array(0.0, dtype=jnp.float32),
                 "reliability_head": jnp.array(0.0, dtype=jnp.float32),
+                "critic_representation": jnp.array(0.0, dtype=jnp.float32),
             },
         },
         "comparison": {
@@ -779,6 +802,7 @@ def run_value_representation_probe(
     learning_rate: float,
     train_fraction: float,
     split_seed: int,
+    use_separate_critic_representation: bool = False,
     eps=1e-12,
 ):
     """Run isolated head-only and shared-representation value probes."""
@@ -811,6 +835,7 @@ def run_value_representation_probe(
         train_mask,
         steps=steps,
         learning_rate=learning_rate,
+        use_separate_critic_representation=use_separate_critic_representation,
     )
     prediction_a = value_apply_fn(
         params_a,
@@ -923,6 +948,7 @@ def run_value_representation_probe(
                     "fusion_shared_trunk",
                     "vision_encoder",
                     "reliability_head",
+                    "critic_representation",
                 )
             },
         },

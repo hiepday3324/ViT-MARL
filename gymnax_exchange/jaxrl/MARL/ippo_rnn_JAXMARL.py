@@ -232,13 +232,59 @@ class ReliabilityFusionRNN(nn.Module):
         )
 
 # FIXME: APPLY VISION 
+class CriticValueRNN(nn.Module):
+    config: Dict
+
+    @functools.partial(
+        nn.scan,
+        variable_broadcast="params",
+        in_axes=0,
+        out_axes=0,
+        split_rngs={"params": False},
+    )
+    @nn.compact
+    def __call__(self, carry, x):
+        exec_obs, raw_tokens, mid_context, resets = x
+        carry = jnp.where(resets[:, None], jnp.zeros_like(carry), carry)
+        critic_obs = jnp.concatenate((exec_obs, mid_context), axis=-1)
+        fused = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])(
+            critic_obs, raw_tokens
+        )
+        embedding = nn.relu(nn.Dense(
+            self.config["FC_DIM_SIZE"],
+            kernel_init=orthogonal(jnp.sqrt(2)),
+            bias_init=constant(0.0),
+        )(fused))
+        return nn.GRUCell(features=self.config["GRU_HIDDEN_DIM"])(carry, embedding)
+
+
 class ActorCriticRNN(nn.Module):
     action_space: spaces.Space
     config: Dict
+    is_execution: bool = False
+
+    @property
+    def separate_critic(self):
+        return self.is_execution and bool(
+            self.config.get("use_separate_critic_representation", False)
+        )
+
+    @nn.nowrap
+    def initialize_carry(self, batch_size):
+        width = self.config["GRU_HIDDEN_DIM"] * (2 if self.separate_critic else 1)
+        return ScannedRNN.initialize_carry(batch_size, width)
 
     @nn.compact
     def __call__(self, hidden, x):
         obs, dones = x
+        if self.separate_critic:
+            if not isinstance(obs, dict):
+                raise ValueError("Separate Execution critic requires vision observations.")
+            if self.config["FC_DIM_SIZE"] != self.config["GRU_HIDDEN_DIM"]:
+                raise ValueError("The existing actor GRU requires FC_DIM_SIZE == GRU_HIDDEN_DIM.")
+            if hidden.shape[-1] != 2 * self.config["GRU_HIDDEN_DIM"]:
+                raise ValueError("Separate Execution critic requires hidden width 2 * GRU_HIDDEN_DIM.")
+            hidden, critic_hidden = jnp.split(hidden, 2, axis=-1)
         
         if isinstance(obs, dict):
             obs_exec = obs['exec_obs']
@@ -273,7 +319,8 @@ class ActorCriticRNN(nn.Module):
                 fusion = StableGatedCrossAttention(d_model=self.config["FC_DIM_SIZE"])
                 fused_obs = fusion(obs_exec, z_tokens)
                 embedding = nn.Dense(
-                    self.config["FC_DIM_SIZE"], kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0)
+                    self.config["FC_DIM_SIZE"], kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0),
+                    name="ActorEmbedding" if self.separate_critic else None,
                 )(fused_obs)
                 embedding = nn.relu(embedding)
 
@@ -326,6 +373,13 @@ class ActorCriticRNN(nn.Module):
                 "vision_token_pooled_norm": zero_diag,
                 "actor_input_norm": jnp.linalg.norm(embedding, axis=-1),
             }
+        critic_embedding = embedding
+        if self.separate_critic:
+            critic_hidden, critic_embedding = CriticValueRNN(config=self.config)(
+                critic_hidden, (obs_exec, z_tokens, mid_context, dones)
+            )
+            hidden = jnp.concatenate((hidden, critic_hidden), axis=-1)
+
         actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
             embedding
         )
@@ -365,7 +419,7 @@ class ActorCriticRNN(nn.Module):
             raise ValueError(f"Unknown action space type {type(self.action_space)}")
 
         critic = nn.Dense(self.config["FC_DIM_SIZE"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
-            embedding
+            critic_embedding
         )
         critic = nn.relu(critic)
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
@@ -584,7 +638,10 @@ def make_train(config):
         init_rnn_resets_agents = []
         for i, instance in enumerate(env.instance_list):
             # print("Action space dimension for network i ",env.action_spaces[i])
-            network = ActorCriticRNN(env.action_spaces[i], config=config)
+            network = ActorCriticRNN(
+                env.action_spaces[i], config=config,
+                is_execution=_is_execution_agent(env.list_of_agents_configs[i]),
+            )
             rng, _rng = jax.random.split(rng)
             if hasattr(env.observation_spaces[i], "spaces"):
                 obs_shape = env.observation_spaces[i].spaces['exec_obs'].shape[0]
@@ -610,7 +667,7 @@ def make_train(config):
             )
 
             # FIXME: very unsure about this, why is it NUM_ENVS and not NUM_ACTORS?
-            init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
+            init_hstate = network.initialize_carry(config["NUM_ENVS"])
             network_params = network.init(_rng, init_hstate, init_x)
             if (
                 (grad_diag_enabled or phasic_mode)
@@ -634,7 +691,10 @@ def make_train(config):
             ):
                 actor_critic_group_counts = validate_required_parameter_groups(
                     network_params,
-                    required_groups=ACTOR_CRITIC_GRADIENT_GROUPS,
+                    required_groups=tuple(
+                        group for group in ACTOR_CRITIC_GRADIENT_GROUPS
+                        if network.separate_critic or group != "critic_representation"
+                    ),
                 )
                 for group in ACTOR_CRITIC_GRADIENT_GROUPS:
                     print(
@@ -649,7 +709,10 @@ def make_train(config):
                 critic_optimizer_group_counts = (
                     validate_required_parameter_groups(
                         network_params,
-                        required_groups=CRITIC_OPTIMIZER_PARAMETER_GROUPS,
+                        required_groups=tuple(
+                            group for group in CRITIC_OPTIMIZER_PARAMETER_GROUPS
+                            if network.separate_critic or group != "critic_representation"
+                        ),
                     )
                 )
                 for group in CRITIC_OPTIMIZER_PARAMETER_GROUPS:
@@ -670,7 +733,8 @@ def make_train(config):
                     "VALUE_REP_PROBE_GROUPS",
                     "agent=EXE",
                     "probe_a=critic_head",
-                    "probe_b=all_except_actor_head",
+                    ("probe_b=critic_representation,critic_head,vision_encoder"
+                     if network.separate_critic else "probe_b=all_except_actor_head"),
                     f"counts={probe_group_counts}",
                 )
             if phasic_mode and i == execution_index:
@@ -690,7 +754,7 @@ def make_train(config):
                 params=network_params,
                 tx=tx,
             )
-            init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS_PERTYPE"][i], config["GRU_HIDDEN_DIM"])
+            init_hstate = network.initialize_carry(config["NUM_ACTORS_PERTYPE"][i])
 
             # Instead of appending dicts, maintain separate lists for each attribute
             hstates.append(init_hstate)
@@ -1431,6 +1495,9 @@ def make_train(config):
                         split_seed=value_representation_probe_config[
                             "split_seed"
                         ],
+                        use_separate_critic_representation=bool(
+                            config.get("use_separate_critic_representation", False)
+                        ),
                     )
 
                 value_representation_probe_diag = jax.lax.cond(
@@ -2821,7 +2888,7 @@ def make_train(config):
                 eval_hstates=[]
                 init_rnn_resets_agents_eval=[]
                 for i, train_state in enumerate(train_states):
-                    eval_hstates.append(ScannedRNN.initialize_carry(config["NUM_ACTORS_PERTYPE"][i], config["GRU_HIDDEN_DIM"]))
+                    eval_hstates.append(jnp.zeros_like(hstates[i]))
                     init_rnn_resets_agents_eval.append(
                         jnp.zeros((config["NUM_ACTORS_PERTYPE"][i]), dtype=bool)
                     )

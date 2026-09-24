@@ -25,6 +25,10 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     gradient_diag_should_run,
     gradient_dot,
     gradient_l2_norm,
+    matching_parameter_paths,
+    flatten_tree_with_paths,
+    parameter_groups_mask,
+    VALUE_PROBE_B_SEPARATE_TRAINABLE_GROUPS,
     scale_gradient_tree,
     subtract_gradient_trees,
     run_value_representation_probe,
@@ -49,6 +53,11 @@ from gymnax_exchange.jaxrl.MARL.ippo_rnn_JAXMARL import (
 )
 from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     masked_reliability_loss,
+)
+from gymnax_exchange.jaxrl.MARL.phasic_reliability import (
+    make_auxiliary_optimizer,
+    resolve_phasic_reliability_settings,
+    run_phasic_auxiliary_phase,
 )
 
 
@@ -1528,3 +1537,199 @@ def test_value_probe_sufficient_features_fit_and_disabled_path_is_static():
     assert validate_value_representation_probe_config(
         {"value_representation_probe_split_seed": 17}
     )["split_seed"] == 17
+
+
+@pytest.fixture(scope="module")
+def separate_critic_fixture():
+    config = {
+        "FC_DIM_SIZE": 16, "GRU_HIDDEN_DIM": 16,
+        "use_reliability_head": True, "use_h_prev_in_reliability": True,
+        "reliability_hidden_dim": 16, "reliability_gate_epsilon": 0.1,
+        "use_separate_critic_representation": True,
+    }
+    action_space = spaces.Box(
+        low=jnp.array([-1., 0., 0.]), high=jnp.array([3., 1., 1.]),
+        shape=(3,), dtype=jnp.float32,
+    )
+    model = ActorCriticRNN(action_space, config=config, is_execution=True)
+    hidden = model.initialize_carry(2)
+    obs = {
+        "exec_obs": jnp.linspace(-1., 1., 4 * 2 * 28).reshape(4, 2, 28),
+        "vision_obs": jnp.linspace(0.1, 2., 4 * 2 * 60).reshape(4, 2, 10, 3, 2),
+        "mid_context": jnp.linspace(-0.5, 0.5, 4 * 2 * 4).reshape(4, 2, 4),
+    }
+    resets = jnp.zeros((4, 2), dtype=jnp.bool_).at[2, 0].set(True)
+    params = model.init(jax.random.PRNGKey(37), hidden, (obs, resets))
+    return model, params, hidden, obs, resets
+
+
+def test_separate_critic_topology_actor_parity_and_legacy(separate_critic_fixture):
+    model, params, hidden, obs, resets = separate_critic_fixture
+    legacy = ActorCriticRNN(
+        model.action_space,
+        config={**model.config, "use_separate_critic_representation": False},
+        is_execution=True,
+    )
+    legacy_hidden = legacy.initialize_carry(2)
+    legacy_params = legacy.init(jax.random.PRNGKey(37), legacy_hidden, (obs, resets))
+    assert hidden.shape == (2, 32)
+    assert legacy_hidden.shape == (2, 16)
+    assert "CriticValueRNN_0" not in legacy_params["params"]
+    assert set(params["params"]) == set(legacy_params["params"]) | {"CriticValueRNN_0"}
+    assert sum(key.startswith("VisionAgent") for key in params["params"]) == 1
+    for key in legacy_params["params"]:
+        _assert_tree_allclose(params["params"][key], legacy_params["params"][key], atol=0, rtol=0)
+    with jax.default_matmul_precision("highest"):
+        new_hidden, _, value, _, aux = jax.jit(model.apply)(params, hidden, (obs, resets))
+        old_hidden, _, _, _, old_aux = jax.jit(legacy.apply)(legacy_params, legacy_hidden, (obs, resets))
+    assert value.shape == (4, 2)
+    assert aux["policy_loc"].shape == (4, 2, 3)
+    for key in ("policy_loc", "policy_log_std", "reliability_logits", "reliability_scores"):
+        np.testing.assert_allclose(aux[key], old_aux[key], atol=1e-6, rtol=1e-6)
+    np.testing.assert_allclose(new_hidden[:, :16], old_hidden, atol=1e-6, rtol=1e-6)
+    for leaf in jax.tree_util.tree_leaves((new_hidden, value, aux)):
+        assert np.isfinite(np.asarray(leaf)).all()
+    critic_paths = set(matching_parameter_paths(params, "critic_representation"))
+    assert critic_paths == {
+        path for path in flatten_tree_with_paths(params)
+        if path[:2] == ("params", "CriticValueRNN_0")
+    }
+    assert {path[2] for path in critic_paths} == {
+        "StableGatedCrossAttention_0", "Dense_0", "GRUCell_0",
+    }
+    for group in GRADIENT_GROUPS[1:]:
+        assert critic_paths.isdisjoint(matching_parameter_paths(params, group))
+
+
+@pytest.mark.parametrize("objective", ["value", "actor", "reliability"])
+def test_separate_critic_gradient_routing(separate_critic_fixture, objective):
+    model, params, hidden, obs, resets = separate_critic_fixture
+
+    def loss(p):
+        _, _, value, _, aux = model.apply(p, hidden, (obs, resets))
+        if objective == "value":
+            return 0.5 * jnp.mean(jnp.square(value - 2.0))
+        if objective == "actor":
+            return jnp.mean(jnp.square(aux["policy_loc"] - 0.3))
+        return masked_reliability_loss(
+            aux["reliability_scores"], jnp.ones((4, 2, 10, 2)),
+            jnp.ones((4, 2, 10, 2)), loss_type="bce",
+            reliability_logits=aux["reliability_logits"],
+        )
+
+    gradients = jax.jit(jax.grad(loss))(params)
+    positive = {
+        "value": ("critic_representation", "critic_head", "vision_encoder"),
+        "actor": ("actor_head", "fusion_shared_trunk", "reliability_head", "vision_encoder"),
+        "reliability": ("reliability_head", "vision_encoder"),
+    }[objective]
+    zero = (
+        ("reliability_head", "fusion_shared_trunk", "actor_head")
+        if objective == "value" else ("critic_representation", "critic_head")
+    )
+    for group in positive:
+        assert float(gradient_l2_norm(gradients, group)) > 0.0, (objective, group)
+    for group in zero:
+        assert float(gradient_l2_norm(gradients, group)) == 0.0, (objective, group)
+
+
+def test_separate_critic_reset_rollout_replay_and_raw_tokens(separate_critic_fixture):
+    model, params, hidden, obs, resets = separate_critic_fixture
+    with jax.default_matmul_precision("highest"):
+        full_hidden, _, full_value, _, full_aux = model.apply(params, hidden, (obs, resets))
+        carry, values, locs = hidden, [], []
+        for t in range(4):
+            step_obs = jax.tree_util.tree_map(lambda x: x[t:t + 1], obs)
+            carry, _, value, _, aux = model.apply(params, carry, (step_obs, resets[t:t + 1]))
+            values.append(value)
+            locs.append(aux["policy_loc"])
+        np.testing.assert_allclose(carry, full_hidden, atol=1e-6, rtol=1e-6)
+        np.testing.assert_allclose(jnp.concatenate(values), full_value, atol=1e-6, rtol=1e-6)
+        np.testing.assert_allclose(jnp.concatenate(locs), full_aux["policy_loc"], atol=1e-6, rtol=1e-6)
+        suffix_obs = jax.tree_util.tree_map(lambda x: x[2:, :1], obs)
+        suffix_reset = resets[2:, :1]
+        reset_out = model.apply(params, jnp.ones((1, 32)) * 17, (suffix_obs, suffix_reset))
+        fresh_out = model.apply(params, model.initialize_carry(1), (suffix_obs, suffix_reset))
+        _assert_tree_allclose(reset_out[0], fresh_out[0], atol=0, rtol=0)
+        np.testing.assert_allclose(reset_out[2], full_value[2:, :1], atol=1e-6, rtol=1e-6)
+
+    perturbed = {"params": dict(params["params"])}
+    perturbed["params"]["ReliabilityFusionRNN_0"] = jax.tree_util.tree_map(
+        lambda x: x + 0.25, params["params"]["ReliabilityFusionRNN_0"]
+    )
+    with jax.default_matmul_precision("highest"):
+        _, _, other_value, _, other_aux = model.apply(perturbed, hidden, (obs, resets))
+    np.testing.assert_array_equal(other_value, full_value)
+    assert not np.allclose(other_aux["reliability_scores"], full_aux["reliability_scores"])
+
+
+def test_separate_critic_phasic_isolation(separate_critic_fixture):
+    model, params, hidden, obs, resets = separate_critic_fixture
+    settings = resolve_phasic_reliability_settings(
+        {**model.config, "reliability_optimization_mode": "phasic",
+         "use_survival_loss": True, "NUM_MINIBATCHES": 1,
+         "LR": [0.0004], "MAX_GRAD_NORM": [0.5]},
+        execution_index=0, execution_actor_count=2,
+    )
+    tx = make_auxiliary_optimizer(settings, total_updates=1)
+    result = jax.jit(lambda p, state: run_phasic_auxiliary_phase(
+        apply_fn=model.apply, params=p, aux_opt_state=state, aux_tx=tx,
+        init_hstate=hidden, obs=obs, rnn_reset=resets,
+        labels=jnp.ones((4, 2, 10, 2)), mask=jnp.ones((4, 2, 10, 2)),
+        rng=jax.random.PRNGKey(92), settings=settings, is_discrete=False,
+        reliability_loss_type="bce", survival_eps=1e-8,
+    ))(params, tx.init(params))
+    updated, _, _, diagnostics = result
+    assert float(diagnostics["aux_steps_accepted"]) == 1
+    for subtree in ("CriticValueRNN_0", "Dense_2", "Dense_3"):
+        _assert_tree_allclose(updated["params"][subtree], params["params"][subtree], atol=0, rtol=0)
+    delta = subtract_gradient_trees(updated, params)
+    assert float(gradient_l2_norm(delta, "vision_encoder")) > 0
+
+
+def test_separate_critic_probe_masks_and_fitting(separate_critic_fixture):
+    model, params, hidden, obs, resets = separate_critic_fixture
+    mask = flatten_tree_with_paths(parameter_groups_mask(params, VALUE_PROBE_B_SEPARATE_TRAINABLE_GROUPS))
+    expected_roots = {"CriticValueRNN_0", "Dense_2", "Dense_3", "VisionAgent_0"}
+    for path, enabled in mask.items():
+        assert enabled == (path[1] in expected_roots)
+    before = jax.tree_util.tree_map(lambda x: np.array(x, copy=True), params)
+
+    def value_apply(p, h, o, r):
+        return model.apply(p, h, (o, r))[2]
+
+    params_a, params_b = jax.jit(lambda p: fit_value_representation_probe_variants(
+        value_apply, p, hidden, obs, resets, jnp.ones((4, 2)) * 2,
+        jnp.ones((4, 2), dtype=jnp.bool_), steps=3, learning_rate=0.001,
+        use_separate_critic_representation=True,
+    ))(params)
+    _assert_tree_allclose(before, params, atol=0, rtol=0)
+    for fitted, allowed in ((params_a, {"Dense_2", "Dense_3"}), (params_b, expected_roots)):
+        for root in params["params"]:
+            if root not in allowed:
+                _assert_tree_allclose(fitted["params"][root], params["params"][root], atol=0, rtol=0)
+        assert float(gradient_l2_norm(subtract_gradient_trees(fitted, params), "critic_head")) > 0
+    for group in ("critic_representation", "vision_encoder"):
+        assert float(gradient_l2_norm(subtract_gradient_trees(params_b, params), group)) > 0
+
+
+def test_separate_critic_is_execution_only_and_supports_no_reliability(separate_critic_fixture):
+    model, _, _, obs, resets = separate_critic_fixture
+    other_agent = ActorCriticRNN(model.action_space, model.config, is_execution=False)
+    hidden = other_agent.initialize_carry(2)
+    assert hidden.shape == (2, 16)
+    params = other_agent.init(jax.random.PRNGKey(37), hidden, (obs, resets))
+    assert "CriticValueRNN_0" not in params["params"]
+    numeric_obs = obs["exec_obs"]
+    numeric_params = other_agent.init(jax.random.PRNGKey(37), hidden, (numeric_obs, resets))
+    assert other_agent.apply(numeric_params, hidden, (numeric_obs, resets))[0].shape == (2, 16)
+    no_rel = ActorCriticRNN(
+        model.action_space, {**model.config, "use_reliability_head": False}, is_execution=True,
+    )
+    hidden = no_rel.initialize_carry(2)
+    params = no_rel.init(jax.random.PRNGKey(37), hidden, (obs, resets))
+    assert "ReliabilityFusionRNN_0" not in params["params"]
+    assert "CriticValueRNN_0" in params["params"]
+    assert no_rel.apply(params, hidden, (obs, resets))[0].shape == (2, 32)
+    with pytest.raises(ValueError, match="hidden width"):
+        no_rel.apply(params, hidden[:, :16], (obs, resets))

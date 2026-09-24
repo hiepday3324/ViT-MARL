@@ -8,6 +8,7 @@
 "NUM_STEPS_EVAL" : 64
 "GRU_HIDDEN_DIM": 128
 "FC_DIM_SIZE": 128
+"use_separate_critic_representation": False
 # Reliability experiment: enable head/loss and tune lambda_surv explicitly.
 "use_reliability_head": False
 "use_h_prev_in_reliability": True
