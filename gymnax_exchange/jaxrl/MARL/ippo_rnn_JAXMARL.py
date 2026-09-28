@@ -78,13 +78,19 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     critic_optimizer_diag_should_run,
     empty_actor_critic_gradient_diagnostics,
     empty_critic_optimizer_diagnostics,
+    empty_critic_optimization_ablation_diagnostics,
+    empty_value_clip_eps_sweep_diagnostics,
     empty_gradient_interaction_diagnostics,
     empty_value_representation_probe_diagnostics,
+    empty_value_fit_diagnostics,
     empty_value_clip_diagnostics,
     format_actor_critic_gradient_diagnostics,
     format_critic_optimizer_diagnostics,
+    format_critic_optimization_ablation_diagnostics,
+    format_value_clip_eps_sweep_diagnostics,
     format_gradient_interaction_diagnostics,
     format_value_representation_probe_diagnostics,
+    format_value_fit_diagnostics,
     format_value_clip_diagnostics,
     gradient_diag_should_run,
     subtract_gradient_trees,
@@ -93,9 +99,16 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     summarize_gradient_interaction,
     summarize_phasic_gradient_interaction,
     run_value_representation_probe,
+    run_critic_optimization_ablation,
+    run_value_clip_eps_sweep,
+    resolve_value_clip_eps,
     summarize_value_clip_diagnostics,
+    summarize_value_fit_diagnostics,
+    summarize_value_fit_statistics,
     validate_actor_critic_grad_diag_config,
     validate_critic_optimizer_diag_config,
+    validate_critic_optimization_ablation_config,
+    validate_value_clip_eps_sweep_config,
     validate_gradient_diag_config,
     validate_required_parameter_groups,
     validate_value_representation_probe_config,
@@ -496,6 +509,19 @@ def make_train(config):
     value_representation_probe_config = (
         validate_value_representation_probe_config(config)
     )
+    value_fit_diag_enabled = bool(config.get("enable_value_fit_diag", False))
+    critic_ablation_enabled = bool(
+        config.get("enable_critic_optimization_ablation", False)
+    )
+    critic_ablation_separate = bool(
+        config.get("use_separate_critic_representation", False)
+    )
+    critic_ablation_updates = validate_critic_optimization_ablation_config(config)
+    value_clip_eps_sweep_enabled = bool(
+        config.get("enable_value_clip_eps_sweep", False)
+    )
+    value_clip_eps_sweep_updates = validate_value_clip_eps_sweep_config(config)
+    value_clip_eps = resolve_value_clip_eps(config)
     box_ppo_diag_enabled = bool(config.get("enable_box_ppo_numerics_diag", False))
     init_key = jax.random.PRNGKey(config["SEED"])
     config_dict={"MarketMaking": MarketMaking_EnvironmentConfig,"Execution": Execution_EnvironmentConfig}
@@ -1432,6 +1458,21 @@ def make_train(config):
                 advantages.append(advantages_i)
                 targets.append(targets_i)
 
+            value_fit_diag = empty_value_fit_diagnostics(
+                enabled=value_fit_diag_enabled,
+                not_applicable=(value_fit_diag_enabled and execution_index is None),
+            )
+            if value_fit_diag_enabled and execution_index is not None:
+                execution_trajectory = traj_batch[execution_index]
+                pre_value_fit = summarize_value_fit_statistics(
+                    execution_trajectory.value,
+                    targets[execution_index],
+                    execution_trajectory.agent_active,
+                )
+                value_fit_diag = summarize_value_fit_diagnostics(
+                    pre_value_fit, skipped_by_schedule=True,
+                )
+
             value_representation_probe_diag = (
                 empty_value_representation_probe_diagnostics(
                     enabled=value_representation_probe_enabled,
@@ -1531,6 +1572,21 @@ def make_train(config):
             ppo_safety_diags = []
             box_ppo_numerics_diags = []
             execution_post_ppo_rng = rng
+            critic_ablation_diag = empty_critic_optimization_ablation_diagnostics(
+                enabled=critic_ablation_enabled,
+                not_applicable=(
+                    critic_ablation_enabled
+                    and (execution_index is None or not critic_ablation_separate)
+                ),
+                base_steps=config["UPDATE_EPOCHS"] * config["NUM_MINIBATCHES"],
+            )
+            value_clip_eps_sweep_diag = empty_value_clip_eps_sweep_diagnostics(
+                enabled=value_clip_eps_sweep_enabled,
+                not_applicable=(
+                    value_clip_eps_sweep_enabled
+                    and (execution_index is None or not critic_ablation_separate)
+                ),
+            )
             for i, train_state in enumerate(train_states):
                 agent_is_execution = _is_execution_agent(env.list_of_agents_configs[i])
                 agent_is_box = isinstance(env.action_spaces[i], spaces.Box)
@@ -1598,7 +1654,7 @@ def make_train(config):
                             # CALCULATE VALUE LOSS
                             value_pred_clipped = traj_batch.value + (
                                 value - traj_batch.value
-                            ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
+                            ).clip(-value_clip_eps, value_clip_eps)
                             value_losses = jnp.square(value - targets)
                             value_losses_clipped = jnp.square(value_pred_clipped - targets)
                             value_loss_samples = 0.5 * jnp.maximum(
@@ -1945,7 +2001,7 @@ def make_train(config):
                                 def _compute_value_clip_diag(_):
                                     return summarize_value_clip_diagnostics(
                                         **components["value_clip_inputs"],
-                                        clip_eps=config["CLIP_EPS"],
+                                        clip_eps=value_clip_eps,
                                     )
 
                                 computed_value_clip_diag = jax.lax.cond(
@@ -2299,6 +2355,10 @@ def make_train(config):
                             loss_value,
                             loss_metrics + (box_ppo_diag,),
                         )
+                        if (critic_ablation_enabled and critic_ablation_updates
+                                and agent_is_execution
+                                and critic_ablation_separate):
+                            total_loss = total_loss + (optax.tree.norm(grads),)
                         return (
                             train_state_after,
                             grad_interaction_diag,
@@ -2485,7 +2545,7 @@ def make_train(config):
                     reason_not_execution=(
                         value_clip_diag_enabled and not agent_is_execution
                     ),
-                    clip_eps=config["CLIP_EPS"],
+                    clip_eps=value_clip_eps,
                 )
                 critic_optimizer_cadence_due = (
                     update_steps % critic_optimizer_diag_cadence == 0
@@ -2524,12 +2584,119 @@ def make_train(config):
                     initial_critic_optimizer_diag,
                     empty_ppo_safety_state(),
                 )
+                pre_ppo_train_state = train_state
+                pre_ppo_rng = rng
                 update_state, loss_info = jax.lax.scan(
                     _update_epoch,
                     update_state,
                     jnp.arange(config["UPDATE_EPOCHS"], dtype=jnp.int32),
                 )
                 train_states[i] = update_state[0]
+                if (critic_ablation_enabled and critic_ablation_updates
+                        and agent_is_execution
+                        and critic_ablation_separate):
+                    due = jnp.any(
+                        jnp.asarray(critic_ablation_updates, dtype=jnp.int32)
+                        == update_steps
+                    )
+
+                    def _run_critic_ablation(_):
+                        actual_lr = (
+                            linear_schedule(
+                                config["LR"][i],
+                                pre_ppo_train_state.opt_state[1][0].count,
+                            )
+                            if config["ANNEAL_LR"][i] else config["LR"][i]
+                        )
+                        return run_critic_optimization_ablation(
+                            apply_fn=pre_ppo_train_state.apply_fn,
+                            params=pre_ppo_train_state.params,
+                            post_ppo_params=train_states[i].params,
+                            optimizer_state=pre_ppo_train_state.opt_state,
+                            rng=pre_ppo_rng,
+                            init_hstate=initial_hstates[i],
+                            obs=traj_batch[i].obs,
+                            rnn_reset=traj_batch[i].rnn_reset,
+                            old_value=traj_batch[i].value,
+                            targets=targets[i],
+                            agent_active=traj_batch[i].agent_active,
+                            real_full_gradient_norms=loss_info[2],
+                            update_epochs=config["UPDATE_EPOCHS"],
+                            num_minibatches=config["NUM_MINIBATCHES"],
+                            current_lr=actual_lr,
+                            current_vf_coef=config["VF_COEF"][i],
+                            clip_eps=value_clip_eps,
+                            max_grad_norm=config["MAX_GRAD_NORM"][i],
+                            num_environments=config["NUM_ENVS"],
+                            train_fraction=value_representation_probe_config[
+                                "train_fraction"
+                            ],
+                            split_seed=value_representation_probe_config[
+                                "split_seed"
+                            ],
+                        )
+
+                    critic_ablation_diag = jax.lax.cond(
+                        due,
+                        _run_critic_ablation,
+                        lambda _: empty_critic_optimization_ablation_diagnostics(
+                            enabled=True,
+                            skipped_by_schedule=True,
+                            base_steps=(
+                                config["UPDATE_EPOCHS"]
+                                * config["NUM_MINIBATCHES"]
+                            ),
+                        ),
+                        operand=None,
+                    )
+                if (value_clip_eps_sweep_enabled and value_clip_eps_sweep_updates
+                        and agent_is_execution and critic_ablation_separate):
+                    sweep_due = jnp.any(
+                        jnp.asarray(value_clip_eps_sweep_updates, dtype=jnp.int32)
+                        == update_steps
+                    )
+
+                    def _run_value_clip_sweep(_):
+                        actual_lr = (
+                            linear_schedule(
+                                config["LR"][i],
+                                pre_ppo_train_state.opt_state[1][0].count,
+                            )
+                            if config["ANNEAL_LR"][i] else config["LR"][i]
+                        )
+                        return run_value_clip_eps_sweep(
+                            apply_fn=pre_ppo_train_state.apply_fn,
+                            params=pre_ppo_train_state.params,
+                            optimizer_state=pre_ppo_train_state.opt_state,
+                            rng=pre_ppo_rng,
+                            init_hstate=initial_hstates[i],
+                            obs=traj_batch[i].obs,
+                            rnn_reset=traj_batch[i].rnn_reset,
+                            old_value=traj_batch[i].value,
+                            targets=targets[i],
+                            agent_active=traj_batch[i].agent_active,
+                            update_epochs=config["UPDATE_EPOCHS"],
+                            num_minibatches=config["NUM_MINIBATCHES"],
+                            current_lr=actual_lr,
+                            max_grad_norm=config["MAX_GRAD_NORM"][i],
+                            num_environments=config["NUM_ENVS"],
+                            train_fraction=value_representation_probe_config[
+                                "train_fraction"
+                            ],
+                            split_seed=value_representation_probe_config[
+                                "split_seed"
+                            ],
+                            policy_clip_eps=config["CLIP_EPS"],
+                        )
+
+                    value_clip_eps_sweep_diag = jax.lax.cond(
+                        sweep_due,
+                        _run_value_clip_sweep,
+                        lambda _: empty_value_clip_eps_sweep_diagnostics(
+                            enabled=True, skipped_by_schedule=True,
+                        ),
+                        operand=None,
+                    )
                 loss_infos.append(loss_info)
                 grad_interaction_diags.append(update_state[8])
                 actor_critic_grad_diags.append(update_state[9])
@@ -2545,6 +2712,39 @@ def make_train(config):
                 )
                 if phasic_mode and i == execution_index:
                     execution_post_ppo_rng = update_state[7]
+
+            if value_fit_diag_enabled and execution_index is not None:
+                post_updates = jnp.asarray(
+                    config.get("value_fit_post_ppo_updates", [5, 10, 15, 19]),
+                    dtype=jnp.int32,
+                )
+                post_scheduled = jnp.any(
+                    jnp.asarray(update_steps, dtype=jnp.int32) == post_updates
+                )
+                execution_train_state = train_states[execution_index]
+                execution_trajectory = traj_batch[execution_index]
+
+                def _post_ppo_value_fit(_):
+                    _, _, post_ppo_value, _, _ = execution_train_state.apply_fn(
+                        execution_train_state.params,
+                        initial_hstates[execution_index],
+                        (execution_trajectory.obs, execution_trajectory.rnn_reset),
+                    )
+                    post_statistics = summarize_value_fit_statistics(
+                        post_ppo_value,
+                        targets[execution_index],
+                        execution_trajectory.agent_active,
+                    )
+                    return summarize_value_fit_diagnostics(
+                        pre_value_fit, post_statistics,
+                    )
+
+                value_fit_diag = jax.lax.cond(
+                    post_scheduled,
+                    _post_ppo_value_fit,
+                    lambda _: value_fit_diag,
+                    operand=None,
+                )
 
             if phasic_mode:
                 execution_train_state = train_states[execution_index]
@@ -2659,9 +2859,12 @@ def make_train(config):
             metrics["actor_critic_grad_diag"] = actor_critic_grad_diags
             metrics["value_clip_diag"] = value_clip_diags
             metrics["critic_optimizer_diag"] = critic_optimizer_diags
+            metrics["critic_optimization_ablation"] = critic_ablation_diag
+            metrics["value_clip_eps_sweep"] = value_clip_eps_sweep_diag
             metrics["value_representation_probe"] = (
                 value_representation_probe_diag
             )
+            metrics["value_fit_diag"] = value_fit_diag
             metrics["phasic_aux_diag"] = phasic_aux_diags
             metrics["ppo_safety_diag"] = ppo_safety_diags
             metrics["box_ppo_numerics_diag"] = box_ppo_numerics_diags
@@ -3465,13 +3668,25 @@ def make_train(config):
                             )
                             print(" ".join(fields))
 
-                print("[GRADIENTS]")
                 grad_wandb_metrics = {}
                 actor_critic_grad_wandb_metrics = {}
                 value_clip_wandb_metrics = {}
                 critic_optimizer_wandb_metrics = {}
+                critic_ablation_wandb_metrics = {}
                 value_representation_probe_wandb_metrics = {}
+                value_fit_wandb_metrics = {}
                 phasic_wandb_metrics = {}
+                print("[VALUE FIT]")
+                value_fit_lines, value_fit_values = format_value_fit_diagnostics(
+                    metric["value_fit_diag"], update=update_idx,
+                )
+                for line in value_fit_lines:
+                    print(line)
+                value_fit_wandb_metrics = {
+                    f"value_fit/{key}": value
+                    for key, value in value_fit_values.items()
+                }
+                print("[GRADIENTS]")
                 if exe_agent_index is not None:
                     execution_grad_diag = metric["grad_interaction_diag"][
                         exe_agent_index
@@ -3526,6 +3741,29 @@ def make_train(config):
                     critic_optimizer_wandb_metrics = {
                         f"critic_optimizer_diag/{key}": value
                         for key, value in critic_optimizer_values.items()
+                    }
+                    critic_ablation_lines, critic_ablation_values = (
+                        format_critic_optimization_ablation_diagnostics(
+                            metric["critic_optimization_ablation"],
+                            update=update_idx,
+                        )
+                    )
+                    for line in critic_ablation_lines:
+                        print(line)
+                    critic_ablation_wandb_metrics = {
+                        f"critic_optimization_ablation/{key}": value
+                        for key, value in critic_ablation_values.items()
+                    }
+                    value_clip_sweep_lines, value_clip_sweep_values = (
+                        format_value_clip_eps_sweep_diagnostics(
+                            metric["value_clip_eps_sweep"], update=update_idx,
+                        )
+                    )
+                    for line in value_clip_sweep_lines:
+                        print(line)
+                    value_clip_sweep_wandb_metrics = {
+                        f"critic_value_clip_sweep/{key}": value
+                        for key, value in value_clip_sweep_values.items()
                     }
                     value_probe_lines, value_probe_values = (
                         format_value_representation_probe_diagnostics(
@@ -3616,9 +3854,12 @@ def make_train(config):
                         logging_dict.update(actor_critic_grad_wandb_metrics)
                         logging_dict.update(value_clip_wandb_metrics)
                         logging_dict.update(critic_optimizer_wandb_metrics)
+                        logging_dict.update(critic_ablation_wandb_metrics)
+                        logging_dict.update(value_clip_sweep_wandb_metrics)
                         logging_dict.update(
                             value_representation_probe_wandb_metrics
                         )
+                        logging_dict.update(value_fit_wandb_metrics)
                         logging_dict.update(phasic_wandb_metrics)
                         logging_dict.update(box_ppo_wandb_metrics)
                         exe_episode_metrics = metric["execution_episode_metrics"]

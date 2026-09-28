@@ -21,6 +21,12 @@
 "enable_value_clip_diag": False
 "enable_critic_optimizer_diag": False
 "enable_value_representation_probe": False
+"enable_critic_optimization_ablation": False
+"critic_optimization_ablation_updates": []
+"enable_value_clip_eps_sweep": False
+"value_clip_eps_sweep_updates": []
+"enable_value_fit_diag": False
+"value_fit_post_ppo_updates": [5, 10, 15, 19]
 "value_representation_probe_updates": [5, 10, 15]
 "value_representation_probe_steps": 150
 "value_representation_probe_lr": 0.001
@@ -52,6 +58,7 @@
 "GAMMA": [0.999,0.999]
 "GAE_LAMBDA": [0.99,0.99]
 "CLIP_EPS": 0.2
+"VALUE_CLIP_EPS": 5.0
 "SCALE_CLIP_EPS": [False,False]
 "ENT_COEF": [0.001,0.001]
 "VF_COEF": [1e-11,1e-11]

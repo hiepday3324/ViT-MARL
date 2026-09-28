@@ -1,25 +1,39 @@
 from functools import partial
+import inspect
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from omegaconf import OmegaConf
 from gymnax.environments import spaces
 
 from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     ACTOR_CRITIC_GRADIENT_GROUPS,
     CRITIC_OPTIMIZER_DIAGNOSTIC_GROUPS,
     GRADIENT_GROUPS,
+    VALUE_CLIP_EPS_SWEEP,
+    VALUE_CLIP_EPS_SWEEP_BRANCHES,
+    _critic_ablation_value_loss_samples,
     actor_critic_grad_diag_should_run,
     add_gradient_trees,
     critic_optimizer_diag_should_run,
     empty_actor_critic_gradient_diagnostics,
     empty_critic_optimizer_diagnostics,
+    empty_critic_optimization_ablation_diagnostics,
+    empty_value_clip_eps_sweep_diagnostics,
     empty_gradient_interaction_diagnostics,
     empty_value_representation_probe_diagnostics,
+    empty_value_fit_diagnostics,
     empty_value_clip_diagnostics,
     fit_value_representation_probe_variants,
+    fit_value_representation_probe_c,
+    format_value_representation_probe_diagnostics,
+    format_critic_optimization_ablation_diagnostics,
+    format_value_clip_eps_sweep_diagnostics,
+    format_value_fit_diagnostics,
     format_gradient_interaction_diagnostics,
     gradient_cosine,
     gradient_diag_should_run,
@@ -27,16 +41,29 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     gradient_l2_norm,
     matching_parameter_paths,
     flatten_tree_with_paths,
+    mask_tree_to_groups,
     parameter_groups_mask,
     VALUE_PROBE_B_SEPARATE_TRAINABLE_GROUPS,
+    VALUE_PROBE_C_TRAINABLE_GROUPS,
     scale_gradient_tree,
     subtract_gradient_trees,
     run_value_representation_probe,
+    run_critic_optimization_ablation,
+    run_value_clip_eps_sweep,
+    resolve_value_clip_eps,
+    critic_ablation_branch_specs,
+    critic_ablation_checkpoint_steps,
+    critic_ablation_permutations,
+    critic_ablation_value_clip_statistics,
+    validate_critic_optimization_ablation_config,
+    validate_value_clip_eps_sweep_config,
     summarize_actor_critic_gradient_interaction,
     summarize_critic_optimizer_diagnostics,
     summarize_gradient_interaction,
     summarize_phasic_gradient_interaction,
     summarize_value_clip_diagnostics,
+    summarize_value_fit_diagnostics,
+    summarize_value_fit_statistics,
     validate_actor_critic_grad_diag_config,
     validate_critic_optimizer_diag_config,
     validate_gradient_diag_config,
@@ -44,13 +71,16 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     validate_value_representation_probe_config,
     validate_value_clip_diag_config,
     value_probe_statistics,
+    value_probe_c_curve_steps,
     value_clip_diag_should_run,
     trajectory_train_holdout_masks,
 )
 from gymnax_exchange.jaxrl.MARL.ippo_rnn_JAXMARL import (
     ActorCriticRNN,
     ScannedRNN,
+    make_train,
 )
+from gymnax_exchange.jaxrl.MARL.ppo_lifecycle import compute_masked_ppo_terms
 from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     masked_reliability_loss,
 )
@@ -818,6 +848,64 @@ def _value_clip_summary(old, new, target, active=None, clip_eps=0.2):
     )
 
 
+def test_production_policy_and_value_clipping_are_independent():
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "gymnax_exchange/jaxrl/MARL/config/ippo_rnn_JAXMARL_2player.yaml"
+    )
+    config = OmegaConf.load(config_path)
+    assert float(config.CLIP_EPS) == 0.2
+    assert float(config.VALUE_CLIP_EPS) == 5.0
+    assert resolve_value_clip_eps(config) == 5.0
+    assert resolve_value_clip_eps({"CLIP_EPS": 0.2}) == 0.2
+    assert resolve_value_clip_eps({"CLIP_EPS": 0.3}) == 0.3
+    assert resolve_value_clip_eps({"CLIP_EPS": 0.3, "VALUE_CLIP_EPS": 5.0}) == 5.0
+
+    old = jnp.zeros((2,), dtype=jnp.float32)
+    prediction = jnp.ones((2,), dtype=jnp.float32)
+    target = jnp.full((2,), 10.0)
+
+    def ppo_terms(policy_eps, value_eps):
+        value_samples = _critic_ablation_value_loss_samples(
+            prediction, old, target, "ppo_clipped", value_eps,
+        )
+        ratio = jnp.array([1.25, 0.75])
+        return compute_masked_ppo_terms(
+            ratio=ratio, logratio=jnp.log(ratio),
+            advantage=jnp.array([1.0, -1.0]),
+            value_loss_samples=value_samples,
+            entropy_samples=jnp.zeros((2,)),
+            agent_active=jnp.ones((2,), dtype=jnp.bool_),
+            clip_eps=policy_eps,
+        )
+
+    separated = ppo_terms(0.2, 5.0)
+    changed_value = ppo_terms(0.2, 0.2)
+    changed_policy = ppo_terms(0.3, 5.0)
+    np.testing.assert_allclose(separated.actor_loss, changed_value.actor_loss)
+    np.testing.assert_allclose(separated.clip_frac, changed_value.clip_frac)
+    assert float(separated.value_loss) != float(changed_value.value_loss)
+    np.testing.assert_allclose(separated.value_loss, changed_policy.value_loss)
+    assert float(separated.actor_loss) != float(changed_policy.actor_loss)
+    np.testing.assert_allclose(separated.clip_frac, 1.0)
+    np.testing.assert_allclose(changed_policy.clip_frac, 0.0)
+
+    value_diag = _value_clip_summary(
+        old=old, new=prediction, target=target,
+        clip_eps=resolve_value_clip_eps(config),
+    )
+    assert float(value_diag["clip_eps"]) == 5.0
+    np.testing.assert_allclose(value_diag["clip_saturated_rate"], 0.0)
+    assert float(empty_value_clip_diagnostics(
+        clip_eps=resolve_value_clip_eps(config),
+    )["clip_eps"]) == 5.0
+
+    trainer_source = inspect.getsource(make_train)
+    assert ").clip(-value_clip_eps, value_clip_eps)" in trainer_source
+    assert 'clip_eps=config["CLIP_EPS"]' in trainer_source
+    assert trainer_source.count("clip_eps=value_clip_eps") == 3
+
+
 def test_value_clip_no_saturation_and_boundary_behavior():
     diagnostics = _value_clip_summary(
         old=[0.0, 0.0, 0.0],
@@ -1362,6 +1450,570 @@ def test_value_probe_statistics_mse_mae_and_explained_variance():
     assert bool(metrics["explained_variance_valid"])
 
 
+def test_probe_c_curve_checkpoint_schedule():
+    assert value_probe_c_curve_steps(150) == (0, 1, 2, 4, 8, 16, 32, 64, 150)
+    assert value_probe_c_curve_steps(50) == (0, 1, 2, 4, 8, 16, 32, 50)
+    assert value_probe_c_curve_steps(32) == (0, 1, 2, 4, 8, 16, 32)
+    assert value_probe_c_curve_steps(1) == (0, 1)
+    for final_step in (1, 2, 3, 32, 50, 64, 150):
+        checkpoints = value_probe_c_curve_steps(final_step)
+        assert checkpoints[0] == 0
+        assert checkpoints[-1] == final_step
+        assert len(checkpoints) == len(set(checkpoints))
+        assert all(step <= final_step for step in checkpoints)
+
+
+def test_probe_c_curve_uses_one_cumulative_optimizer_trajectory():
+    params = {"params": {
+        "VisionAgent_0": {"kernel": jnp.array([2.0])},
+        "CriticValueRNN_0": {"kernel": jnp.array([0.5])},
+        "Dense_2": {"kernel": jnp.array([0.25])},
+        "Dense_3": {"bias": jnp.array([0.0])},
+        "Dense_0": {"kernel": jnp.array([1.0])},
+    }}
+    x = jnp.array([[1.0, 2.0], [3.0, 4.0]])
+    target = 1.5 * x
+    mask = jnp.ones_like(x, dtype=jnp.bool_)
+    initial_params = jax.tree_util.tree_map(lambda value: np.array(value, copy=True), params)
+    training_key = jax.random.PRNGKey(7)
+    key_before = np.array(training_key, copy=True)
+
+    def value_apply(p, h, o, r):
+        del h, r
+        weights = p["params"]
+        return (
+            weights["Dense_2"]["kernel"][0]
+            * weights["CriticValueRNN_0"]["kernel"][0]
+            * weights["VisionAgent_0"]["kernel"][0]
+            * o["x"]
+            + weights["Dense_3"]["bias"][0]
+        )
+
+    def fit(p, steps, holdout_mask=None):
+        return fit_value_representation_probe_c(
+            value_apply, p, jnp.zeros((2, 1)), {"x": x}, mask,
+            target, mask, steps=steps, learning_rate=0.01,
+            holdout_mask=holdout_mask,
+        )
+
+    fitted, curve = jax.jit(lambda p: fit(p, 3, mask))(params)
+    _assert_tree_allclose(fitted, fit(params, 3), atol=0, rtol=0)
+    np.testing.assert_array_equal(curve["steps"], [0, 1, 2, 3])
+    for index, checkpoint in enumerate((0, 1, 2, 3)):
+        reference_params = params if checkpoint == 0 else fit(params, checkpoint)
+        reference_stats = value_probe_statistics(
+            value_apply(reference_params, None, {"x": x}, None), target, mask,
+        )
+        for split in ("train", "holdout"):
+            for name, expected in reference_stats.items():
+                np.testing.assert_allclose(
+                    curve[split][name][index], expected, atol=1e-6, rtol=1e-6,
+                )
+    _assert_tree_allclose(initial_params, params, atol=0, rtol=0)
+    np.testing.assert_array_equal(training_key, key_before)
+    for root in ("VisionAgent_0", "Dense_0"):
+        _assert_tree_allclose(fitted["params"][root], params["params"][root], atol=0, rtol=0)
+    assert not np.array_equal(fitted["params"]["CriticValueRNN_0"]["kernel"],
+                              params["params"]["CriticValueRNN_0"]["kernel"])
+
+
+def test_critic_ablation_specs_schedule_and_disabled_path():
+    specs = critic_ablation_branch_specs(32, 1e-5, 4e-4)
+    for left, right in (
+        ("O1", "O2"), ("O2", "O2_150"), ("O2", "O3"),
+        ("O3", "O4"), ("O4", "O5"), ("O5", "O6"),
+    ):
+        assert sum(a != b for a, b in zip(specs[left], specs[right])) == 1
+    assert specs["O2_150"][-1] == specs["O6"][-1] == 150
+    assert specs["O2"][-1] == specs["O5"][-1] == 32
+    for name in ("O3", "O4"):
+        assert critic_ablation_checkpoint_steps(name, 32) == (
+            0, 1, 2, 4, 8, 16, 32,
+        )
+        assert critic_ablation_checkpoint_steps(name, 10) == (
+            0, 1, 2, 4, 8, 10,
+        )
+    assert critic_ablation_checkpoint_steps("O2", 32) == (0, 32)
+    assert validate_critic_optimization_ablation_config({
+        "critic_optimization_ablation_updates": [10],
+    }) == (10,)
+    with pytest.raises(ValueError, match="unique and non-negative"):
+        validate_critic_optimization_ablation_config({
+            "critic_optimization_ablation_updates": [10, 10],
+        })
+    disabled = empty_critic_optimization_ablation_diagnostics(base_steps=32)
+    lines, values = format_critic_optimization_ablation_diagnostics(
+        disabled, update=10,
+    )
+    assert lines == [] and values == {}
+    assert "value_clip_curve" not in disabled["branches"]["O2"]
+    for name in ("O3", "O4"):
+        np.testing.assert_array_equal(
+            disabled["branches"][name]["curve"]["steps"],
+            [0, 1, 2, 4, 8, 16, 32],
+        )
+        assert disabled["branches"][name]["value_clip_curve"][
+            "value_gradient_locked_rate"
+        ].shape == (7,)
+
+
+def test_critic_ablation_clip_evaluator_reuses_existing_semantics():
+    old = jnp.array([0.0, 0.0, 1000.0])
+    prediction = jnp.array([0.0, 1.0, -1000.0])
+    target = jnp.array([10.0, 10.0, -1000.0])
+    active = jnp.array([True, True, False])
+    evaluated = jax.jit(critic_ablation_value_clip_statistics)(
+        old, prediction, target, active, 0.2,
+    )
+    expected = _value_clip_summary(
+        old=old, new=prediction, target=target,
+        active=active, clip_eps=0.2,
+    )
+    for name, value in evaluated.items():
+        np.testing.assert_allclose(value, expected[name], atol=0, rtol=0)
+    np.testing.assert_allclose(evaluated["clip_saturated_rate"], 0.5)
+    np.testing.assert_allclose(evaluated["clipped_branch_selected_rate"], 0.5)
+    np.testing.assert_allclose(evaluated["value_gradient_locked_rate"], 0.5)
+
+
+def test_critic_ablation_copied_adam_state_matches_real_optax_chain():
+    params = {"params": {
+        "CriticValueRNN_0": {"kernel": jnp.array([1.0, -2.0])},
+        "Dense_2": {"kernel": jnp.array([0.5])},
+        "VisionAgent_0": {"kernel": jnp.array([3.0])},
+    }}
+    mask = parameter_groups_mask(params, VALUE_PROBE_C_TRAINABLE_GROUPS)
+    gradients = {"params": {
+        "CriticValueRNN_0": {"kernel": jnp.array([2.0, 3.0])},
+        "Dense_2": {"kernel": jnp.array([1.0])},
+        "VisionAgent_0": {"kernel": jnp.array([0.0])},
+    }}
+    tx = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(4e-4, eps=1e-5))
+    state = tx.init(params)
+    real_updates, real_next_state = tx.update(gradients, state, params)
+    clipped, _ = optax.clip_by_global_norm(0.5).update(
+        gradients, optax.EmptyState(), params,
+    )
+    adam = optax.adam(4e-4, eps=1e-5)
+    diagnostic_updates, diagnostic_next_state = adam.update(
+        clipped, (state[1][0], optax.EmptyState()), params,
+    )
+    _assert_tree_allclose(real_updates, diagnostic_updates, atol=0, rtol=0)
+    _assert_tree_allclose(real_next_state[1][0], diagnostic_next_state[0], atol=0, rtol=0)
+    assert all(
+        path[1] in {"CriticValueRNN_0", "Dense_2"}
+        for path, enabled in flatten_tree_with_paths(mask).items() if enabled
+    )
+
+
+def test_critic_ablation_copied_state_clipping_and_cumulative_curves():
+    params = {"params": {
+        "VisionAgent_0": {"kernel": jnp.array([2.0])},
+        "CriticValueRNN_0": {"kernel": jnp.array([0.5])},
+        "Dense_2": {"kernel": jnp.array([0.25])},
+        "Dense_3": {"bias": jnp.array([0.0])},
+        "Dense_0": {"kernel": jnp.array([1.0])},
+        "ReliabilityFusionRNN_0": {"kernel": jnp.array([1.0])},
+    }}
+    obs = {"x": jnp.array([[1., 2., 3., 4.], [2., 3., 4., 5.]])}
+    reset = jnp.zeros((2, 4), dtype=jnp.bool_)
+    active = jnp.ones((2, 4), dtype=jnp.bool_)
+    hidden = jnp.zeros((4, 1))
+
+    def apply_fn(p, h, inputs):
+        del h
+        x = inputs[0]["x"]
+        weights = p["params"]
+        value = (
+            weights["VisionAgent_0"]["kernel"][0]
+            * weights["CriticValueRNN_0"]["kernel"][0]
+            * weights["Dense_2"]["kernel"][0] * x
+            + weights["Dense_3"]["bias"][0]
+        )
+        return None, None, value, None, None
+
+    old = apply_fn(params, hidden, (obs, reset))[2]
+    targets = 10.0 * obs["x"]
+    tx = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(4e-4, eps=1e-5))
+    optimizer_state = tx.init(params)
+    key = jax.random.PRNGKey(19)
+    before_params = jax.tree_util.tree_map(lambda x: np.array(x, copy=True), params)
+    before_optimizer = jax.tree_util.tree_map(
+        lambda x: np.array(x, copy=True), optimizer_state,
+    )
+    before_key = np.array(key, copy=True)
+    expected_permutations = []
+    copied_key = key
+    for _ in range(2):
+        copied_key, epoch_key = jax.random.split(copied_key)
+        expected_permutations.append(jax.random.permutation(epoch_key, 4))
+    np.testing.assert_array_equal(
+        critic_ablation_permutations(key, 2, 4),
+        jnp.stack(expected_permutations),
+    )
+    np.testing.assert_array_equal(key, before_key)
+
+    def run(p, state, rng, lr):
+        return run_critic_optimization_ablation(
+            apply_fn=apply_fn, params=p, post_ppo_params=p,
+            optimizer_state=state, rng=rng, init_hstate=hidden,
+            obs=obs, rnn_reset=reset, old_value=old, targets=targets,
+            agent_active=active,
+            real_full_gradient_norms=jnp.full((2, 2), 10.0),
+            update_epochs=2, num_minibatches=2, current_lr=lr,
+            current_vf_coef=1e-5, clip_eps=0.01, max_grad_norm=0.5,
+            num_environments=4, train_fraction=0.5, split_seed=0,
+        )
+
+    result = jax.jit(run)(params, optimizer_state, key, jnp.asarray(4e-4))
+    _assert_tree_allclose(before_params, params, atol=0, rtol=0)
+    _assert_tree_allclose(before_optimizer, optimizer_state, atol=0, rtol=0)
+    np.testing.assert_array_equal(key, before_key)
+    assert bool(result["active"])
+    for name in ("O1", "O2", "O2_150", "O3", "O4", "O5", "O6"):
+        branch = result["branches"][name]
+        np.testing.assert_allclose(
+            branch["initial"]["explained_variance"],
+            result["branches"]["O1"]["initial"]["explained_variance"],
+        )
+        assert np.isfinite(float(branch["final"]["rmse"]))
+        for frozen_group in (
+            "vision_parameter_displacement_norm",
+            "actor_parameter_displacement_norm",
+            "reliability_parameter_displacement_norm",
+        ):
+            assert float(branch["metadata"][frozen_group]) == 0.0
+    np.testing.assert_allclose(
+        result["branches"]["O1"]["metadata"]["mean_clip_scale"], 0.05,
+        atol=1e-6,
+    )
+    assert float(result["branches"]["O2"]["metadata"]["mean_clip_scale"]) > 0.05
+    assert float(result["branches"]["O3"]["metadata"]["vf_scaling"]) == 1.0
+    assert float(result["branches"]["O3"]["metadata"]["mean_critic_grad_norm"]) > (
+        float(result["branches"]["O2"]["metadata"]["mean_critic_grad_norm"])
+    )
+    for name in ("O3", "O4"):
+        branch = result["branches"][name]
+        np.testing.assert_array_equal(branch["curve"]["steps"], [0, 1, 2, 4])
+        np.testing.assert_allclose(
+            branch["value_clip_curve"]["clip_eps"], 0.01, atol=0, rtol=1e-6,
+        )
+        assert float(branch["value_clip_curve"]["value_delta_abs_mean"][0]) == 0.0
+        np.testing.assert_allclose(
+            branch["value_clip_curve"]["target_distance_to_clip_ratio_mean"],
+            branch["value_clip_curve"]["target_distance_to_clip_ratio_mean"][0],
+            atol=0, rtol=0,
+        )
+        for metric in ("explained_variance", "rmse", "mae",
+                       "prediction_std_to_target_std_ratio"):
+            np.testing.assert_allclose(
+                branch["curve"]["full"][metric][-1], branch["final"][metric],
+                atol=0, rtol=0,
+            )
+
+    # An uninterrupted replay is the pre-curve O3/O4 optimization path.
+    permutations = critic_ablation_permutations(key, 2, 4)
+    for name in ("O3", "O4"):
+        p = params
+        adam = optax.adam(4e-4, eps=1e-5)
+        adam_state = (optimizer_state[1][0], optax.EmptyState())
+        for step_index in range(4):
+            indices = permutations[step_index // 2].reshape(2, 2)[step_index % 2]
+
+            def loss(probe_params):
+                prediction = apply_fn(
+                    probe_params, hidden[indices],
+                    ({"x": obs["x"][:, indices]}, reset[:, indices]),
+                )[2]
+                samples = jnp.square(prediction - targets[:, indices])
+                if name == "O3":
+                    clipped = old[:, indices] + jnp.clip(
+                        prediction - old[:, indices], -0.01, 0.01,
+                    )
+                    samples = jnp.maximum(
+                        samples, jnp.square(clipped - targets[:, indices]),
+                    )
+                return 0.5 * jnp.mean(samples)
+
+            gradients = mask_tree_to_groups(
+                jax.grad(loss)(p), VALUE_PROBE_C_TRAINABLE_GROUPS,
+            )
+            clipped_gradients, _ = optax.clip_by_global_norm(0.5).update(
+                gradients, optax.EmptyState(), p,
+            )
+            updates, adam_state = adam.update(clipped_gradients, adam_state, p)
+            p = optax.apply_updates(
+                p, mask_tree_to_groups(updates, VALUE_PROBE_C_TRAINABLE_GROUPS),
+            )
+        expected_final = value_probe_statistics(
+            apply_fn(p, hidden, (obs, reset))[2], targets, active,
+        )
+        for metric in ("explained_variance", "rmse", "mae",
+                       "prediction_std_to_target_std_ratio"):
+            np.testing.assert_allclose(
+                result["branches"][name]["final"][metric],
+                expected_final[metric], atol=1e-6, rtol=1e-5,
+            )
+    for long_name, short_name in (("O2_150", "O2"), ("O6", "O5")):
+        curve = result["branches"][long_name]["curve"]
+        np.testing.assert_array_equal(
+            curve["steps"], [0, 1, 2, 4, 8, 16, 32, 64, 96, 128, 150],
+        )
+        np.testing.assert_allclose(
+            curve["full"]["explained_variance"][3],
+            result["branches"][short_name]["final"]["explained_variance"],
+            atol=1e-6, rtol=1e-6,
+        )
+        assert int(result["branches"][long_name]["metadata"]["optimizer_steps"]) == 150
+    lines, values = format_critic_optimization_ablation_diagnostics(result, update=10)
+    assert any("branch=O2_150 step=32 split=holdout" in line for line in lines)
+    for name in ("O3", "O4"):
+        clip_lines = [
+            line for line in lines
+            if line.startswith("CRITIC_OPT_VALUE_CLIP_CURVE ")
+            and f"branch={name} " in line
+        ]
+        assert [int(line.split("step=")[1].split()[0]) for line in clip_lines] == [
+            0, 1, 2, 4,
+        ]
+        assert all("split=full" in line for line in clip_lines)
+        assert f"{name}/value_clip_curve/step_4/explained_variance" in values
+        if name == "O4":
+            assert all("clip_evaluation=hypothetical" in line for line in clip_lines)
+            assert all("would_be_clip_saturated_rate=" in line for line in clip_lines)
+            assert all("clip_saturated_rate=" not in line.replace(
+                "would_be_clip_saturated_rate=", "",
+            ) for line in clip_lines)
+        else:
+            assert all("clip_evaluation=actual" in line for line in clip_lines)
+            assert all("value_gradient_locked_rate=" in line for line in clip_lines)
+    assert "O1/metadata/mean_clip_scale" in values
+    assert "comparison/O6_minus_O5_final_ev" in values
+    skipped = empty_critic_optimization_ablation_diagnostics(
+        enabled=True, skipped_by_schedule=True, base_steps=4,
+    )
+    assert jax.tree_util.tree_structure(skipped) == jax.tree_util.tree_structure(result)
+    jax.eval_shape(
+        lambda p, state, rng, lr: jax.lax.cond(
+            jnp.asarray(True),
+            lambda _: run(p, state, rng, lr),
+            lambda _: empty_critic_optimization_ablation_diagnostics(
+                enabled=True, skipped_by_schedule=True, base_steps=4,
+            ),
+            operand=None,
+        ),
+        params, optimizer_state, key, jnp.asarray(4e-4),
+    )
+
+
+def test_value_clip_eps_sweep_defaults_schedule_and_loss_modes():
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "gymnax_exchange/jaxrl/MARL/config/ippo_rnn_JAXMARL_2player.yaml"
+    )
+    config = OmegaConf.load(config_path)
+    assert config.enable_value_clip_eps_sweep is False
+    assert list(config.value_clip_eps_sweep_updates) == []
+    assert float(config.CLIP_EPS) == 0.2
+    assert VALUE_CLIP_EPS_SWEEP == (0.2, 0.5, 1.0, 2.0, 5.0, 10.0)
+    assert VALUE_CLIP_EPS_SWEEP_BRANCHES == (
+        "eps_0p2", "eps_0p5", "eps_1p0", "eps_2p0",
+        "eps_5p0", "eps_10p0", "no_clip",
+    )
+    assert validate_value_clip_eps_sweep_config(config) == ()
+    enabled = {
+        "enable_value_clip_eps_sweep": True,
+        "value_clip_eps_sweep_updates": [10],
+        "UPDATE_EPOCHS": 2, "NUM_MINIBATCHES": 16, "CLIP_EPS": 0.2,
+    }
+    assert validate_value_clip_eps_sweep_config(enabled) == (10,)
+    with pytest.raises(ValueError, match="32 PPO minibatch"):
+        validate_value_clip_eps_sweep_config({**enabled, "NUM_MINIBATCHES": 8})
+    with pytest.raises(ValueError, match="unchanged policy CLIP_EPS"):
+        validate_value_clip_eps_sweep_config({**enabled, "CLIP_EPS": 0.3})
+    with pytest.raises(ValueError, match="unique and non-negative"):
+        validate_value_clip_eps_sweep_config({
+            **enabled, "value_clip_eps_sweep_updates": [10, 10],
+        })
+
+    old, prediction, target = jnp.array(0.0), jnp.array(1.0), jnp.array(10.0)
+    for eps in VALUE_CLIP_EPS_SWEEP:
+        clipped = old + jnp.clip(prediction - old, -eps, eps)
+        expected = 0.5 * jnp.maximum(
+            jnp.square(prediction - target), jnp.square(clipped - target),
+        )
+        np.testing.assert_allclose(
+            _critic_ablation_value_loss_samples(
+                prediction, old, target, "ppo_clipped", eps,
+            ), expected, atol=0, rtol=0,
+        )
+    np.testing.assert_allclose(
+        _critic_ablation_value_loss_samples(
+            prediction, old, target, "plain_mse", 0.2,
+        ), 0.5 * jnp.square(prediction - target), atol=0, rtol=0,
+    )
+    disabled = empty_value_clip_eps_sweep_diagnostics()
+    skipped = empty_value_clip_eps_sweep_diagnostics(
+        enabled=True, skipped_by_schedule=True,
+    )
+    assert format_value_clip_eps_sweep_diagnostics(disabled, update=10) == ([], {})
+    assert format_value_clip_eps_sweep_diagnostics(skipped, update=10) == ([], {})
+
+
+def test_value_clip_eps_sweep_isolated_snapshot_and_o3_o4_equivalence():
+    params = {"params": {
+        "VisionAgent_0": {"kernel": jnp.array([2.0])},
+        "CriticValueRNN_0": {"kernel": jnp.array([0.5])},
+        "Dense_2": {"kernel": jnp.array([0.25])},
+        "Dense_3": {"bias": jnp.array([0.0])},
+        "Dense_0": {"kernel": jnp.array([1.0])},
+        "ReliabilityFusionRNN_0": {
+            "kernel": jnp.array([1.0]),
+            "LevelWiseReliabilityHead_0": {"kernel": jnp.array([1.0])},
+        },
+    }}
+    mask = flatten_tree_with_paths(parameter_groups_mask(
+        params, VALUE_PROBE_C_TRAINABLE_GROUPS,
+    ))
+    assert {path[1] for path, selected in mask.items() if selected} == {
+        "CriticValueRNN_0", "Dense_2", "Dense_3",
+    }
+    x = jnp.stack((jnp.linspace(1.0, 4.0, 16), jnp.linspace(2.0, 5.0, 16)))
+    obs = {"x": x}
+    hidden = jnp.zeros((16, 1))
+    reset = jnp.zeros((2, 16), dtype=jnp.bool_)
+    active = jnp.ones((2, 16), dtype=jnp.bool_)
+
+    def apply_fn(p, h, inputs):
+        del h
+        weights = p["params"]
+        prediction = (
+            weights["VisionAgent_0"]["kernel"][0]
+            * weights["CriticValueRNN_0"]["kernel"][0]
+            * weights["Dense_2"]["kernel"][0] * inputs[0]["x"]
+            + weights["Dense_3"]["bias"][0]
+        )
+        return None, None, prediction, None, None
+
+    old = apply_fn(params, hidden, (obs, reset))[2]
+    target = 5.0 * x + 1.0
+    optimizer = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(0.02, eps=1e-5))
+    optimizer_state = optimizer.init(params)
+    key = jax.random.PRNGKey(42)
+    before_params = jax.tree_util.tree_map(lambda value: np.array(value, copy=True), params)
+    before_optimizer = jax.tree_util.tree_map(
+        lambda value: np.array(value, copy=True), optimizer_state,
+    )
+    before_key = np.array(key, copy=True)
+
+    def run_sweep(p, state, rng):
+        return run_value_clip_eps_sweep(
+            apply_fn=apply_fn, params=p, optimizer_state=state, rng=rng,
+            init_hstate=hidden, obs=obs, rnn_reset=reset, old_value=old,
+            targets=target, agent_active=active,
+            update_epochs=2, num_minibatches=16, current_lr=0.02,
+            max_grad_norm=0.5, num_environments=16,
+            train_fraction=0.5, split_seed=0, policy_clip_eps=0.2,
+        )
+
+    result = jax.jit(run_sweep)(params, optimizer_state, key)
+    _assert_tree_allclose(before_params, params, atol=0, rtol=0)
+    _assert_tree_allclose(before_optimizer, optimizer_state, atol=0, rtol=0)
+    np.testing.assert_array_equal(key, before_key)
+    assert bool(result["active"])
+    assert jax.tree_util.tree_structure(result) == jax.tree_util.tree_structure(
+        empty_value_clip_eps_sweep_diagnostics(enabled=True, skipped_by_schedule=True)
+    )
+    jax.eval_shape(
+        lambda p, state, rng: jax.lax.cond(
+            jnp.asarray(True),
+            lambda _: run_sweep(p, state, rng),
+            lambda _: empty_value_clip_eps_sweep_diagnostics(
+                enabled=True, skipped_by_schedule=True,
+            ),
+            operand=None,
+        ),
+        params, optimizer_state, key,
+    )
+    first_initial = result["branches"]["eps_0p2"]["initial"]
+    for branch_name in VALUE_CLIP_EPS_SWEEP_BRANCHES:
+        branch = result["branches"][branch_name]
+        np.testing.assert_array_equal(
+            branch["curve"]["steps"], [0, 1, 2, 4, 8, 16, 32],
+        )
+        for metric in first_initial:
+            np.testing.assert_allclose(
+                branch["initial"][metric], first_initial[metric],
+                atol=0, rtol=0,
+            )
+        assert int(branch["metadata"]["optimizer_steps"]) == 32
+        assert float(branch["metadata"]["vf_scaling"]) == 1.0
+        np.testing.assert_allclose(branch["metadata"]["learning_rate"], 0.02)
+        assert np.isfinite(float(branch["final"]["rmse"]))
+        for frozen in (
+            "vision_parameter_displacement_norm",
+            "actor_parameter_displacement_norm",
+            "reliability_parameter_displacement_norm",
+        ):
+            assert float(branch["metadata"][frozen]) == 0.0
+        for metric in ("explained_variance", "rmse", "mae"):
+            np.testing.assert_allclose(
+                branch["curve"]["full"][metric][-1], branch["final"][metric],
+                atol=0, rtol=0,
+            )
+        np.testing.assert_allclose(
+            branch["value_clip_curve"]["target_distance_to_clip_ratio_mean"],
+            branch["value_clip_curve"]["target_distance_to_clip_ratio_mean"][0],
+            atol=0, rtol=0,
+        )
+    for branch_name, eps in zip(VALUE_CLIP_EPS_SWEEP_BRANCHES[:-1], VALUE_CLIP_EPS_SWEEP):
+        np.testing.assert_allclose(
+            result["branches"][branch_name]["value_clip_curve"]["clip_eps"],
+            eps, rtol=1e-6,
+        )
+    np.testing.assert_allclose(
+        result["branches"]["no_clip"]["value_clip_curve"]["clip_eps"],
+        0.2, rtol=1e-6,
+    )
+
+    reference = jax.jit(lambda p, state, rng: run_critic_optimization_ablation(
+        apply_fn=apply_fn, params=p, post_ppo_params=p,
+        optimizer_state=state, rng=rng, init_hstate=hidden,
+        obs=obs, rnn_reset=reset, old_value=old, targets=target,
+        agent_active=active, real_full_gradient_norms=jnp.ones((2, 16)),
+        update_epochs=2, num_minibatches=16, current_lr=0.02,
+        current_vf_coef=1e-7, clip_eps=0.2, max_grad_norm=0.5,
+        num_environments=16, train_fraction=0.5, split_seed=0,
+    ))(params, optimizer_state, key)
+    for sweep_name, reference_name in (("eps_0p2", "O3"), ("no_clip", "O4")):
+        for stage in ("initial", "final", "delta"):
+            for metric in result["branches"][sweep_name][stage]:
+                np.testing.assert_allclose(
+                    result["branches"][sweep_name][stage][metric],
+                    reference["branches"][reference_name][stage][metric],
+                    atol=1e-6, rtol=1e-6,
+                )
+        for metric in result["branches"][sweep_name]["metadata"]:
+            np.testing.assert_allclose(
+                result["branches"][sweep_name]["metadata"][metric],
+                reference["branches"][reference_name]["metadata"][metric],
+                atol=1e-6, rtol=1e-6,
+            )
+
+    lines, values = format_value_clip_eps_sweep_diagnostics(result, update=10)
+    assert len([line for line in lines if line.startswith("CRITIC_VALUE_CLIP_SWEEP ")]) == 49
+    assert len([line for line in lines if line.startswith("CRITIC_VALUE_CLIP_SWEEP_SUMMARY ")]) == 7
+    assert any("eps=2.0 step=32" in line for line in lines)
+    assert any("eps=no_clip step=32" in line and "clip_evaluation=hypothetical"
+               in line and "would_be_value_gradient_locked_rate=" in line
+               for line in lines)
+    assert "eps_0p2/summary/delta_final_ev_vs_eps_0p2" in values
+    np.testing.assert_allclose(
+        values["eps_0p2/summary/delta_final_ev_vs_eps_0p2"], 0.0,
+        atol=0, rtol=0,
+    )
+
+
 def test_value_probe_a_changes_only_critic_and_b_freezes_actor_parameters():
     data = _value_probe_data()
     params = _value_probe_params(shared_scale=1.0 / 3.0, critic_scale=0.1)
@@ -1526,6 +2178,8 @@ def test_value_probe_sufficient_features_fit_and_disabled_path_is_static():
     assert jax.tree_util.tree_structure(disabled) == jax.tree_util.tree_structure(
         diagnostics
     )
+    disabled_lines, _ = format_value_representation_probe_diagnostics(disabled, update=5)
+    assert not any("VALUE_REP_PROBE_CURVE" in line for line in disabled_lines)
     assert not bool(disabled["enabled"])
     assert bool(skipped["skipped_by_schedule"])
     validated = validate_value_representation_probe_config({})
@@ -1693,7 +2347,15 @@ def test_separate_critic_probe_masks_and_fitting(separate_critic_fixture):
     expected_roots = {"CriticValueRNN_0", "Dense_2", "Dense_3", "VisionAgent_0"}
     for path, enabled in mask.items():
         assert enabled == (path[1] in expected_roots)
+    c_roots = {"CriticValueRNN_0", "Dense_2", "Dense_3"}
+    c_mask = flatten_tree_with_paths(parameter_groups_mask(params, VALUE_PROBE_C_TRAINABLE_GROUPS))
+    for path, enabled in c_mask.items():
+        assert enabled == (path[1] in c_roots)
     before = jax.tree_util.tree_map(lambda x: np.array(x, copy=True), params)
+    real_optimizer_state = {"count": jnp.asarray(11, dtype=jnp.int32)}
+    optimizer_state_before = jax.tree_util.tree_map(
+        lambda x: np.array(x, copy=True), real_optimizer_state,
+    )
 
     def value_apply(p, h, o, r):
         return model.apply(p, h, (o, r))[2]
@@ -1703,14 +2365,130 @@ def test_separate_critic_probe_masks_and_fitting(separate_critic_fixture):
         jnp.ones((4, 2), dtype=jnp.bool_), steps=3, learning_rate=0.001,
         use_separate_critic_representation=True,
     ))(params)
+    params_c = jax.jit(lambda p: fit_value_representation_probe_c(
+        value_apply, p, hidden, obs, resets, jnp.ones((4, 2)) * 2,
+        jnp.ones((4, 2), dtype=jnp.bool_), steps=3, learning_rate=0.001,
+    ))(params)
+    params_c_curve, curve = jax.jit(lambda p: fit_value_representation_probe_c(
+        value_apply, p, hidden, obs, resets, jnp.ones((4, 2)) * 2,
+        jnp.ones((4, 2), dtype=jnp.bool_), steps=3, learning_rate=0.001,
+        holdout_mask=jnp.ones((4, 2), dtype=jnp.bool_),
+    ))(params)
+    _assert_tree_allclose(params_c, params_c_curve, atol=0, rtol=0)
+    np.testing.assert_array_equal(curve["steps"], [0, 1, 2, 3])
     _assert_tree_allclose(before, params, atol=0, rtol=0)
-    for fitted, allowed in ((params_a, {"Dense_2", "Dense_3"}), (params_b, expected_roots)):
+    _assert_tree_allclose(optimizer_state_before, real_optimizer_state, atol=0, rtol=0)
+    for fitted, allowed in (
+        (params_a, {"Dense_2", "Dense_3"}),
+        (params_b, expected_roots),
+        (params_c, c_roots),
+    ):
         for root in params["params"]:
             if root not in allowed:
                 _assert_tree_allclose(fitted["params"][root], params["params"][root], atol=0, rtol=0)
         assert float(gradient_l2_norm(subtract_gradient_trees(fitted, params), "critic_head")) > 0
     for group in ("critic_representation", "vision_encoder"):
         assert float(gradient_l2_norm(subtract_gradient_trees(params_b, params), group)) > 0
+    assert float(gradient_l2_norm(
+        subtract_gradient_trees(params_c, params), "critic_representation",
+    )) > 0
+    for group in ("vision_encoder", "reliability_head", "fusion_shared_trunk", "actor_head"):
+        assert float(gradient_l2_norm(subtract_gradient_trees(params_c, params), group)) == 0
+
+
+def test_critic_ablation_recurrent_model_shape(separate_critic_fixture):
+    model, params, hidden, obs, resets = separate_critic_fixture
+    old_value = model.apply(params, hidden, (obs, resets))[2]
+    tx = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(4e-4, eps=1e-5))
+
+    def replay(p, state):
+        return run_critic_optimization_ablation(
+            apply_fn=lambda q, h, x: model.apply(q, h, x),
+            params=p, post_ppo_params=p, optimizer_state=state,
+            rng=jax.random.PRNGKey(8), init_hstate=hidden,
+            obs=obs, rnn_reset=resets, old_value=old_value,
+            targets=old_value + 1.0,
+            agent_active=jnp.ones_like(old_value, dtype=jnp.bool_),
+            real_full_gradient_norms=jnp.ones((2, 1)),
+            update_epochs=2, num_minibatches=1, current_lr=4e-4,
+            current_vf_coef=1e-5, clip_eps=0.2, max_grad_norm=0.5,
+            num_environments=2, train_fraction=0.5, split_seed=0,
+        )
+
+    shaped = jax.eval_shape(replay, params, tx.init(params))
+    assert shaped["branches"]["O6"]["curve"]["steps"].shape == (11,)
+    assert shaped["branches"]["O2"]["final"]["rmse"].shape == ()
+
+
+def test_separate_critic_probe_c_starts_independently_and_logs(separate_critic_fixture):
+    model, params, hidden, obs, resets = separate_critic_fixture
+
+    def value_apply(p, h, o, r):
+        return model.apply(p, h, (o, r))[2]
+
+    before = jax.tree_util.tree_map(lambda x: np.array(x, copy=True), params)
+    diagnostic = jax.jit(lambda p: run_value_representation_probe(
+        value_apply, p, hidden, obs, resets, jnp.ones((4, 2)) * 2,
+        jnp.ones((4, 2), dtype=jnp.bool_), num_environments=2,
+        steps=3, learning_rate=0.001, train_fraction=0.5, split_seed=0,
+        use_separate_critic_representation=True,
+    ))(params)
+    assert bool(diagnostic["probe_c_applicable"])
+    assert bool(diagnostic["probes_start_identical"])
+    assert bool(diagnostic["probe_c_starts_identical"])
+    _assert_tree_allclose(before, params, atol=0, rtol=0)
+    for split in ("train", "holdout"):
+        _assert_tree_allclose(
+            diagnostic["probe_c"][split]["initial"],
+            diagnostic["probe_a"][split]["initial"], atol=0, rtol=0,
+        )
+        _assert_tree_allclose(
+            diagnostic["probe_c"][split]["initial"],
+            diagnostic["probe_b"][split]["initial"], atol=0, rtol=0,
+        )
+    assert float(diagnostic["probe_c"]["parameter_change"]["critic_representation"]) > 0
+    assert float(diagnostic["probe_c"]["parameter_change"]["critic_head"]) > 0
+    np.testing.assert_array_equal(diagnostic["probe_c_curve"]["steps"], [0, 1, 2, 3])
+    for split in ("train", "holdout"):
+        for name in diagnostic["probe_c"][split]["initial"]:
+            np.testing.assert_allclose(
+                diagnostic["probe_c_curve"][split][name][0],
+                diagnostic["probe_c"][split]["initial"][name], atol=0, rtol=0,
+            )
+            np.testing.assert_allclose(
+                diagnostic["probe_c_curve"][split][name][-1],
+                diagnostic["probe_c"][split]["final"][name], atol=0, rtol=0,
+            )
+    lines, values = format_value_representation_probe_diagnostics(diagnostic, update=5)
+    assert sum(
+        line.startswith("VALUE_REP_PROBE ") and "probe=probe_c" in line
+        and "status=active" in line for line in lines
+    ) == 4
+    assert sum(line.startswith("VALUE_REP_PROBE_CURVE") for line in lines) == 8
+    assert any("step=2 split=holdout" in line for line in lines)
+    assert "probe_c/curve/step_2/holdout/explained_variance" in values
+    assert "comparison/c_minus_a_final_holdout_ev" in values
+    assert "comparison/b_minus_c_final_holdout_ev" in values
+    assert jax.tree_util.tree_structure(diagnostic) == jax.tree_util.tree_structure(
+        empty_value_representation_probe_diagnostics(enabled=True)
+    )
+
+
+def test_legacy_probe_c_is_explicitly_not_applicable():
+    data = _value_probe_data()
+    diagnostic = run_value_representation_probe(
+        _value_probe_apply, _value_probe_params(1.0 / 3.0),
+        data["init_hstate"], data["obs"], data["rnn_reset"],
+        data["target"], data["active"], num_environments=10,
+        steps=1, learning_rate=0.001, train_fraction=0.8, split_seed=0,
+        use_separate_critic_representation=False,
+    )
+    assert not bool(diagnostic["probe_c_applicable"])
+    lines, values = format_value_representation_probe_diagnostics(diagnostic, update=5)
+    assert any("probe=probe_c reason=legacy_architecture" in line for line in lines)
+    assert "comparison/c_minus_a_final_holdout_ev" not in values
+    assert "comparison/b_minus_a_final_holdout_ev" in values
+    assert not any(line.startswith("VALUE_REP_PROBE_CURVE") for line in lines)
 
 
 def test_separate_critic_is_execution_only_and_supports_no_reliability(separate_critic_fixture):
@@ -1733,3 +2511,88 @@ def test_separate_critic_is_execution_only_and_supports_no_reliability(separate_
     assert no_rel.apply(params, hidden, (obs, resets))[0].shape == (2, 32)
     with pytest.raises(ValueError, match="hidden width"):
         no_rel.apply(params, hidden[:, :16], (obs, resets))
+
+
+def test_value_fit_masked_statistics_and_delta_ignore_inactive_outlier():
+    prediction = jnp.array([1.0, 2.0, 1000.0])
+    target = jnp.array([1.0, 4.0, -1000.0])
+    mask = jnp.array([True, True, False])
+    pre = jax.jit(summarize_value_fit_statistics)(prediction, target, mask)
+    expected = {
+        "active_sample_count": 2.0, "prediction_mean": 1.5,
+        "prediction_std": 0.5, "prediction_min": 1.0, "prediction_max": 2.0,
+        "target_mean": 2.5, "target_std": 1.5,
+        "target_min": 1.0, "target_max": 4.0,
+        "mae": 1.0, "rmse": np.sqrt(2.0),
+        "explained_variance": 5.0 / 9.0,
+        "prediction_std_to_target_std_ratio": 1.0 / 3.0,
+        "mean_prediction_error": -1.0,
+    }
+    for name, value in expected.items():
+        np.testing.assert_allclose(float(pre[name]), value, atol=1e-6)
+    assert bool(pre["explained_variance_valid"])
+    post = summarize_value_fit_statistics(target, target, mask)
+    lines, values = format_value_fit_diagnostics(
+        summarize_value_fit_diagnostics(pre, post), update=5,
+    )
+    assert len(lines) == 3
+    assert "phase=pre_ppo" in lines[0] and "phase=post_ppo" in lines[1]
+    assert "VALUE_FIT_DELTA" in lines[2]
+    np.testing.assert_allclose(values["delta/rmse"], -np.sqrt(2.0))
+    np.testing.assert_allclose(values["delta/mae"], -1.0)
+    np.testing.assert_allclose(values["delta/explained_variance"], 4.0 / 9.0)
+    np.testing.assert_allclose(values["delta/prediction_std_to_target_std_ratio"], 2.0 / 3.0)
+
+
+def test_value_fit_constant_target_and_empty_mask_are_finite():
+    for mask in (jnp.array([True] * 3), jnp.array([False] * 3)):
+        stats = summarize_value_fit_statistics(
+            jnp.array([1.0, 2.0, 3.0]), jnp.array([4.0] * 3), mask,
+        )
+        assert not bool(stats["explained_variance_valid"])
+        assert all(np.isfinite(np.asarray(value)).all() for value in stats.values())
+
+
+def test_value_fit_pytree_is_fixed_and_schedule_is_jittable():
+    pre = summarize_value_fit_statistics(jnp.array([1.0]), jnp.array([2.0]), jnp.array([True]))
+    post = summarize_value_fit_statistics(jnp.array([2.0]), jnp.array([2.0]), jnp.array([True]))
+    disabled = empty_value_fit_diagnostics()
+    not_applicable = empty_value_fit_diagnostics(enabled=True, not_applicable=True)
+    skipped = summarize_value_fit_diagnostics(pre, skipped_by_schedule=True)
+    scheduled = summarize_value_fit_diagnostics(pre, post)
+    assert len({str(jax.tree_util.tree_structure(d)) for d in (disabled, not_applicable, skipped, scheduled)}) == 1
+    result = jax.jit(lambda due: jax.lax.cond(
+        due, lambda _: summarize_value_fit_diagnostics(pre, post),
+        lambda _: skipped, operand=None,
+    ))(True)
+    assert bool(result["post"]["active"])
+    assert format_value_fit_diagnostics(disabled, update=0)[1] == {}
+    assert "status=not_applicable" in format_value_fit_diagnostics(not_applicable, update=0)[0][0]
+    assert "status=skipped_by_schedule" in format_value_fit_diagnostics(skipped, update=1)[0][1]
+
+
+@pytest.mark.parametrize("separate_critic", [False, True])
+def test_value_fit_replay_uses_model_hidden_and_does_not_mutate_state(
+    separate_critic, separate_critic_fixture,
+):
+    separate_model, _, _, obs, resets = separate_critic_fixture
+    model = ActorCriticRNN(
+        separate_model.action_space,
+        {**separate_model.config, "use_separate_critic_representation": separate_critic},
+        is_execution=True,
+    )
+    hidden = model.initialize_carry(2)
+    params = model.init(jax.random.PRNGKey(37), hidden, (obs, resets))
+    opt_state = optax.adam(1e-3).init(params)
+    params_before = jax.tree_util.tree_map(lambda value: np.asarray(value).copy(), params)
+    opt_before = jax.tree_util.tree_map(lambda value: np.asarray(value).copy(), opt_state)
+    _, _, value, _, _ = jax.jit(model.apply)(params, hidden, (obs, resets))
+    assert hidden.shape == (2, 32 if separate_critic else 16)
+    assert value.shape == (4, 2)
+    stats = jax.jit(summarize_value_fit_statistics)(
+        value, value + 1.0, jnp.ones_like(value, dtype=jnp.bool_),
+    )
+    assert float(stats["active_sample_count"]) == 8.0
+    assert all(np.isfinite(np.asarray(value)).all() for value in stats.values())
+    _assert_tree_allclose(params, params_before, atol=0, rtol=0)
+    _assert_tree_allclose(opt_state, opt_before, atol=0, rtol=0)

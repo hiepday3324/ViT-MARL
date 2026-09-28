@@ -215,6 +215,16 @@ VALUE_PROBE_B_FROZEN_GROUPS = ("actor_head",)
 VALUE_PROBE_B_SEPARATE_TRAINABLE_GROUPS = (
     "critic_representation", "critic_head", "vision_encoder",
 )
+VALUE_PROBE_C_TRAINABLE_GROUPS = ("critic_representation", "critic_head")
+VALUE_PROBE_C_CURVE_STEPS = (0, 1, 2, 4, 8, 16, 32, 64)
+
+
+def value_probe_c_curve_steps(steps: int) -> tuple[int, ...]:
+    """Return unique cumulative Probe C checkpoints through the final step."""
+    steps = int(steps)
+    return tuple(step for step in VALUE_PROBE_C_CURVE_STEPS if step <= steps) + (
+        (steps,) if steps not in VALUE_PROBE_C_CURVE_STEPS else ()
+    )
 
 
 def _string_path(path: Sequence[Any]) -> tuple[str, ...]:
@@ -610,6 +620,84 @@ def value_probe_statistics(prediction, target, mask, eps=1e-12):
     }
 
 
+def summarize_value_fit_statistics(prediction, target, mask, eps=1e-12):
+    """Extend the existing masked value statistics for rollout diagnostics."""
+    statistics = value_probe_statistics(prediction, target, mask, eps=eps)
+    prediction = jnp.asarray(prediction, dtype=jnp.float32)
+    target = jnp.asarray(target, dtype=jnp.float32)
+    mask = jnp.broadcast_to(jnp.asarray(mask, dtype=jnp.bool_), target.shape)
+    has_active = statistics["active_sample_count"] > 0
+    statistics.update({
+        "prediction_min": jnp.where(
+            has_active, jnp.min(jnp.where(mask, prediction, jnp.inf)), 0.0,
+        ),
+        "prediction_max": jnp.where(
+            has_active, jnp.max(jnp.where(mask, prediction, -jnp.inf)), 0.0,
+        ),
+        "target_min": jnp.where(
+            has_active, jnp.min(jnp.where(mask, target, jnp.inf)), 0.0,
+        ),
+        "target_max": jnp.where(
+            has_active, jnp.max(jnp.where(mask, target, -jnp.inf)), 0.0,
+        ),
+        "mean_prediction_error": masked_mean(prediction - target, mask),
+    })
+    return statistics
+
+
+VALUE_FIT_DELTA_METRICS = (
+    "explained_variance",
+    "rmse",
+    "mae",
+    "prediction_std_to_target_std_ratio",
+)
+
+
+def _empty_value_fit_statistics():
+    return {
+        **_empty_value_probe_statistics(),
+        **{
+            name: jnp.array(0.0, dtype=jnp.float32)
+            for name in (
+                "prediction_min", "prediction_max", "target_min", "target_max",
+                "mean_prediction_error",
+            )
+        },
+    }
+
+
+def empty_value_fit_diagnostics(*, enabled=False, not_applicable=False):
+    return {
+        "enabled": jnp.asarray(enabled, dtype=jnp.bool_),
+        "not_applicable": jnp.asarray(not_applicable, dtype=jnp.bool_),
+        "pre": _empty_value_fit_statistics(),
+        "post": {
+            "active": jnp.array(False),
+            "skipped_by_schedule": jnp.array(False),
+            **_empty_value_fit_statistics(),
+        },
+        "delta": {
+            name: jnp.array(0.0, dtype=jnp.float32)
+            for name in VALUE_FIT_DELTA_METRICS
+        },
+    }
+
+
+def summarize_value_fit_diagnostics(pre, post=None, *, skipped_by_schedule=False):
+    diagnostics = empty_value_fit_diagnostics(enabled=True)
+    diagnostics["pre"] = pre
+    diagnostics["post"]["skipped_by_schedule"] = jnp.asarray(
+        skipped_by_schedule, dtype=jnp.bool_,
+    )
+    if post is not None:
+        diagnostics["post"].update(post)
+        diagnostics["post"]["active"] = jnp.array(True)
+        diagnostics["delta"] = {
+            name: post[name] - pre[name] for name in VALUE_FIT_DELTA_METRICS
+        }
+    return diagnostics
+
+
 def _relative_parameter_change(initial_params, final_params, group, eps=1e-12):
     delta = subtract_gradient_trees(final_params, initial_params)
     return gradient_l2_norm(delta, group) / jnp.maximum(
@@ -708,6 +796,74 @@ def fit_value_representation_probe_variants(
     return params_a, params_b
 
 
+def fit_value_representation_probe_c(
+    value_apply_fn,
+    params,
+    init_hstate,
+    obs,
+    rnn_reset,
+    targets,
+    train_mask,
+    *,
+    steps: int,
+    learning_rate: float,
+    holdout_mask=None,
+    eps=1e-12,
+):
+    """Fit a separate critic representation without adapting VisionAgent."""
+    params_c = jax.tree_util.tree_map(lambda value: value + 0, params)
+    mask_c = parameter_groups_mask(params_c, VALUE_PROBE_C_TRAINABLE_GROUPS)
+    optimizer_c = optax.masked(
+        optax.adam(learning_rate=learning_rate, eps=1e-5), mask_c,
+    )
+    optimizer_state_c = optimizer_c.init(params_c)
+
+    def probe_loss(probe_params):
+        prediction = value_apply_fn(probe_params, init_hstate, obs, rnn_reset)
+        return 0.5 * masked_mean(jnp.square(prediction - targets), train_mask)
+
+    def probe_step(carry, _):
+        probe_params, optimizer_state = carry
+        gradients = mask_tree_to_groups(
+            jax.grad(probe_loss)(probe_params), VALUE_PROBE_C_TRAINABLE_GROUPS,
+        )
+        updates, optimizer_state = optimizer_c.update(
+            gradients, optimizer_state, probe_params,
+        )
+        updates = mask_tree_to_groups(updates, VALUE_PROBE_C_TRAINABLE_GROUPS)
+        return (optax.apply_updates(probe_params, updates), optimizer_state), None
+
+    if holdout_mask is None:
+        (params_c, _), _ = jax.lax.scan(
+            probe_step, (params_c, optimizer_state_c), xs=None, length=int(steps),
+        )
+        return params_c
+
+    checkpoint_steps = jnp.asarray(value_probe_c_curve_steps(steps), dtype=jnp.int32)
+
+    def checkpoint_step(carry, checkpoint):
+        probe_params, optimizer_state, previous_step = carry
+
+        def advance(_, fit_state):
+            return probe_step(fit_state, None)[0]
+
+        probe_params, optimizer_state = jax.lax.fori_loop(
+            previous_step, checkpoint, advance, (probe_params, optimizer_state),
+        )
+        prediction = value_apply_fn(probe_params, init_hstate, obs, rnn_reset)
+        statistics = {
+            "train": value_probe_statistics(prediction, targets, train_mask, eps),
+            "holdout": value_probe_statistics(prediction, targets, holdout_mask, eps),
+        }
+        return (probe_params, optimizer_state, checkpoint), statistics
+
+    (params_c, _, _), curve_statistics = jax.lax.scan(
+        checkpoint_step, (params_c, optimizer_state_c, jnp.int32(0)),
+        checkpoint_steps,
+    )
+    return params_c, {"steps": checkpoint_steps, **curve_statistics}
+
+
 def _empty_value_probe_statistics():
     return {
         "active_sample_count": jnp.array(0.0, dtype=jnp.float32),
@@ -728,6 +884,19 @@ def _empty_value_probe_split_metrics():
     return {
         "initial": _empty_value_probe_statistics(),
         "final": _empty_value_probe_statistics(),
+    }
+
+
+def _empty_value_probe_c_curve(steps):
+    checkpoint_steps = jnp.asarray(value_probe_c_curve_steps(steps), dtype=jnp.int32)
+    empty_statistics = jax.tree_util.tree_map(
+        lambda value: jnp.zeros((len(checkpoint_steps),), dtype=value.dtype),
+        _empty_value_probe_statistics(),
+    )
+    return {
+        "steps": checkpoint_steps,
+        "train": empty_statistics,
+        "holdout": empty_statistics,
     }
 
 
@@ -756,6 +925,8 @@ def empty_value_representation_probe_diagnostics(
         "train_environment_count": jnp.array(0, dtype=jnp.int32),
         "holdout_environment_count": jnp.array(0, dtype=jnp.int32),
         "probes_start_identical": jnp.array(False),
+        "probe_c_applicable": jnp.array(False),
+        "probe_c_starts_identical": jnp.array(False),
         "probe_a": {
             "train": _empty_value_probe_split_metrics(),
             "holdout": _empty_value_probe_split_metrics(),
@@ -774,12 +945,23 @@ def empty_value_representation_probe_diagnostics(
                 "critic_representation": jnp.array(0.0, dtype=jnp.float32),
             },
         },
+        "probe_c": {
+            "train": _empty_value_probe_split_metrics(),
+            "holdout": _empty_value_probe_split_metrics(),
+            "parameter_change": {
+                "critic_head": jnp.array(0.0, dtype=jnp.float32),
+                "critic_representation": jnp.array(0.0, dtype=jnp.float32),
+            },
+        },
+        "probe_c_curve": _empty_value_probe_c_curve(steps),
         "comparison": {
             "holdout_ev_gain_a": jnp.array(0.0, dtype=jnp.float32),
             "holdout_ev_gain_b": jnp.array(0.0, dtype=jnp.float32),
             "holdout_mae_reduction_a": jnp.array(0.0, dtype=jnp.float32),
             "holdout_mae_reduction_b": jnp.array(0.0, dtype=jnp.float32),
             "b_minus_a_final_holdout_ev": jnp.array(0.0, dtype=jnp.float32),
+            "c_minus_a_final_holdout_ev": jnp.array(0.0, dtype=jnp.float32),
+            "b_minus_c_final_holdout_ev": jnp.array(0.0, dtype=jnp.float32),
             "b_over_a_holdout_mae_reduction_ratio": jnp.array(
                 0.0,
                 dtype=jnp.float32,
@@ -885,6 +1067,59 @@ def run_value_representation_probe(
         holdout_mask,
         eps,
     )
+    probe_c = empty_value_representation_probe_diagnostics()["probe_c"]
+    probe_c_curve = _empty_value_probe_c_curve(steps)
+    probe_c_starts_identical = jnp.array(False)
+    c_minus_a_final_holdout_ev = jnp.array(0.0, dtype=jnp.float32)
+    b_minus_c_final_holdout_ev = jnp.array(0.0, dtype=jnp.float32)
+    if use_separate_critic_representation:
+        probe_c_start = jax.tree_util.tree_map(lambda value: value + 0, params)
+        probe_c_starts_identical = tree_l2_norm(
+            subtract_gradient_trees(probe_a_start, probe_c_start)
+        ) == 0.0
+        params_c, probe_c_curve = fit_value_representation_probe_c(
+            value_apply_fn, probe_c_start, init_hstate, obs, rnn_reset,
+            targets, train_mask, steps=steps, learning_rate=learning_rate,
+            holdout_mask=holdout_mask, eps=eps,
+        )
+        prediction_c = value_apply_fn(params_c, init_hstate, obs, rnn_reset)
+        final_c_train = value_probe_statistics(
+            prediction_c, targets, train_mask, eps,
+        )
+        final_c_holdout = value_probe_statistics(
+            prediction_c, targets, holdout_mask, eps,
+        )
+        probe_c_curve = {
+            "steps": probe_c_curve["steps"],
+            **{
+                split_name: {
+                    name: curve_values.at[0].set(initial_stats[name]).at[-1].set(
+                        final_stats[name]
+                    )
+                    for name, curve_values in probe_c_curve[split_name].items()
+                }
+                for split_name, initial_stats, final_stats in (
+                    ("train", initial_train, final_c_train),
+                    ("holdout", initial_holdout, final_c_holdout),
+                )
+            },
+        }
+        probe_c = {
+            "train": {"initial": initial_train, "final": final_c_train},
+            "holdout": {"initial": initial_holdout, "final": final_c_holdout},
+            "parameter_change": {
+                group: _relative_parameter_change(params, params_c, group, eps)
+                for group in VALUE_PROBE_C_TRAINABLE_GROUPS
+            },
+        }
+        c_minus_a_final_holdout_ev = (
+            final_c_holdout["explained_variance"]
+            - final_a_holdout["explained_variance"]
+        )
+        b_minus_c_final_holdout_ev = (
+            final_b_holdout["explained_variance"]
+            - final_c_holdout["explained_variance"]
+        )
     holdout_ev_gain_a = (
         final_a_holdout["explained_variance"]
         - initial_holdout["explained_variance"]
@@ -915,6 +1150,8 @@ def run_value_representation_probe(
             dtype=jnp.int32,
         ),
         "probes_start_identical": probes_start_identical,
+        "probe_c_applicable": jnp.asarray(use_separate_critic_representation),
+        "probe_c_starts_identical": probe_c_starts_identical,
         "probe_a": {
             "train": {"initial": initial_train, "final": final_a_train},
             "holdout": {
@@ -952,6 +1189,8 @@ def run_value_representation_probe(
                 )
             },
         },
+        "probe_c": probe_c,
+        "probe_c_curve": probe_c_curve,
         "comparison": {
             "holdout_ev_gain_a": holdout_ev_gain_a,
             "holdout_ev_gain_b": holdout_ev_gain_b,
@@ -961,12 +1200,754 @@ def run_value_representation_probe(
                 final_b_holdout["explained_variance"]
                 - final_a_holdout["explained_variance"]
             ),
+            "c_minus_a_final_holdout_ev": c_minus_a_final_holdout_ev,
+            "b_minus_c_final_holdout_ev": b_minus_c_final_holdout_ev,
             "b_over_a_holdout_mae_reduction_ratio": (
                 holdout_mae_reduction_b
                 / jnp.maximum(jnp.abs(holdout_mae_reduction_a), eps)
             ),
         },
     }
+
+
+CRITIC_ABLATION_BRANCHES = (
+    "REAL", "O1", "O2", "O2_150", "O3", "O4", "O5", "O6",
+)
+CRITIC_ABLATION_CURVE_STEPS = (0, 1, 2, 4, 8, 16, 32, 64, 96, 128, 150)
+CRITIC_ABLATION_VALUE_CLIP_CURVE_STEPS = (0, 1, 2, 4, 8, 16, 32)
+VALUE_CLIP_EPS_SWEEP = (0.2, 0.5, 1.0, 2.0, 5.0, 10.0)
+VALUE_CLIP_EPS_SWEEP_BRANCHES = (
+    "eps_0p2", "eps_0p5", "eps_1p0", "eps_2p0",
+    "eps_5p0", "eps_10p0", "no_clip",
+)
+
+
+def resolve_value_clip_eps(config):
+    """Keep old configs on their original shared policy/value clip epsilon."""
+    return config.get("VALUE_CLIP_EPS", config["CLIP_EPS"])
+
+
+_CRITIC_ABLATION_VALUE_CLIP_METRICS = (
+    "clip_eps", "value_delta_mean", "value_delta_abs_mean",
+    "value_delta_abs_max", "clip_saturated_rate",
+    "clipped_branch_selected_rate", "unclipped_branch_selected_rate",
+    "branch_tie_rate", "value_gradient_locked_rate",
+    "target_distance_to_clip_ratio_mean",
+    "target_distance_to_clip_ratio_p50",
+    "target_distance_to_clip_ratio_p95",
+)
+_CRITIC_ABLATION_DELTA_METRICS = (
+    "mse", "rmse", "mae", "explained_variance", "prediction_std",
+    "prediction_std_to_target_std_ratio",
+)
+
+
+def validate_critic_optimization_ablation_config(config):
+    updates = tuple(int(value) for value in config.get(
+        "critic_optimization_ablation_updates", (),
+    ))
+    if any(value < 0 for value in updates) or len(updates) != len(set(updates)):
+        raise ValueError("Ablation update indices must be unique and non-negative.")
+    if config.get("enable_critic_optimization_ablation", False):
+        base_steps = int(config["UPDATE_EPOCHS"]) * int(config["NUM_MINIBATCHES"])
+        if not 0 < base_steps < 150:
+            raise ValueError("Ablation requires 1-149 PPO minibatch steps per update.")
+    return updates
+
+
+def validate_value_clip_eps_sweep_config(config):
+    updates = tuple(int(value) for value in config.get(
+        "value_clip_eps_sweep_updates", (),
+    ))
+    if any(value < 0 for value in updates) or len(updates) != len(set(updates)):
+        raise ValueError("Value-clip sweep update indices must be unique and non-negative.")
+    if config.get("enable_value_clip_eps_sweep", False) and updates:
+        if int(config["UPDATE_EPOCHS"]) * int(config["NUM_MINIBATCHES"]) != 32:
+            raise ValueError("Value-clip sweep requires exactly 32 PPO minibatch steps.")
+        if float(config["CLIP_EPS"]) != 0.2:
+            raise ValueError("Value-clip sweep requires unchanged policy CLIP_EPS=0.2.")
+    return updates
+
+
+def critic_ablation_branch_specs(base_steps, current_vf, current_lr):
+    """Only adjacent entries change the specified experimental variable."""
+    return {
+        "O1": ("full", "ppo_clipped", current_vf, current_lr, base_steps),
+        "O2": ("critic", "ppo_clipped", current_vf, current_lr, base_steps),
+        "O2_150": ("critic", "ppo_clipped", current_vf, current_lr, 150),
+        "O3": ("critic", "ppo_clipped", 1.0, current_lr, base_steps),
+        "O4": ("critic", "plain_mse", 1.0, current_lr, base_steps),
+        "O5": ("critic", "plain_mse", 1.0, 1e-3, base_steps),
+        "O6": ("critic", "plain_mse", 1.0, 1e-3, 150),
+    }
+
+
+def critic_ablation_permutations(rng, update_epochs, actor_count):
+    """Replay PPO's epoch-key splits from a copied pre-PPO key."""
+    def epoch(carry, _):
+        carry, key = jax.random.split(carry)
+        return carry, jax.random.permutation(key, actor_count)
+
+    _, permutations = jax.lax.scan(epoch, rng, xs=None, length=update_epochs)
+    return permutations
+
+
+def critic_ablation_checkpoint_steps(branch_name, final_step):
+    if branch_name in ("O2_150", "O6"):
+        return CRITIC_ABLATION_CURVE_STEPS
+    if branch_name in ("O3", "O4"):
+        checkpoints = tuple(
+            step for step in CRITIC_ABLATION_VALUE_CLIP_CURVE_STEPS
+            if step <= final_step
+        )
+        return checkpoints if checkpoints[-1] == final_step else checkpoints + (final_step,)
+    return (0, final_step)
+
+
+def critic_ablation_value_clip_statistics(old_value, prediction, target, mask, clip_eps):
+    """Evaluate the existing PPO clip diagnostics without changing a branch loss."""
+    clipped = old_value + jnp.clip(prediction - old_value, -clip_eps, clip_eps)
+    summary = summarize_value_clip_diagnostics(
+        old_value=old_value,
+        new_value=prediction,
+        target=target,
+        value_pred_clipped=clipped,
+        value_losses=jnp.square(prediction - target),
+        value_losses_clipped=jnp.square(clipped - target),
+        agent_active=mask,
+        clip_eps=clip_eps,
+    )
+    return {name: summary[name] for name in _CRITIC_ABLATION_VALUE_CLIP_METRICS}
+
+
+def _empty_critic_ablation_curve(checkpoints):
+    empty_stats = _empty_value_probe_statistics()
+    statistics = jax.tree_util.tree_map(
+        lambda value: jnp.zeros((len(checkpoints),), dtype=value.dtype),
+        empty_stats,
+    )
+    return {
+        "steps": jnp.asarray(checkpoints, dtype=jnp.int32),
+        "full": statistics, "train": statistics, "holdout": statistics,
+    }
+
+
+def _empty_critic_ablation_branch(checkpoints, *, include_value_clip_curve=False):
+    empty_stats = _empty_value_probe_statistics()
+    zero = jnp.array(0.0, dtype=jnp.float32)
+    branch = {
+        "initial": empty_stats,
+        "final": empty_stats,
+        "delta": {name: zero for name in _CRITIC_ABLATION_DELTA_METRICS},
+        "curve": _empty_critic_ablation_curve(checkpoints),
+        "metadata": {
+            "learning_rate": zero,
+            "vf_scaling": zero,
+            "optimizer_steps": jnp.array(0, dtype=jnp.int32),
+            "mean_critic_grad_norm": zero,
+            "mean_clip_scale": zero,
+            "min_clip_scale": zero,
+            "clip_active_fraction": zero,
+            "mean_critic_update_norm": zero,
+            "critic_parameter_displacement_norm": zero,
+            "critic_relative_parameter_displacement": zero,
+            "vision_parameter_displacement_norm": zero,
+            "actor_parameter_displacement_norm": zero,
+            "reliability_parameter_displacement_norm": zero,
+            "holdout_in_optimizer_batch": jnp.array(False),
+        },
+    }
+    if include_value_clip_curve:
+        branch["value_clip_curve"] = {
+            name: jnp.zeros((len(checkpoints),), dtype=jnp.float32)
+            for name in _CRITIC_ABLATION_VALUE_CLIP_METRICS
+        }
+    return branch
+
+
+def empty_critic_optimization_ablation_diagnostics(
+    *, enabled=False, skipped_by_schedule=False, not_applicable=False,
+    base_steps=32,
+):
+    branches = {
+        name: _empty_critic_ablation_branch(
+            critic_ablation_checkpoint_steps(
+                name, 150 if name in ("O2_150", "O6") else base_steps,
+            ),
+            include_value_clip_curve=name in ("O3", "O4"),
+        )
+        for name in CRITIC_ABLATION_BRANCHES
+    }
+    zero = jnp.array(0.0, dtype=jnp.float32)
+    return {
+        "enabled": jnp.asarray(enabled, dtype=jnp.bool_),
+        "active": jnp.array(False),
+        "skipped_by_schedule": jnp.asarray(skipped_by_schedule, dtype=jnp.bool_),
+        "not_applicable": jnp.asarray(not_applicable, dtype=jnp.bool_),
+        "branches": branches,
+        "comparisons": {
+            "O1_minus_REAL_delta_ev": zero,
+            "O2_minus_O1_final_ev": zero,
+            "O2_150_minus_O2_final_ev": zero,
+            "O3_minus_O2_final_ev": zero,
+            "O4_minus_O3_final_ev": zero,
+            "O5_minus_O4_final_ev": zero,
+            "O6_minus_O5_final_ev": zero,
+        },
+    }
+
+
+def _critic_ablation_minibatches(
+    rng, full_batch, update_epochs, num_minibatches, actor_count,
+):
+    permutations = critic_ablation_permutations(rng, update_epochs, actor_count)
+
+    def make_minibatches(permutation):
+        shuffled = jax.tree_util.tree_map(
+            lambda value: jnp.take(value, permutation, axis=1), full_batch,
+        )
+        return jax.tree_util.tree_map(
+            lambda value: jnp.swapaxes(
+                jnp.reshape(
+                    value, (value.shape[0], num_minibatches, -1)
+                    + value.shape[2:],
+                ), 1, 0,
+            ), shuffled,
+        )
+
+    return jax.vmap(make_minibatches)(permutations)
+
+
+def _critic_ablation_value_loss_samples(prediction, old, target, loss_mode, clip_eps):
+    if loss_mode == "ppo_clipped":
+        clipped = old + jnp.clip(prediction - old, -clip_eps, clip_eps)
+        return 0.5 * jnp.maximum(
+            jnp.square(prediction - target),
+            jnp.square(clipped - target),
+        )
+    return 0.5 * jnp.square(prediction - target)
+
+
+def _run_critic_ablation_branch(
+    *, apply_fn, params, optimizer_state, minibatches, init_hstate,
+    obs, rnn_reset, old_value, targets, agent_active, train_mask, holdout_mask,
+    real_full_gradient_norms, update_epochs, num_minibatches,
+    clip_mode, loss_mode, vf_scale, lr, steps, clip_eps, max_grad_norm,
+    checkpoints, record_value_clip,
+):
+    """Replay one independent diagnostic branch from pre-PPO params and moments."""
+    if len(optimizer_state) != 2 or len(optimizer_state[1]) != 2:
+        raise ValueError("Expected clip_by_global_norm -> optax.adam state.")
+    critic_groups = VALUE_PROBE_C_TRAINABLE_GROUPS
+    branch_params = jax.tree_util.tree_map(lambda value: value + 0, params)
+    adam_tx = optax.adam(learning_rate=lr, eps=1e-5)
+    branch_adam_state = (
+        jax.tree_util.tree_map(
+            lambda value: value + 0, optimizer_state[1][0],
+        ),
+        optax.EmptyState(),
+    )
+    max_grad_norm = jnp.asarray(max_grad_norm, dtype=jnp.float32)
+    clip_tx = optax.clip_by_global_norm(max_grad_norm)
+    base_steps = update_epochs * num_minibatches
+
+    def value_prediction(p):
+        return apply_fn(p, init_hstate, (obs, rnn_reset))[2]
+
+    def step(step_index, carry):
+        p, adam_state, sum_grad, sum_scale, min_scale, clipped_count, sum_update = carry
+        epoch = (step_index % base_steps) // num_minibatches
+        minibatch = step_index % num_minibatches
+        h, batch_obs, reset, old, target, active = jax.tree_util.tree_map(
+            lambda value: value[epoch, minibatch], minibatches,
+        )
+
+        def value_loss(probe_params):
+            prediction = apply_fn(
+                probe_params, h.squeeze(), (batch_obs, reset),
+            )[2]
+            samples = _critic_ablation_value_loss_samples(
+                prediction, old, target, loss_mode, clip_eps,
+            )
+            return vf_scale * masked_mean(samples, active)
+
+        gradients = mask_tree_to_groups(
+            jax.grad(value_loss)(p), critic_groups,
+        )
+        critic_norm = optax.tree.norm(gradients)
+        if clip_mode == "full":
+            clip_norm = real_full_gradient_norms[epoch, minibatch]
+            below_limit = clip_norm < max_grad_norm
+            clipped_gradients = jax.tree_util.tree_map(
+                lambda value: jax.lax.select(
+                    below_limit, value,
+                    (value / jnp.maximum(clip_norm, 1e-12)) * max_grad_norm,
+                ), gradients,
+            )
+        else:
+            clip_norm = critic_norm
+            clipped_gradients, _ = clip_tx.update(
+                gradients, optax.EmptyState(), p,
+            )
+        clip_scale = jnp.where(
+            clip_norm < max_grad_norm, 1.0,
+            max_grad_norm / jnp.maximum(clip_norm, 1e-12),
+        )
+        updates, adam_state = adam_tx.update(clipped_gradients, adam_state, p)
+        updates = mask_tree_to_groups(updates, critic_groups)
+        next_params = optax.apply_updates(p, updates)
+        return (
+            next_params, adam_state, sum_grad + critic_norm,
+            sum_scale + clip_scale, jnp.minimum(min_scale, clip_scale),
+            clipped_count + (clip_scale < 1.0).astype(jnp.float32),
+            sum_update + optax.tree.norm(updates),
+        )
+
+    def checkpoint(carry, checkpoint_step):
+        state, previous = carry
+        state = jax.lax.fori_loop(previous, checkpoint_step, step, state)
+        prediction = value_prediction(state[0])
+        stats = {
+            "full": value_probe_statistics(prediction, targets, agent_active),
+            "train": value_probe_statistics(prediction, targets, train_mask),
+            "holdout": value_probe_statistics(prediction, targets, holdout_mask),
+        }
+        if record_value_clip:
+            clip_stats = critic_ablation_value_clip_statistics(
+                old_value, prediction, targets, agent_active, clip_eps,
+            )
+            return (state, checkpoint_step), (stats, clip_stats)
+        return (state, checkpoint_step), stats
+
+    initial_state = (
+        branch_params, branch_adam_state,
+        jnp.array(0.0), jnp.array(0.0), jnp.array(1.0),
+        jnp.array(0.0), jnp.array(0.0),
+    )
+    (final_state, _), curve_output = jax.lax.scan(
+        checkpoint, (initial_state, jnp.int32(0)),
+        jnp.asarray(checkpoints, dtype=jnp.int32),
+    )
+    if record_value_clip:
+        curve_statistics, clip_curve_statistics = curve_output
+    else:
+        curve_statistics = curve_output
+    final_params = final_state[0]
+    initial_stats = jax.tree_util.tree_map(
+        lambda value: value[0], curve_statistics["full"],
+    )
+    final_stats = jax.tree_util.tree_map(
+        lambda value: value[-1], curve_statistics["full"],
+    )
+    displacement = mask_tree_to_groups(
+        subtract_gradient_trees(final_params, params), critic_groups,
+    )
+    all_displacement = subtract_gradient_trees(final_params, params)
+    critic_params = mask_tree_to_groups(params, critic_groups)
+    branch = {
+        "initial": initial_stats,
+        "final": final_stats,
+        "delta": {
+            name: final_stats[name] - initial_stats[name]
+            for name in _CRITIC_ABLATION_DELTA_METRICS
+        },
+        "curve": {
+            "steps": jnp.asarray(checkpoints, dtype=jnp.int32),
+            **curve_statistics,
+        },
+        "metadata": {
+            "learning_rate": jnp.asarray(lr, dtype=jnp.float32),
+            "vf_scaling": jnp.asarray(vf_scale, dtype=jnp.float32),
+            "optimizer_steps": jnp.asarray(steps, dtype=jnp.int32),
+            "mean_critic_grad_norm": final_state[2] / steps,
+            "mean_clip_scale": final_state[3] / steps,
+            "min_clip_scale": final_state[4],
+            "clip_active_fraction": final_state[5] / steps,
+            "mean_critic_update_norm": final_state[6] / steps,
+            "critic_parameter_displacement_norm": optax.tree.norm(displacement),
+            "critic_relative_parameter_displacement": (
+                optax.tree.norm(displacement)
+                / jnp.maximum(optax.tree.norm(critic_params), 1e-12)
+            ),
+            "vision_parameter_displacement_norm": gradient_l2_norm(
+                all_displacement, "vision_encoder",
+            ),
+            "actor_parameter_displacement_norm": gradient_l2_norm(
+                all_displacement, "actor_head",
+            ) + gradient_l2_norm(
+                all_displacement, "fusion_shared_trunk",
+            ),
+            "reliability_parameter_displacement_norm": gradient_l2_norm(
+                all_displacement, "reliability_head",
+            ),
+            "holdout_in_optimizer_batch": jnp.array(True),
+        },
+    }
+    if record_value_clip:
+        branch["value_clip_curve"] = clip_curve_statistics
+    return branch
+
+
+def run_critic_optimization_ablation(
+    *, apply_fn, params, post_ppo_params, optimizer_state, rng,
+    init_hstate, obs, rnn_reset, old_value, targets, agent_active,
+    real_full_gradient_norms, update_epochs, num_minibatches,
+    current_lr, current_vf_coef, clip_eps, max_grad_norm,
+    num_environments, train_fraction, split_seed,
+):
+    """Fit isolated critic-only counterfactuals on the exact PPO actor order."""
+    actor_count = agent_active.shape[1]
+    base_steps = update_epochs * num_minibatches
+    train_mask, holdout_mask, _, _ = trajectory_train_holdout_masks(
+        agent_active, num_environments=num_environments,
+        train_fraction=train_fraction, split_seed=split_seed,
+    )
+    full_batch = (
+        init_hstate[jnp.newaxis, :], obs, rnn_reset,
+        old_value, targets, agent_active,
+    )
+    minibatches = _critic_ablation_minibatches(
+        rng, full_batch, update_epochs, num_minibatches, actor_count,
+    )
+    real_initial = value_probe_statistics(old_value, targets, agent_active)
+    real_final = value_probe_statistics(
+        apply_fn(post_ppo_params, init_hstate, (obs, rnn_reset))[2],
+        targets, agent_active,
+    )
+    specs = critic_ablation_branch_specs(
+        base_steps, current_vf_coef, current_lr,
+    )
+    branches = {}
+    real_branch = _empty_critic_ablation_branch((0, base_steps))
+    branches["REAL"] = {
+        **real_branch,
+        "initial": real_initial,
+        "final": real_final,
+        "metadata": {
+            **real_branch["metadata"],
+            "holdout_in_optimizer_batch": jnp.array(True),
+        },
+        "delta": {
+            name: real_final[name] - real_initial[name]
+            for name in _CRITIC_ABLATION_DELTA_METRICS
+        },
+    }
+
+    for branch_name, (clip_mode, loss_mode, vf_scale, lr, steps) in specs.items():
+        checkpoints = critic_ablation_checkpoint_steps(branch_name, steps)
+        branches[branch_name] = _run_critic_ablation_branch(
+            apply_fn=apply_fn, params=params, optimizer_state=optimizer_state,
+            minibatches=minibatches, init_hstate=init_hstate,
+            obs=obs, rnn_reset=rnn_reset, old_value=old_value,
+            targets=targets, agent_active=agent_active,
+            train_mask=train_mask, holdout_mask=holdout_mask,
+            real_full_gradient_norms=real_full_gradient_norms,
+            update_epochs=update_epochs, num_minibatches=num_minibatches,
+            clip_mode=clip_mode, loss_mode=loss_mode, vf_scale=vf_scale,
+            lr=lr, steps=steps, clip_eps=clip_eps,
+            max_grad_norm=max_grad_norm, checkpoints=checkpoints,
+            record_value_clip=branch_name in ("O3", "O4"),
+        )
+
+    ev = lambda name, stage: branches[name][stage]["explained_variance"]
+    return {
+        "enabled": jnp.array(True),
+        "active": jnp.array(True),
+        "skipped_by_schedule": jnp.array(False),
+        "not_applicable": jnp.array(False),
+        "branches": branches,
+        "comparisons": {
+            "O1_minus_REAL_delta_ev": (
+                branches["O1"]["delta"]["explained_variance"]
+                - branches["REAL"]["delta"]["explained_variance"]
+            ),
+            "O2_minus_O1_final_ev": ev("O2", "final") - ev("O1", "final"),
+            "O2_150_minus_O2_final_ev": ev("O2_150", "final") - ev("O2", "final"),
+            "O3_minus_O2_final_ev": ev("O3", "final") - ev("O2", "final"),
+            "O4_minus_O3_final_ev": ev("O4", "final") - ev("O3", "final"),
+            "O5_minus_O4_final_ev": ev("O5", "final") - ev("O4", "final"),
+            "O6_minus_O5_final_ev": ev("O6", "final") - ev("O5", "final"),
+        },
+    }
+
+
+def empty_value_clip_eps_sweep_diagnostics(
+    *, enabled=False, skipped_by_schedule=False, not_applicable=False,
+):
+    return {
+        "enabled": jnp.asarray(enabled, dtype=jnp.bool_),
+        "active": jnp.array(False),
+        "skipped_by_schedule": jnp.asarray(skipped_by_schedule, dtype=jnp.bool_),
+        "not_applicable": jnp.asarray(not_applicable, dtype=jnp.bool_),
+        "branches": {
+            name: _empty_critic_ablation_branch(
+                CRITIC_ABLATION_VALUE_CLIP_CURVE_STEPS,
+                include_value_clip_curve=True,
+            )
+            for name in VALUE_CLIP_EPS_SWEEP_BRANCHES
+        },
+    }
+
+
+def run_value_clip_eps_sweep(
+    *, apply_fn, params, optimizer_state, rng, init_hstate,
+    obs, rnn_reset, old_value, targets, agent_active,
+    update_epochs, num_minibatches, current_lr, max_grad_norm,
+    num_environments, train_fraction, split_seed, policy_clip_eps,
+):
+    """Run independent O3-equivalent value-clip thresholds on copied state."""
+    if update_epochs * num_minibatches != 32:
+        raise ValueError("Value-clip sweep requires exactly 32 PPO minibatch steps.")
+    if float(policy_clip_eps) != 0.2:
+        raise ValueError("Value-clip sweep requires unchanged policy CLIP_EPS=0.2.")
+    actor_count = agent_active.shape[1]
+    train_mask, holdout_mask, _, _ = trajectory_train_holdout_masks(
+        agent_active, num_environments=num_environments,
+        train_fraction=train_fraction, split_seed=split_seed,
+    )
+    full_batch = (
+        init_hstate[jnp.newaxis, :], obs, rnn_reset,
+        old_value, targets, agent_active,
+    )
+    minibatches = _critic_ablation_minibatches(
+        rng, full_batch, update_epochs, num_minibatches, actor_count,
+    )
+    branches = {}
+    for branch_name, value_eps in zip(
+        VALUE_CLIP_EPS_SWEEP_BRANCHES,
+        (*VALUE_CLIP_EPS_SWEEP, None),
+    ):
+        branches[branch_name] = _run_critic_ablation_branch(
+            apply_fn=apply_fn, params=params, optimizer_state=optimizer_state,
+            minibatches=minibatches, init_hstate=init_hstate,
+            obs=obs, rnn_reset=rnn_reset, old_value=old_value,
+            targets=targets, agent_active=agent_active,
+            train_mask=train_mask, holdout_mask=holdout_mask,
+            real_full_gradient_norms=None,
+            update_epochs=update_epochs, num_minibatches=num_minibatches,
+            clip_mode="critic",
+            loss_mode="plain_mse" if value_eps is None else "ppo_clipped",
+            vf_scale=1.0, lr=current_lr, steps=32,
+            clip_eps=policy_clip_eps if value_eps is None else value_eps,
+            max_grad_norm=max_grad_norm,
+            checkpoints=CRITIC_ABLATION_VALUE_CLIP_CURVE_STEPS,
+            record_value_clip=True,
+        )
+    return {
+        "enabled": jnp.array(True),
+        "active": jnp.array(True),
+        "skipped_by_schedule": jnp.array(False),
+        "not_applicable": jnp.array(False),
+        "branches": branches,
+    }
+
+
+def format_value_clip_eps_sweep_diagnostics(diagnostics, *, update):
+    if not _host_bool(diagnostics["enabled"]):
+        return [], {}
+    if _host_bool(diagnostics["not_applicable"]):
+        return [f"CRITIC_VALUE_CLIP_SWEEP update={update} status=not_applicable"], {}
+    if _host_bool(diagnostics["skipped_by_schedule"]) or not _host_bool(
+        diagnostics["active"]
+    ):
+        return [], {}
+    lines, values = [], {}
+    baseline = diagnostics["branches"]["eps_0p2"]["final"]
+    for branch_name, value_eps in zip(
+        VALUE_CLIP_EPS_SWEEP_BRANCHES,
+        (*VALUE_CLIP_EPS_SWEEP, None),
+    ):
+        branch = diagnostics["branches"][branch_name]
+        label = "no_clip" if value_eps is None else f"{value_eps:.1f}"
+        mode = "hypothetical" if value_eps is None else "actual"
+        curve = branch["curve"]
+        for index, step in enumerate(curve["steps"]):
+            fit = {
+                name: _host_scalar(column[index])
+                for name, column in curve["full"].items()
+            }
+            clip = {
+                name: _host_scalar(column[index])
+                for name, column in branch["value_clip_curve"].items()
+            }
+            if value_eps is None:
+                clip = {
+                    (f"would_be_{name}" if name in (
+                        "clip_saturated_rate", "clipped_branch_selected_rate",
+                        "unclipped_branch_selected_rate", "branch_tie_rate",
+                        "value_gradient_locked_rate",
+                    ) else name): value
+                    for name, value in clip.items()
+                }
+            scalars = {**fit, **clip}
+            values.update({
+                f"{branch_name}/step_{int(step)}/{name}": value
+                for name, value in scalars.items()
+            })
+            lines.append(" ".join(
+                ["CRITIC_VALUE_CLIP_SWEEP", f"update={update}",
+                 "status=active", f"eps={label}", f"step={int(step)}",
+                 "split=full", f"clip_evaluation={mode}"]
+                + [f"{name}={value:.6g}" for name, value in scalars.items()]
+            ))
+        metadata = {
+            name: _host_scalar(value)
+            for name, value in branch["metadata"].items()
+        }
+        final = branch["final"]
+        summary = {
+            "final_ev": _host_scalar(final["explained_variance"]),
+            "delta_ev": _host_scalar(branch["delta"]["explained_variance"]),
+            "final_amp_ratio": _host_scalar(
+                final["prediction_std_to_target_std_ratio"]
+            ),
+            "final_rmse": _host_scalar(final["rmse"]),
+            "final_value_gradient_locked_rate": _host_scalar(
+                branch["value_clip_curve"]["value_gradient_locked_rate"][-1]
+            ),
+            "final_clip_saturated_rate": _host_scalar(
+                branch["value_clip_curve"]["clip_saturated_rate"][-1]
+            ),
+            "delta_final_ev_vs_eps_0p2": _host_scalar(
+                final["explained_variance"] - baseline["explained_variance"]
+            ),
+            "delta_rmse_vs_eps_0p2": _host_scalar(
+                final["rmse"] - baseline["rmse"]
+            ),
+            "delta_amp_ratio_vs_eps_0p2": _host_scalar(
+                final["prediction_std_to_target_std_ratio"]
+                - baseline["prediction_std_to_target_std_ratio"]
+            ),
+        }
+        if value_eps is None:
+            summary["would_be_value_gradient_locked_rate"] = summary.pop(
+                "final_value_gradient_locked_rate"
+            )
+            summary["would_be_clip_saturated_rate"] = summary.pop(
+                "final_clip_saturated_rate"
+            )
+        scalars = {**summary, **metadata}
+        values.update({
+            f"{branch_name}/summary/{name}": value
+            for name, value in scalars.items()
+        })
+        lines.append(" ".join(
+            ["CRITIC_VALUE_CLIP_SWEEP_SUMMARY", f"update={update}",
+             "status=active", f"eps={label}", f"clip_evaluation={mode}"]
+            + [f"{name}={value:.6g}" for name, value in scalars.items()]
+        ))
+    return lines, values
+
+
+def format_critic_optimization_ablation_diagnostics(diagnostics, *, update):
+    """Emit parseable host-side lines; no callback or host work in the scan."""
+    if not _host_bool(diagnostics["enabled"]):
+        return [], {}
+    if _host_bool(diagnostics["not_applicable"]):
+        return [f"CRITIC_OPT_ABLATION update={update} status=not_applicable"], {}
+    if _host_bool(diagnostics["skipped_by_schedule"]):
+        return [], {}
+    if not _host_bool(diagnostics["active"]):
+        return [], {}
+    lines, values = [], {}
+    for branch_name in CRITIC_ABLATION_BRANCHES:
+        branch = diagnostics["branches"][branch_name]
+        for stage in ("initial", "final"):
+            stats = branch[stage]
+            scalars = {name: _host_scalar(value) for name, value in stats.items()}
+            values.update({
+                f"{branch_name}/{stage}/{name}": value
+                for name, value in scalars.items()
+            })
+            lines.append(" ".join(
+                ["CRITIC_OPT_ABLATION", f"update={update}", "status=active",
+                 f"branch={branch_name}", f"stage={stage}"]
+                + [f"{name}={value:.6g}" for name, value in scalars.items()]
+            ))
+        delta_values = {
+            name: _host_scalar(value) for name, value in branch["delta"].items()
+        }
+        metadata_values = {
+            name: _host_scalar(value) for name, value in branch["metadata"].items()
+        }
+        values.update({
+            f"{branch_name}/delta/{name}": value
+            for name, value in delta_values.items()
+        })
+        values.update({
+            f"{branch_name}/metadata/{name}": value
+            for name, value in metadata_values.items()
+        })
+        lines.append(" ".join(
+            ["CRITIC_OPT_ABLATION", f"update={update}", "status=active",
+             f"branch={branch_name}", "stage=summary"]
+            + [f"delta_{name}={value:.6g}" for name, value in delta_values.items()]
+            + [f"{name}={value:.6g}" for name, value in metadata_values.items()]
+        ))
+        if branch_name in ("O2_150", "O6"):
+            curve = branch["curve"]
+            for index, step in enumerate(curve["steps"]):
+                for split in ("train", "holdout"):
+                    scalars = {
+                        name: _host_scalar(column[index])
+                        for name, column in curve[split].items()
+                    }
+                    values.update({
+                        f"{branch_name}/curve/step_{int(step)}/{split}/{name}": value
+                        for name, value in scalars.items()
+                    })
+                    lines.append(" ".join(
+                        ["CRITIC_OPT_ABLATION_CURVE", f"update={update}",
+                         "status=active", f"branch={branch_name}",
+                         f"step={int(step)}", f"split={split}"]
+                        + [f"{name}={value:.6g}" for name, value in scalars.items()]
+                    ))
+        if branch_name in ("O3", "O4"):
+            curve = branch["curve"]
+            for index, step in enumerate(curve["steps"]):
+                clip_scalars = {
+                    name: _host_scalar(column[index])
+                    for name, column in branch["value_clip_curve"].items()
+                }
+                if branch_name == "O4":
+                    clip_scalars = {
+                        (f"would_be_{name}" if name in (
+                            "clip_saturated_rate", "clipped_branch_selected_rate",
+                            "unclipped_branch_selected_rate", "branch_tie_rate",
+                            "value_gradient_locked_rate",
+                        ) else name): value
+                        for name, value in clip_scalars.items()
+                    }
+                fit_scalars = {
+                    name: _host_scalar(curve["full"][name][index])
+                    for name in (
+                        "explained_variance", "rmse", "mae",
+                        "prediction_std_to_target_std_ratio",
+                    )
+                }
+                scalars = {**clip_scalars, **fit_scalars}
+                values.update({
+                    f"{branch_name}/value_clip_curve/step_{int(step)}/{name}": value
+                    for name, value in scalars.items()
+                })
+                lines.append(" ".join(
+                    ["CRITIC_OPT_VALUE_CLIP_CURVE", f"update={update}",
+                     "status=active", f"branch={branch_name}",
+                     f"step={int(step)}", "split=full",
+                     f"objective={'ppo_clipped' if branch_name == 'O3' else 'plain_mse'}",
+                     f"clip_evaluation={'actual' if branch_name == 'O3' else 'hypothetical'}"]
+                    + [f"{name}={value:.6g}" for name, value in scalars.items()]
+                ))
+    comparisons = {
+        name: _host_scalar(value)
+        for name, value in diagnostics["comparisons"].items()
+    }
+    values.update({f"comparison/{name}": value for name, value in comparisons.items()})
+    lines.append(" ".join(
+        ["CRITIC_OPT_ABLATION_COMPARISON", f"update={update}", "status=active"]
+        + [f"{name}={value:.6g}" for name, value in comparisons.items()]
+    ))
+    return lines, values
 
 
 def _empty_actor_critic_group_metrics(
@@ -2204,6 +3185,53 @@ def format_critic_optimizer_diagnostics(
     return lines, values
 
 
+def format_value_fit_diagnostics(
+    diagnostics: Mapping[str, Any], *, update: int,
+) -> tuple[list[str], dict[str, float]]:
+    """Format lightweight value-fit metrics outside the jitted update."""
+    if not _host_bool(diagnostics["enabled"]):
+        return [f"VALUE_FIT_DIAG update={update} status=disabled"], {}
+    if _host_bool(diagnostics["not_applicable"]):
+        return [
+            f"VALUE_FIT_DIAG update={update} status=not_applicable reason=no_execution_agent"
+        ], {}
+
+    names = tuple(_empty_value_fit_statistics())
+    lines = []
+    values = {}
+    for phase in ("pre_ppo", "post_ppo"):
+        statistics = diagnostics["pre" if phase == "pre_ppo" else "post"]
+        if phase == "post_ppo" and not _host_bool(statistics["active"]):
+            lines.append(
+                f"VALUE_FIT_DIAG update={update} phase=post_ppo status=skipped_by_schedule"
+            )
+            continue
+        scalars = {name: _host_scalar(statistics[name]) for name in names}
+        values.update({f"{phase}/{name}": value for name, value in scalars.items()})
+        lines.append(" ".join(
+            ["VALUE_FIT_DIAG", f"update={update}", f"phase={phase}"]
+            + [
+                f"{name}={str(bool(scalars[name])).lower()}"
+                if name == "explained_variance_valid" else f"{name}={scalars[name]:.6g}"
+                for name in names
+            ]
+        ))
+    if _host_bool(diagnostics["post"]["active"]):
+        deltas = {
+            f"delta_{name}": _host_scalar(diagnostics["delta"][name])
+            for name in VALUE_FIT_DELTA_METRICS
+        }
+        values.update({
+            f"delta/{name}": _host_scalar(diagnostics["delta"][name])
+            for name in VALUE_FIT_DELTA_METRICS
+        })
+        lines.append(" ".join(
+            ["VALUE_FIT_DELTA", f"update={update}"]
+            + [f"{name}={value:.6g}" for name, value in deltas.items()]
+        ))
+    return lines, values
+
+
 def format_value_representation_probe_diagnostics(
     diagnostics: Mapping[str, Any],
     *,
@@ -2233,6 +3261,10 @@ def format_value_representation_probe_diagnostics(
         "probes_start_identical": float(
             _host_bool(diagnostics["probes_start_identical"])
         ),
+        "probe_c_applicable": float(_host_bool(diagnostics["probe_c_applicable"])),
+        "probe_c_starts_identical": float(
+            _host_bool(diagnostics["probe_c_starts_identical"])
+        ),
     }
     if not enabled:
         return [f"VALUE_REP_PROBE update={update} status=disabled"], values
@@ -2249,7 +3281,11 @@ def format_value_representation_probe_diagnostics(
 
     lines = []
     statistic_names = tuple(_empty_value_probe_statistics())
-    for probe_name in ("probe_a", "probe_b"):
+    probe_c_applicable = _host_bool(diagnostics["probe_c_applicable"])
+    probe_names = ("probe_a", "probe_b") + (
+        ("probe_c",) if probe_c_applicable else ()
+    )
+    for probe_name in probe_names:
         for split_name in ("train", "holdout"):
             for stage_name in ("initial", "final"):
                 statistics = diagnostics[probe_name][split_name][stage_name]
@@ -2286,9 +3322,41 @@ def format_value_representation_probe_diagnostics(
                 _host_scalar(value)
             )
 
+    if not probe_c_applicable:
+        lines.append(
+            f"VALUE_REP_PROBE update={update} status=not_applicable "
+            f"agent={agent} probe=probe_c reason=legacy_architecture"
+        )
+    else:
+        curve = diagnostics["probe_c_curve"]
+        for index, step in enumerate(curve["steps"]):
+            for split_name in ("train", "holdout"):
+                statistic_values = {
+                    name: _host_scalar(curve[split_name][name][index])
+                    for name in statistic_names
+                }
+                prefix = f"probe_c/curve/step_{int(step)}/{split_name}"
+                values.update({
+                    f"{prefix}/{name}": value
+                    for name, value in statistic_values.items()
+                })
+                lines.append(" ".join(
+                    [
+                        "VALUE_REP_PROBE_CURVE", f"update={update}",
+                        "status=active", f"agent={agent}", "probe=probe_c",
+                        f"step={int(step)}", f"split={split_name}",
+                    ] + [
+                        f"{name}={value:.6g}"
+                        for name, value in statistic_values.items()
+                    ]
+                ))
+
     comparison_values = {
         name: _host_scalar(value)
         for name, value in diagnostics["comparison"].items()
+        if probe_c_applicable or name not in (
+            "c_minus_a_final_holdout_ev", "b_minus_c_final_holdout_ev",
+        )
     }
     values.update(
         {f"comparison/{name}": value for name, value in comparison_values.items()}
