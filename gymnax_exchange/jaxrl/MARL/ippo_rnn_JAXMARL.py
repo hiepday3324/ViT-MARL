@@ -82,6 +82,7 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     empty_value_clip_eps_sweep_diagnostics,
     empty_gradient_interaction_diagnostics,
     empty_value_representation_probe_diagnostics,
+    empty_reliability_capacity_probe_diagnostics,
     empty_value_fit_diagnostics,
     empty_value_clip_diagnostics,
     format_actor_critic_gradient_diagnostics,
@@ -90,15 +91,18 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     format_value_clip_eps_sweep_diagnostics,
     format_gradient_interaction_diagnostics,
     format_value_representation_probe_diagnostics,
+    format_reliability_capacity_probe_diagnostics,
     format_value_fit_diagnostics,
     format_value_clip_diagnostics,
     gradient_diag_should_run,
+    mask_tree_excluding_groups,
     subtract_gradient_trees,
     summarize_actor_critic_gradient_interaction,
     summarize_critic_optimizer_diagnostics,
     summarize_gradient_interaction,
     summarize_phasic_gradient_interaction,
     run_value_representation_probe,
+    run_reliability_capacity_probe,
     run_critic_optimization_ablation,
     run_value_clip_eps_sweep,
     resolve_value_clip_eps,
@@ -112,6 +116,7 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     validate_gradient_diag_config,
     validate_required_parameter_groups,
     validate_value_representation_probe_config,
+    validate_reliability_capacity_probe_config,
     validate_value_clip_diag_config,
     value_clip_diag_should_run,
 )
@@ -140,6 +145,30 @@ import functools
 import matplotlib.pyplot as plt
 
 
+def maybe_mask_reliability_ppo_grads(
+    grads,
+    *,
+    agent_is_execution,
+    use_reliability_head,
+    detach_reliability_from_policy_gradient,
+):
+    if (
+        agent_is_execution
+        and use_reliability_head
+        and detach_reliability_from_policy_gradient
+    ):
+        return mask_tree_excluding_groups(grads, ("reliability_head",))
+    return grads
+
+
+def validate_reliability_ppo_gradient_ablation(config, *, phasic_mode):
+    enabled = bool(config.get("detach_reliability_from_policy_gradient", False))
+    if enabled and not phasic_mode:
+        raise ValueError(
+            "detach_reliability_from_policy_gradient requires "
+            "reliability_optimization_mode=phasic"
+        )
+    return enabled
 
 class ScannedRNN(nn.Module):
     @functools.partial(
@@ -509,6 +538,12 @@ def make_train(config):
     value_representation_probe_config = (
         validate_value_representation_probe_config(config)
     )
+    reliability_capacity_probe_enabled = bool(
+        config.get("enable_reliability_capacity_probe", False)
+    )
+    reliability_capacity_probe_config = (
+        validate_reliability_capacity_probe_config(config)
+    )
     value_fit_diag_enabled = bool(config.get("enable_value_fit_diag", False))
     critic_ablation_enabled = bool(
         config.get("enable_critic_optimization_ablation", False)
@@ -615,6 +650,9 @@ def make_train(config):
         execution_actor_count=execution_actor_count,
     )
     phasic_mode = phasic_settings.enabled
+    detach_reliability_from_policy_gradient = (
+        validate_reliability_ppo_gradient_ablation(config, phasic_mode=phasic_mode)
+    )
     print(
         "RELIABILITY_OPTIMIZATION_CONFIG",
         f"mode={phasic_settings.mode}",
@@ -1561,6 +1599,76 @@ def make_train(config):
                     operand=None,
                 )
 
+            reliability_capacity_probe_diag = empty_reliability_capacity_probe_diagnostics(
+                enabled=reliability_capacity_probe_enabled,
+                not_applicable=(
+                    reliability_capacity_probe_enabled
+                    and (
+                        execution_index is None
+                        or not config.get("use_reliability_head", False)
+                        or not config.get("use_survival_loss", False)
+                    )
+                ),
+                steps=reliability_capacity_probe_config["steps"],
+                learning_rate=reliability_capacity_probe_config["learning_rate"],
+                train_fraction=reliability_capacity_probe_config["train_fraction"],
+                split_seed=reliability_capacity_probe_config["split_seed"],
+                curve_steps=reliability_capacity_probe_config["curve_steps"],
+            )
+            if (
+                reliability_capacity_probe_enabled
+                and execution_index is not None
+                and config.get("use_reliability_head", False)
+                and config.get("use_survival_loss", False)
+            ):
+                capacity_scheduled = jnp.any(
+                    jnp.asarray(update_steps, dtype=jnp.int32)
+                    == jnp.asarray(
+                        reliability_capacity_probe_config["updates"], dtype=jnp.int32,
+                    )
+                )
+                capacity_state = train_states[execution_index]
+                capacity_trajectory = traj_batch[execution_index]
+
+                def _capacity_apply(probe_params, probe_hstate, probe_obs, probe_reset):
+                    _, _, _, _, aux = capacity_state.apply_fn(
+                        probe_params, probe_hstate, (probe_obs, probe_reset),
+                    )
+                    return aux["reliability_scores"], aux["reliability_logits"]
+
+                def _run_capacity_probe(_):
+                    return run_reliability_capacity_probe(
+                        _capacity_apply, capacity_state.params,
+                        initial_hstates[execution_index],
+                        capacity_trajectory.obs, capacity_trajectory.rnn_reset,
+                        survival_labels[execution_index],
+                        survival_masks[execution_index],
+                        survival_task_side_masks[execution_index],
+                        capacity_trajectory.agent_active,
+                        num_environments=config["NUM_ENVS"],
+                        steps=reliability_capacity_probe_config["steps"],
+                        learning_rate=reliability_capacity_probe_config["learning_rate"],
+                        train_fraction=reliability_capacity_probe_config["train_fraction"],
+                        split_seed=reliability_capacity_probe_config["split_seed"],
+                        curve_steps=reliability_capacity_probe_config["curve_steps"],
+                        loss_type=config.get("reliability_loss_type", "bce"),
+                        eps=config.get("survival_eps", 1e-8),
+                    )
+
+                reliability_capacity_probe_diag = jax.lax.cond(
+                    capacity_scheduled,
+                    _run_capacity_probe,
+                    lambda _: empty_reliability_capacity_probe_diagnostics(
+                        enabled=True, skipped_by_schedule=True,
+                        steps=reliability_capacity_probe_config["steps"],
+                        learning_rate=reliability_capacity_probe_config["learning_rate"],
+                        train_fraction=reliability_capacity_probe_config["train_fraction"],
+                        split_seed=reliability_capacity_probe_config["split_seed"],
+                        curve_steps=reliability_capacity_probe_config["curve_steps"],
+                    ),
+                    operand=None,
+                )
+
             # UPDATE NETWORKS
             # FIXME: APPLY VISION, GATED-FUSION
             loss_infos = []
@@ -1590,6 +1698,12 @@ def make_train(config):
             for i, train_state in enumerate(train_states):
                 agent_is_execution = _is_execution_agent(env.list_of_agents_configs[i])
                 agent_is_box = isinstance(env.action_spaces[i], spaces.Box)
+                mask_ppo_grads = functools.partial(
+                    maybe_mask_reliability_ppo_grads,
+                    agent_is_execution=agent_is_execution,
+                    use_reliability_head=config.get("use_reliability_head", False),
+                    detach_reliability_from_policy_gradient=detach_reliability_from_policy_gradient,
+                )
                 ppo_objective_survival_weight = ppo_survival_loss_weight(
                     phasic_settings,
                     config.get("lambda_surv", 0.0),
@@ -2107,6 +2221,7 @@ def make_train(config):
                             surv_mask,
                             ppo_objective_survival_weight,
                         )
+                        grads = mask_ppo_grads(grads)
                         loss_value, loss_aux = total_loss
                         (
                             loss_metrics,
@@ -2132,6 +2247,7 @@ def make_train(config):
                                         surv_labels,
                                         surv_mask,
                                     )
+                                    ppo_grads = mask_ppo_grads(ppo_grads)
                                     survival_grads = jax.grad(
                                         _survival_objective
                                     )(
@@ -2214,6 +2330,7 @@ def make_train(config):
                                     surv_labels,
                                     surv_mask,
                                 )
+                                policy_grads = mask_ppo_grads(policy_grads)
                                 value_grads_raw = jax.grad(
                                     _value_objective_raw
                                 )(
@@ -2234,6 +2351,7 @@ def make_train(config):
                                     surv_labels,
                                     surv_mask,
                                 )
+                                ppo_grads = mask_ppo_grads(ppo_grads)
                                 return summarize_actor_critic_gradient_interaction(
                                     train_state.params,
                                     grads,
@@ -2270,6 +2388,7 @@ def make_train(config):
                                     surv_labels,
                                     surv_mask,
                                 )
+                                policy_grads = mask_ppo_grads(policy_grads)
                                 value_grads_raw = jax.grad(
                                     _value_objective_raw
                                 )(
@@ -2864,6 +2983,7 @@ def make_train(config):
             metrics["value_representation_probe"] = (
                 value_representation_probe_diag
             )
+            metrics["reliability_capacity_probe"] = reliability_capacity_probe_diag
             metrics["value_fit_diag"] = value_fit_diag
             metrics["phasic_aux_diag"] = phasic_aux_diags
             metrics["ppo_safety_diag"] = ppo_safety_diags
@@ -3674,6 +3794,7 @@ def make_train(config):
                 critic_optimizer_wandb_metrics = {}
                 critic_ablation_wandb_metrics = {}
                 value_representation_probe_wandb_metrics = {}
+                reliability_capacity_probe_wandb_metrics = {}
                 value_fit_wandb_metrics = {}
                 phasic_wandb_metrics = {}
                 print("[VALUE FIT]")
@@ -3778,6 +3899,17 @@ def make_train(config):
                         f"value_representation_probe/{key}": value
                         for key, value in value_probe_values.items()
                     }
+                    capacity_lines, capacity_values = (
+                        format_reliability_capacity_probe_diagnostics(
+                            metric["reliability_capacity_probe"], update=update_idx,
+                        )
+                    )
+                    for line in capacity_lines:
+                        print(line)
+                    reliability_capacity_probe_wandb_metrics = {
+                        f"reliability_capacity_probe/{key}": value
+                        for key, value in capacity_values.items()
+                    }
                     survival_loss_pre_ppo = None
                     if (
                         phasic_settings.mode == "phasic"
@@ -3859,6 +3991,7 @@ def make_train(config):
                         logging_dict.update(
                             value_representation_probe_wandb_metrics
                         )
+                        logging_dict.update(reliability_capacity_probe_wandb_metrics)
                         logging_dict.update(value_fit_wandb_metrics)
                         logging_dict.update(phasic_wandb_metrics)
                         logging_dict.update(box_ppo_wandb_metrics)

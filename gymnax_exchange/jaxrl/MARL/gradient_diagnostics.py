@@ -12,6 +12,7 @@ from flax.core import FrozenDict, freeze, unfreeze
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 from gymnax_exchange.jaxrl.MARL.ppo_lifecycle import masked_mean
+from gymnax_exchange.jaxrl.MARL.reliability_targets import masked_reliability_loss
 
 
 GRADIENT_GROUPS = (
@@ -185,6 +186,7 @@ _RELIABILITY_HEAD = _PARAMS + (
 )
 _VISION_ENCODER = _PARAMS + ("VisionAgent_0",)
 _RELIABILITY_FUSION = _PARAMS + ("ReliabilityFusionRNN_0",)
+_RELIABILITY_ACTOR_GRU = _RELIABILITY_FUSION + ("GRUCell_0",)
 _CRITIC_REPRESENTATION = _PARAMS + ("CriticValueRNN_0",)
 _ACTOR_DENSE_MODULES = frozenset(("Dense_0", "Dense_1"))
 _CRITIC_DENSE_MODULES = frozenset(("Dense_2", "Dense_3"))
@@ -198,6 +200,11 @@ PARAMETER_GROUP_RULES = {
         "prefix=params/ReliabilityFusionRNN_0 excluding "
         "LevelWiseReliabilityHead_0; or actor-only ActorEmbedding, "
         "StableGatedCrossAttention_0, ScannedRNN_0"
+    ),
+    "reliability_actor_gru": "prefix=params/ReliabilityFusionRNN_0/GRUCell_0",
+    "reliability_actor_fusion_non_gru": (
+        "prefix=params/ReliabilityFusionRNN_0/StableGatedCrossAttention_0 "
+        "or params/ReliabilityFusionRNN_0/Dense_0"
     ),
     "actor_head": "prefix=params/Dense_0 or params/Dense_1; exact=params/log_std",
     "critic_head": "prefix=params/Dense_2 or params/Dense_3",
@@ -251,6 +258,13 @@ def parameter_path_in_group(path: Sequence[Any], group: str) -> bool:
         )) or any(
             _has_prefix(path, _PARAMS + (module,))
             for module in ("ActorEmbedding", "StableGatedCrossAttention_0", "ScannedRNN_0")
+        )
+    if group == "reliability_actor_gru":
+        return _has_prefix(path, _RELIABILITY_ACTOR_GRU)
+    if group == "reliability_actor_fusion_non_gru":
+        return any(
+            _has_prefix(path, _RELIABILITY_FUSION + (module,))
+            for module in ("StableGatedCrossAttention_0", "Dense_0")
         )
     if group == "critic_representation":
         return _has_prefix(path, _CRITIC_REPRESENTATION)
@@ -364,7 +378,10 @@ def matching_parameter_paths(
 def parameter_group_leaf_counts(tree: Mapping[str, Any]) -> dict[str, int]:
     return {
         group: len(matching_parameter_paths(tree, group))
-        for group in GRADIENT_GROUPS + ("critic_representation",)
+        for group in GRADIENT_GROUPS + (
+            "critic_representation", "reliability_actor_gru",
+            "reliability_actor_fusion_non_gru",
+        )
     }
 
 
@@ -571,6 +588,456 @@ def trajectory_train_holdout_masks(
         train_environment_count,
         num_environments - train_environment_count,
     )
+
+
+RELIABILITY_CAPACITY_PROBE_GROUPS = {
+    "probe_a": ("reliability_head",),
+    "probe_b": ("reliability_head", "vision_encoder"),
+    "probe_c": ("reliability_head", "vision_encoder", "fusion_shared_trunk"),
+    "probe_d": ("reliability_head", "vision_encoder", "reliability_actor_gru"),
+}
+RELIABILITY_CAPACITY_PARAMETER_GROUPS = (
+    "reliability_head", "vision_encoder", "fusion_shared_trunk",
+    "reliability_actor_gru", "reliability_actor_fusion_non_gru",
+    "actor_head", "critic_representation", "critic_head",
+)
+RELIABILITY_CAPACITY_SCOPES = ("ALL_VALID", "TOP3_TASK_SIDE")
+
+
+def reliability_capacity_curve_checkpoints(steps: int, checkpoints=None):
+    """Normalize static cumulative checkpoints and include both endpoints."""
+    steps = int(steps)
+    if steps < 1:
+        raise ValueError("reliability_capacity_probe_steps must be >= 1.")
+    if checkpoints is None:
+        checkpoints = (0, steps)
+    checkpoints = tuple(checkpoints)
+    if any(
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, np.integer))
+        for value in checkpoints
+    ):
+        raise ValueError("reliability_capacity_probe_curve_steps must contain integers.")
+    if len(set(checkpoints)) != len(checkpoints):
+        raise ValueError("reliability_capacity_probe_curve_steps must be unique.")
+    if any(value < 0 or value > steps for value in checkpoints):
+        raise ValueError(
+            "reliability_capacity_probe_curve_steps must lie within [0, probe_steps]."
+        )
+    return tuple(sorted(set(checkpoints) | {0, steps}))
+
+
+def validate_reliability_capacity_probe_config(config: Mapping[str, Any]):
+    updates = tuple(int(value) for value in config.get(
+        "reliability_capacity_probe_updates", (5, 10, 15),
+    ))
+    steps = int(config.get("reliability_capacity_probe_steps", 150))
+    learning_rate = float(config.get("reliability_capacity_probe_lr", 0.001))
+    train_fraction = float(config.get("reliability_capacity_probe_train_fraction", 0.8))
+    split_seed = int(config.get("reliability_capacity_probe_split_seed", 0))
+    if not updates or any(value < 0 for value in updates) or len(set(updates)) != len(updates):
+        raise ValueError("reliability_capacity_probe_updates must be unique non-negative indices.")
+    if steps < 1:
+        raise ValueError("reliability_capacity_probe_steps must be >= 1.")
+    if not np.isfinite(learning_rate) or learning_rate <= 0:
+        raise ValueError("reliability_capacity_probe_lr must be finite and > 0.")
+    if not np.isfinite(train_fraction) or not 0 < train_fraction < 1:
+        raise ValueError("reliability_capacity_probe_train_fraction must be between 0 and 1.")
+    if split_seed < 0:
+        raise ValueError("reliability_capacity_probe_split_seed must be non-negative.")
+    curve_steps = reliability_capacity_curve_checkpoints(
+        steps, config.get("reliability_capacity_probe_curve_steps", (0, steps)),
+    )
+    return {
+        "updates": updates, "steps": steps, "learning_rate": learning_rate,
+        "train_fraction": train_fraction, "split_seed": split_seed,
+        "curve_steps": curve_steps,
+    }
+
+
+def reliability_top3_task_side_mask(valid_mask, task_side_mask):
+    valid = jnp.asarray(valid_mask, dtype=jnp.bool_)
+    task_side = jnp.asarray(task_side_mask, dtype=jnp.bool_)
+    if valid.ndim != 4 or task_side.shape != valid.shape:
+        raise ValueError("Reliability masks must have shape [time, actor, level, side].")
+    current_rank_top3 = jnp.arange(valid.shape[2])[:, None] < 3
+    return valid & task_side & current_rank_top3
+
+
+def _aligned_reliability_scores(scores, labels):
+    if scores.shape == labels.shape + (1,):
+        return jnp.squeeze(scores, axis=-1)
+    if scores.shape != labels.shape:
+        raise ValueError("Reliability scores and labels have incompatible shapes.")
+    return scores
+
+
+def reliability_capacity_statistics(scores, logits, labels, mask, *, eps=1e-8):
+    scores = jnp.asarray(_aligned_reliability_scores(scores, labels), dtype=jnp.float32)
+    labels = jnp.asarray(labels, dtype=jnp.float32)
+    mask = jnp.asarray(mask, dtype=jnp.bool_)
+    if mask.shape != labels.shape:
+        raise ValueError("Reliability evaluation mask must match labels.")
+    count = jnp.sum(mask.astype(jnp.float32))
+    score_mean = masked_mean(scores, mask)
+    target_mean = masked_mean(labels, mask)
+    score_var = masked_mean(jnp.square(scores - score_mean), mask)
+    target_var = masked_mean(jnp.square(labels - target_mean), mask)
+    score_std = jnp.sqrt(jnp.maximum(score_var, 0.0))
+    target_std = jnp.sqrt(jnp.maximum(target_var, 0.0))
+    covariance = masked_mean((scores - score_mean) * (labels - target_mean), mask)
+    correlation_valid = (count > 1) & (score_std > eps) & (target_std > eps)
+    correlation = jnp.where(
+        correlation_valid,
+        covariance / jnp.maximum(score_std * target_std, eps),
+        0.0,
+    )
+    error = scores - labels
+    mse = masked_mean(jnp.square(error), mask)
+    low = mask & (labels <= 0.2)
+    high = mask & (labels >= 0.8)
+    low_count = jnp.sum(low.astype(jnp.float32))
+    high_count = jnp.sum(high.astype(jnp.float32))
+    low_mean = masked_mean(scores, low)
+    high_mean = masked_mean(scores, high)
+    return {
+        "sample_count": count,
+        "bce": masked_reliability_loss(
+            scores, labels, mask, loss_type="bce", eps=eps,
+            reliability_logits=logits,
+        ),
+        "mae": masked_mean(jnp.abs(error), mask),
+        "mse": mse,
+        "rmse": jnp.sqrt(jnp.maximum(mse, 0.0)),
+        "prediction_mean": score_mean,
+        "prediction_std": score_std,
+        "target_mean": target_mean,
+        "target_std": target_std,
+        "prediction_std_to_target_std_ratio": score_std / jnp.maximum(target_std, eps),
+        "pearson_correlation": correlation,
+        "pearson_valid": correlation_valid,
+        "low_target_count": low_count,
+        "high_target_count": high_count,
+        "mean_score_low_target": low_mean,
+        "mean_score_high_target": high_mean,
+        "high_minus_low_score_separation": high_mean - low_mean,
+        "discrimination_valid": (low_count > 0) & (high_count > 0),
+    }
+
+
+def _empty_reliability_capacity_statistics():
+    zeros = {name: jnp.array(0.0, dtype=jnp.float32) for name in (
+        "sample_count", "bce", "mae", "mse", "rmse", "prediction_mean",
+        "prediction_std", "target_mean", "target_std",
+        "prediction_std_to_target_std_ratio", "pearson_correlation",
+        "low_target_count", "high_target_count", "mean_score_low_target",
+        "mean_score_high_target", "high_minus_low_score_separation",
+    )}
+    zeros["pearson_valid"] = jnp.array(False)
+    zeros["discrimination_valid"] = jnp.array(False)
+    return zeros
+
+
+def _empty_reliability_capacity_best():
+    result = {}
+    for metric in ("bce", "mae", "correlation", "separation"):
+        result[f"best_{metric}_step"] = jnp.array(0, dtype=jnp.int32)
+        result[f"best_{metric}"] = jnp.array(0.0, dtype=jnp.float32)
+    result["best_correlation_valid"] = jnp.array(False)
+    result["best_separation_valid"] = jnp.array(False)
+    return result
+
+
+def reliability_capacity_best_holdout(curve_steps, statistics):
+    """Select independent TOP3 holdout optima, breaking ties by earliest step."""
+    metric_values = {
+        "bce": statistics["bce"],
+        "mae": statistics["mae"],
+        "correlation": statistics["pearson_correlation"],
+        "separation": statistics["high_minus_low_score_separation"],
+    }
+    correlation_valid = statistics["pearson_valid"]
+    separation_valid = statistics["discrimination_valid"]
+    indices = {
+        "bce": jnp.argmin(metric_values["bce"]),
+        "mae": jnp.argmin(metric_values["mae"]),
+        "correlation": jnp.where(
+            jnp.any(correlation_valid),
+            jnp.argmax(jnp.where(correlation_valid, metric_values["correlation"], -jnp.inf)),
+            0,
+        ),
+        "separation": jnp.where(
+            jnp.any(separation_valid),
+            jnp.argmax(jnp.where(separation_valid, metric_values["separation"], -jnp.inf)),
+            0,
+        ),
+    }
+    result = {
+        key: value
+        for metric, index in indices.items()
+        for key, value in (
+            (f"best_{metric}_step", curve_steps[index]),
+            (f"best_{metric}", metric_values[metric][index]),
+        )
+    }
+    result["best_correlation_valid"] = statistics["pearson_valid"][
+        indices["correlation"]
+    ]
+    result["best_separation_valid"] = statistics["discrimination_valid"][
+        indices["separation"]
+    ]
+    return result
+
+
+def empty_reliability_capacity_probe_diagnostics(
+    *, enabled=False, skipped_by_schedule=False, not_applicable=False,
+    steps=0, learning_rate=0.0, train_fraction=0.0, split_seed=0,
+    curve_steps=None,
+):
+    checkpoints = (
+        reliability_capacity_curve_checkpoints(steps, curve_steps)
+        if steps >= 1 else (0,)
+    )
+    empty_stats = _empty_reliability_capacity_statistics()
+    empty_curve_stats = jax.tree_util.tree_map(
+        lambda value: jnp.zeros((len(checkpoints),), dtype=value.dtype), empty_stats,
+    )
+    return {
+        "enabled": jnp.asarray(enabled, dtype=jnp.bool_),
+        "active": jnp.array(False),
+        "skipped_by_schedule": jnp.asarray(skipped_by_schedule, dtype=jnp.bool_),
+        "not_applicable": jnp.asarray(not_applicable, dtype=jnp.bool_),
+        "steps": jnp.asarray(steps, dtype=jnp.int32),
+        "learning_rate": jnp.asarray(learning_rate, dtype=jnp.float32),
+        "train_fraction": jnp.asarray(train_fraction, dtype=jnp.float32),
+        "split_seed": jnp.asarray(split_seed, dtype=jnp.int32),
+        "train_environment_count": jnp.array(0, dtype=jnp.int32),
+        "holdout_environment_count": jnp.array(0, dtype=jnp.int32),
+        "probes_start_identical": jnp.array(False),
+        "probes": {
+            probe: {
+                "splits": {
+                    split: {
+                        stage: {scope: empty_stats for scope in RELIABILITY_CAPACITY_SCOPES}
+                        for stage in ("initial", "final")
+                    }
+                    for split in ("train", "holdout")
+                },
+                "relative_param_change": {
+                    group: jnp.array(0.0, dtype=jnp.float32)
+                    for group in RELIABILITY_CAPACITY_PARAMETER_GROUPS
+                },
+                "curve": {
+                    split: {
+                        scope: empty_curve_stats for scope in RELIABILITY_CAPACITY_SCOPES
+                    }
+                    for split in ("train", "holdout")
+                },
+                "best_holdout_top3": _empty_reliability_capacity_best(),
+            }
+            for probe in RELIABILITY_CAPACITY_PROBE_GROUPS
+        },
+        "curve_steps": jnp.asarray(checkpoints, dtype=jnp.int32),
+        "comparison": {
+            name: jnp.array(0.0, dtype=jnp.float32)
+            for name in (
+                *(f"{probe}_{stage}_top3_holdout_{metric}"
+                  for probe in RELIABILITY_CAPACITY_PROBE_GROUPS
+                  for stage in ("initial", "final")
+                  for metric in (
+                      "bce", "mae", "pearson_correlation",
+                      "prediction_std_to_target_std_ratio",
+                  )),
+                "b_minus_a_final_top3_holdout_mae",
+                "b_minus_a_final_top3_holdout_correlation",
+                "b_minus_a_final_top3_holdout_separation",
+                "c_minus_b_final_top3_holdout_mae",
+                "c_minus_b_final_top3_holdout_correlation",
+                "c_minus_b_final_top3_holdout_separation",
+                "d_minus_b_final_top3_holdout_mae",
+                "d_minus_b_final_top3_holdout_correlation",
+                "d_minus_b_final_top3_holdout_separation",
+                "d_minus_c_final_top3_holdout_correlation",
+            )
+        },
+    }
+
+
+def run_reliability_capacity_probe(
+    reliability_apply_fn, params, init_hstate, obs, rnn_reset,
+    labels, valid_mask, task_side_mask, agent_active, *,
+    num_environments, steps, learning_rate, train_fraction, split_seed,
+    loss_type="bce", eps=1e-8, curve_steps=None,
+):
+    """Fit independent diagnostic copies using the real recurrent rollout."""
+    validate_required_parameter_groups(
+        params, required_groups=(
+            "reliability_head", "vision_encoder", "fusion_shared_trunk",
+            "reliability_actor_gru", "reliability_actor_fusion_non_gru",
+        ),
+    )
+    train_actors, holdout_actors, train_count, holdout_count = (
+        trajectory_train_holdout_masks(
+            agent_active, num_environments=num_environments,
+            train_fraction=train_fraction, split_seed=split_seed,
+        )
+    )
+    valid = jnp.asarray(valid_mask, dtype=jnp.bool_)
+    if valid.shape != labels.shape or task_side_mask.shape != labels.shape:
+        raise ValueError("Survival labels and masks must have identical shapes.")
+    train_valid = valid & train_actors[..., None, None]
+    holdout_valid = valid & holdout_actors[..., None, None]
+    top3 = reliability_top3_task_side_mask(valid, task_side_mask)
+    split_masks = {
+        "train": {"ALL_VALID": train_valid, "TOP3_TASK_SIDE": train_valid & top3},
+        "holdout": {
+            "ALL_VALID": holdout_valid,
+            "TOP3_TASK_SIDE": holdout_valid & top3,
+        },
+    }
+    checkpoints = jnp.asarray(
+        reliability_capacity_curve_checkpoints(steps, curve_steps), dtype=jnp.int32,
+    )
+    starts = {
+        probe: jax.tree_util.tree_map(lambda value: value + 0, params)
+        for probe in RELIABILITY_CAPACITY_PROBE_GROUPS
+    }
+    starts_identical = jnp.logical_and(
+        jnp.logical_and(
+            tree_l2_norm(subtract_gradient_trees(
+                starts["probe_a"], starts["probe_b"],
+            )) == 0,
+            tree_l2_norm(subtract_gradient_trees(
+                starts["probe_a"], starts["probe_c"],
+            )) == 0,
+        ),
+        tree_l2_norm(subtract_gradient_trees(
+            starts["probe_a"], starts["probe_d"],
+        )) == 0,
+    )
+    fitted = {}
+    curves = {}
+    for probe, groups in RELIABILITY_CAPACITY_PROBE_GROUPS.items():
+        probe_params = starts[probe]
+        group_mask = parameter_groups_mask(probe_params, groups)
+        optimizer = optax.masked(optax.adam(learning_rate, eps=1e-5), group_mask)
+        optimizer_state = optimizer.init(probe_params)
+
+        def probe_loss(candidate):
+            scores, logits = reliability_apply_fn(
+                candidate, init_hstate, obs, rnn_reset,
+            )
+            return masked_reliability_loss(
+                scores, labels, train_valid, loss_type=loss_type,
+                eps=eps, reliability_logits=logits,
+            )
+
+        def probe_step(carry, _):
+            candidate, state = carry
+            gradients = mask_tree_to_groups(jax.grad(probe_loss)(candidate), groups)
+            updates, state = optimizer.update(gradients, state, candidate)
+            updates = mask_tree_to_groups(updates, groups)
+            return (optax.apply_updates(candidate, updates), state), None
+
+        def checkpoint_step(carry, checkpoint):
+            candidate, state, previous_step = carry
+
+            def advance(_, fit_state):
+                return probe_step(fit_state, None)[0]
+
+            candidate, state = jax.lax.fori_loop(
+                previous_step, checkpoint, advance, (candidate, state),
+            )
+            scores, logits = reliability_apply_fn(
+                candidate, init_hstate, obs, rnn_reset,
+            )
+            statistics = {
+                split: {
+                    scope: reliability_capacity_statistics(
+                        scores, logits, labels, scope_mask, eps=eps,
+                    )
+                    for scope, scope_mask in masks.items()
+                }
+                for split, masks in split_masks.items()
+            }
+            return (candidate, state, checkpoint), statistics
+
+        (fitted[probe], _, _), curves[probe] = jax.lax.scan(
+            checkpoint_step,
+            (probe_params, optimizer_state, jnp.int32(0)), checkpoints,
+        )
+
+    result = empty_reliability_capacity_probe_diagnostics(
+        enabled=True, steps=steps, learning_rate=learning_rate,
+        train_fraction=train_fraction, split_seed=split_seed,
+        curve_steps=curve_steps,
+    )
+    result["active"] = jnp.array(True)
+    result["train_environment_count"] = jnp.asarray(train_count, dtype=jnp.int32)
+    result["holdout_environment_count"] = jnp.asarray(holdout_count, dtype=jnp.int32)
+    result["probes_start_identical"] = starts_identical
+    for probe in RELIABILITY_CAPACITY_PROBE_GROUPS:
+        result["probes"][probe]["curve"] = curves[probe]
+        result["probes"][probe]["best_holdout_top3"] = (
+            reliability_capacity_best_holdout(
+                checkpoints, curves[probe]["holdout"]["TOP3_TASK_SIDE"],
+            )
+        )
+        for split in ("train", "holdout"):
+            for scope in RELIABILITY_CAPACITY_SCOPES:
+                statistics = curves[probe][split][scope]
+                for stage, index in (("initial", 0), ("final", -1)):
+                    result["probes"][probe]["splits"][split][stage][scope] = {
+                        name: values[index]
+                        for name, values in statistics.items()
+                    }
+        result["probes"][probe]["relative_param_change"] = {
+            group: _relative_parameter_change(params, fitted[probe], group)
+            for group in RELIABILITY_CAPACITY_PARAMETER_GROUPS
+        }
+    a = result["probes"]["probe_a"]["splits"]["holdout"]["final"]["TOP3_TASK_SIDE"]
+    b = result["probes"]["probe_b"]["splits"]["holdout"]["final"]["TOP3_TASK_SIDE"]
+    c = result["probes"]["probe_c"]["splits"]["holdout"]["final"]["TOP3_TASK_SIDE"]
+    d = result["probes"]["probe_d"]["splits"]["holdout"]["final"]["TOP3_TASK_SIDE"]
+    result["comparison"] = {
+        **{
+            f"{probe}_{stage}_top3_holdout_{metric}": (
+                result["probes"][probe]["splits"]["holdout"][stage]
+                ["TOP3_TASK_SIDE"][metric]
+            )
+            for probe in RELIABILITY_CAPACITY_PROBE_GROUPS
+            for stage in ("initial", "final")
+            for metric in (
+                "bce", "mae", "pearson_correlation",
+                "prediction_std_to_target_std_ratio",
+            )
+        },
+        "b_minus_a_final_top3_holdout_mae": b["mae"] - a["mae"],
+        "b_minus_a_final_top3_holdout_correlation": (
+            b["pearson_correlation"] - a["pearson_correlation"]
+        ),
+        "b_minus_a_final_top3_holdout_separation": (
+            b["high_minus_low_score_separation"] - a["high_minus_low_score_separation"]
+        ),
+        "c_minus_b_final_top3_holdout_mae": c["mae"] - b["mae"],
+        "c_minus_b_final_top3_holdout_correlation": (
+            c["pearson_correlation"] - b["pearson_correlation"]
+        ),
+        "c_minus_b_final_top3_holdout_separation": (
+            c["high_minus_low_score_separation"] - b["high_minus_low_score_separation"]
+        ),
+        "d_minus_b_final_top3_holdout_mae": d["mae"] - b["mae"],
+        "d_minus_b_final_top3_holdout_correlation": (
+            d["pearson_correlation"] - b["pearson_correlation"]
+        ),
+        "d_minus_b_final_top3_holdout_separation": (
+            d["high_minus_low_score_separation"] - b["high_minus_low_score_separation"]
+        ),
+        "d_minus_c_final_top3_holdout_correlation": (
+            d["pearson_correlation"] - c["pearson_correlation"]
+        ),
+    }
+    return result
 
 
 def value_probe_statistics(prediction, target, mask, eps=1e-12):
@@ -3229,6 +3696,117 @@ def format_value_fit_diagnostics(
             ["VALUE_FIT_DELTA", f"update={update}"]
             + [f"{name}={value:.6g}" for name, value in deltas.items()]
         ))
+    return lines, values
+
+
+def format_reliability_capacity_probe_diagnostics(
+    diagnostics: Mapping[str, Any], *, update: int,
+) -> tuple[list[str], dict[str, float]]:
+    """Render the capacity probe outside the jitted update."""
+    if not _host_bool(diagnostics["enabled"]):
+        return [], {}
+    if _host_bool(diagnostics["not_applicable"]):
+        return [f"RELIABILITY_CAPACITY_PROBE update={update} status=not_applicable"], {}
+    if _host_bool(diagnostics["skipped_by_schedule"]):
+        return [], {}
+    if not _host_bool(diagnostics["active"]):
+        return [f"RELIABILITY_CAPACITY_PROBE update={update} status=inactive"], {}
+    lines = []
+    values = {
+        name: _host_scalar(diagnostics[name])
+        for name in (
+            "steps", "learning_rate", "train_fraction", "split_seed",
+            "train_environment_count", "holdout_environment_count",
+            "probes_start_identical",
+        )
+    }
+    for probe in RELIABILITY_CAPACITY_PROBE_GROUPS:
+        for split in ("train", "holdout"):
+            for stage in ("initial", "final"):
+                for scope in RELIABILITY_CAPACITY_SCOPES:
+                    stats = diagnostics["probes"][probe]["splits"][split][stage][scope]
+                    scalars = {name: _host_scalar(value) for name, value in stats.items()}
+                    prefix = f"{probe}/{split}/{stage}/{scope}"
+                    values.update({f"{prefix}/{name}": value for name, value in scalars.items()})
+                    standard = {key: value for key, value in scalars.items()
+                                if key not in (
+                                    "low_target_count", "high_target_count",
+                                    "mean_score_low_target", "mean_score_high_target",
+                                    "high_minus_low_score_separation", "discrimination_valid",
+                                )}
+                    discrimination = {key: scalars[key] for key in (
+                        "low_target_count", "high_target_count",
+                        "mean_score_low_target", "mean_score_high_target",
+                        "high_minus_low_score_separation", "discrimination_valid",
+                    )}
+                    identity = (
+                        f"update={update} status=active agent=EXE probe={probe} "
+                        f"split={split} stage={stage} scope={scope}"
+                    )
+                    lines.append("RELIABILITY_CAPACITY_PROBE " + identity + " " + " ".join(
+                        f"{name}={value:.6g}" for name, value in standard.items()
+                    ))
+                    lines.append("RELIABILITY_CAPACITY_PROBE_DISCRIMINATION " + identity + " " + " ".join(
+                        f"{name}={value:.6g}" for name, value in discrimination.items()
+                    ))
+        for group, value in diagnostics["probes"][probe]["relative_param_change"].items():
+            relative_change = _host_scalar(value)
+            values[f"{probe}/relative_param_change/{group}"] = relative_change
+            lines.append(
+                f"RELIABILITY_CAPACITY_PROBE update={update} status=active "
+                f"agent=EXE probe={probe} group={group} "
+                f"relative_param_change={relative_change:.6g}"
+            )
+        for index, step_value in enumerate(diagnostics["curve_steps"]):
+            step = int(step_value)
+            for split in ("train", "holdout"):
+                for scope in RELIABILITY_CAPACITY_SCOPES:
+                    statistics = diagnostics["probes"][probe]["curve"][split][scope]
+                    scalars = {
+                        name: _host_scalar(series[index])
+                        for name, series in statistics.items()
+                    }
+                    prefix = f"{probe}/curve/step_{step}/{split}/{scope}"
+                    values.update({
+                        f"{prefix}/{name}": value for name, value in scalars.items()
+                    })
+                    discrimination_names = (
+                        "low_target_count", "high_target_count",
+                        "mean_score_low_target", "mean_score_high_target",
+                        "high_minus_low_score_separation", "discrimination_valid",
+                    )
+                    identity = (
+                        f"update={update} status=active agent=EXE probe={probe} "
+                        f"step={step} split={split} scope={scope}"
+                    )
+                    lines.append("RELIABILITY_CAPACITY_PROBE_CURVE " + identity + " " + " ".join(
+                        f"{name}={value:.6g}" for name, value in scalars.items()
+                        if name not in discrimination_names
+                    ))
+                    lines.append(
+                        "RELIABILITY_CAPACITY_PROBE_CURVE_DISCRIMINATION "
+                        + identity + " " + " ".join(
+                            f"{name}={scalars[name]:.6g}"
+                            for name in discrimination_names
+                        )
+                    )
+        best = diagnostics["probes"][probe]["best_holdout_top3"]
+        best_values = {name: _host_scalar(value) for name, value in best.items()}
+        values.update({f"{probe}/best_holdout/TOP3_TASK_SIDE/{name}": value
+                       for name, value in best_values.items()})
+        lines.append(
+            f"RELIABILITY_CAPACITY_PROBE_BEST update={update} probe={probe} "
+            "scope=TOP3_TASK_SIDE "
+            + " ".join(f"{name}={value:.6g}" for name, value in best_values.items())
+        )
+    comparisons = {
+        name: _host_scalar(value)
+        for name, value in diagnostics["comparison"].items()
+    }
+    values.update({f"comparison/{name}": value for name, value in comparisons.items()})
+    lines.append("RELIABILITY_CAPACITY_PROBE_COMPARISON " + f"update={update} " + " ".join(
+        f"{name}={value:.6g}" for name, value in comparisons.items()
+    ))
     return lines, values
 
 

@@ -21,6 +21,13 @@
 "enable_value_clip_diag": False
 "enable_critic_optimizer_diag": False
 "enable_value_representation_probe": False
+"enable_reliability_capacity_probe": False
+"reliability_capacity_probe_updates": [5, 10, 15]
+"reliability_capacity_probe_steps": 1000
+"reliability_capacity_probe_curve_steps": [0, 50, 100, 150, 300, 500, 750, 1000]
+"reliability_capacity_probe_lr": 0.001
+"reliability_capacity_probe_train_fraction": 0.8
+"reliability_capacity_probe_split_seed": 0
 "enable_critic_optimization_ablation": False
 "critic_optimization_ablation_updates": []
 "enable_value_clip_eps_sweep": False
@@ -38,6 +45,7 @@
 "value_clip_diag_every_updates": 1
 "critic_optimizer_diag_every_updates": 1
 "reliability_optimization_mode": "joint"
+"detach_reliability_from_policy_gradient": False
 "aux_reliability_epochs": 1
 "aux_reliability_num_minibatches": null
 "aux_survival_coef": 1.0

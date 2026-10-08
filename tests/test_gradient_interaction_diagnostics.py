@@ -26,11 +26,13 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     empty_value_clip_eps_sweep_diagnostics,
     empty_gradient_interaction_diagnostics,
     empty_value_representation_probe_diagnostics,
+    empty_reliability_capacity_probe_diagnostics,
     empty_value_fit_diagnostics,
     empty_value_clip_diagnostics,
     fit_value_representation_probe_variants,
     fit_value_representation_probe_c,
     format_value_representation_probe_diagnostics,
+    format_reliability_capacity_probe_diagnostics,
     format_critic_optimization_ablation_diagnostics,
     format_value_clip_eps_sweep_diagnostics,
     format_value_fit_diagnostics,
@@ -48,6 +50,7 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     scale_gradient_tree,
     subtract_gradient_trees,
     run_value_representation_probe,
+    run_reliability_capacity_probe,
     run_critic_optimization_ablation,
     run_value_clip_eps_sweep,
     resolve_value_clip_eps,
@@ -74,18 +77,27 @@ from gymnax_exchange.jaxrl.MARL.gradient_diagnostics import (
     value_probe_c_curve_steps,
     value_clip_diag_should_run,
     trajectory_train_holdout_masks,
+    reliability_capacity_statistics,
+    reliability_capacity_best_holdout,
+    reliability_capacity_curve_checkpoints,
+    reliability_top3_task_side_mask,
+    validate_reliability_capacity_probe_config,
 )
 from gymnax_exchange.jaxrl.MARL.ippo_rnn_JAXMARL import (
     ActorCriticRNN,
     ScannedRNN,
     make_train,
+    maybe_mask_reliability_ppo_grads,
+    validate_reliability_ppo_gradient_ablation,
 )
 from gymnax_exchange.jaxrl.MARL.ppo_lifecycle import compute_masked_ppo_terms
 from gymnax_exchange.jaxrl.MARL.reliability_targets import (
     masked_reliability_loss,
 )
 from gymnax_exchange.jaxrl.MARL.phasic_reliability import (
+    build_rollout_outputs,
     make_auxiliary_optimizer,
+    policy_kl,
     resolve_phasic_reliability_settings,
     run_phasic_auxiliary_phase,
 )
@@ -1617,7 +1629,7 @@ def test_critic_ablation_copied_state_clipping_and_cumulative_curves():
     }}
     obs = {"x": jnp.array([[1., 2., 3., 4.], [2., 3., 4., 5.]])}
     reset = jnp.zeros((2, 4), dtype=jnp.bool_)
-    active = jnp.ones((2, 4), dtype=jnp.bool_)
+    active = jnp.ones((2, 8), dtype=jnp.bool_)
     hidden = jnp.zeros((4, 1))
 
     def apply_fn(p, h, inputs):
@@ -2321,6 +2333,7 @@ def test_separate_critic_phasic_isolation(separate_critic_fixture):
     model, params, hidden, obs, resets = separate_critic_fixture
     settings = resolve_phasic_reliability_settings(
         {**model.config, "reliability_optimization_mode": "phasic",
+         "detach_reliability_from_policy_gradient": True,
          "use_survival_loss": True, "NUM_MINIBATCHES": 1,
          "LR": [0.0004], "MAX_GRAD_NORM": [0.5]},
         execution_index=0, execution_actor_count=2,
@@ -2339,6 +2352,522 @@ def test_separate_critic_phasic_isolation(separate_critic_fixture):
         _assert_tree_allclose(updated["params"][subtree], params["params"][subtree], atol=0, rtol=0)
     delta = subtract_gradient_trees(updated, params)
     assert float(gradient_l2_norm(delta, "vision_encoder")) > 0
+    assert float(gradient_l2_norm(delta, "reliability_head")) > 0
+
+
+def test_reliability_capacity_probe_config_masks_and_degenerate_metrics():
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "gymnax_exchange/jaxrl/MARL/config/ippo_rnn_JAXMARL_2player.yaml"
+    )
+    config = OmegaConf.load(config_path)
+    assert config.enable_reliability_capacity_probe is False
+    assert validate_reliability_capacity_probe_config(config) == {
+        "updates": (5, 10, 15), "steps": 1000, "learning_rate": 0.001,
+        "train_fraction": 0.8, "split_seed": 0,
+        "curve_steps": (0, 50, 100, 150, 300, 500, 750, 1000),
+    }
+    assert reliability_capacity_curve_checkpoints(1000, (150, 50, 100)) == (
+        0, 50, 100, 150, 1000,
+    )
+    assert validate_reliability_capacity_probe_config({
+        "reliability_capacity_probe_steps": 1000,
+        "reliability_capacity_probe_curve_steps": [0, 50, 100, 150, 300, 500, 750, 1000],
+    })["curve_steps"] == (0, 50, 100, 150, 300, 500, 750, 1000)
+    for override in (
+        {"reliability_capacity_probe_steps": 0},
+        {"reliability_capacity_probe_lr": 0},
+        {"reliability_capacity_probe_train_fraction": 1},
+        {"reliability_capacity_probe_split_seed": -1},
+        {"reliability_capacity_probe_updates": [5, 5]},
+        {"reliability_capacity_probe_curve_steps": [0, 50, 50]},
+        {"reliability_capacity_probe_curve_steps": [-1, 50]},
+        {"reliability_capacity_probe_curve_steps": [0, 1001]},
+        {"reliability_capacity_probe_curve_steps": [0, 1.5]},
+    ):
+        with pytest.raises(ValueError):
+            validate_reliability_capacity_probe_config(override)
+    disabled = empty_reliability_capacity_probe_diagnostics(enabled=False)
+    assert format_reliability_capacity_probe_diagnostics(disabled, update=5) == ([], {})
+
+    valid = jnp.ones((2, 4, 5, 2), dtype=jnp.bool_)
+    task_side = jnp.zeros_like(valid).at[..., 1].set(True)
+    top3 = reliability_top3_task_side_mask(valid, task_side)
+    assert int(jnp.sum(top3)) == 2 * 4 * 3
+    assert not bool(jnp.any(top3[:, :, 3:]))
+    assert not bool(jnp.any(top3[..., 0]))
+    active = jnp.ones((2, 4), dtype=jnp.bool_)
+    train, holdout, train_count, holdout_count = trajectory_train_holdout_masks(
+        active, num_environments=4, train_fraction=0.5, split_seed=0,
+    )
+    repeat = trajectory_train_holdout_masks(
+        active, num_environments=4, train_fraction=0.5, split_seed=0,
+    )
+    alternate = trajectory_train_holdout_masks(
+        active, num_environments=4, train_fraction=0.5, split_seed=1,
+    )
+    np.testing.assert_array_equal(train, repeat[0])
+    assert not bool(jnp.array_equal(train, alternate[0]))
+    assert (train_count, holdout_count) == (2, 2)
+    assert not bool(jnp.any(train & holdout))
+    np.testing.assert_array_equal(train | holdout, active)
+    np.testing.assert_array_equal(train[0], train[1])
+    for env_index in range(4):
+        assert bool(train[0, 2 * env_index]) == bool(train[0, 2 * env_index + 1])
+
+    scores = jnp.full((2, 4, 5, 2), 0.5)
+    labels = jnp.full_like(scores, 0.7)
+    stats = reliability_capacity_statistics(scores, jnp.zeros_like(scores), labels, top3)
+    assert not bool(stats["pearson_valid"])
+    assert not bool(stats["discrimination_valid"])
+    assert float(stats["sample_count"]) == 24
+    for leaf in jax.tree_util.tree_leaves(stats):
+        assert np.isfinite(np.asarray(leaf)).all()
+    binary_targets = jnp.zeros_like(scores).at[..., 1].set(1.0)
+    separated_scores = jnp.full_like(scores, 0.2).at[..., 1].set(0.8)
+    separated = reliability_capacity_statistics(
+        separated_scores, jnp.zeros_like(scores), binary_targets, valid,
+    )
+    assert bool(separated["pearson_valid"])
+    assert bool(separated["discrimination_valid"])
+    np.testing.assert_allclose(
+        separated["high_minus_low_score_separation"], 0.6, atol=1e-6,
+    )
+
+
+def test_reliability_capacity_probe_isolated_fit_and_holdout(separate_critic_fixture):
+    model, params, hidden, obs, resets = separate_critic_fixture
+    c_groups = ("reliability_head", "vision_encoder", "fusion_shared_trunk")
+    c_mask = flatten_tree_with_paths(parameter_groups_mask(params, c_groups))
+    c_paths = {path for path, selected in c_mask.items() if selected}
+    assert c_paths == set().union(*(
+        set(matching_parameter_paths(params, group)) for group in c_groups
+    ))
+    assert c_paths.isdisjoint(set().union(*(
+        set(matching_parameter_paths(params, group))
+        for group in ("actor_head", "critic_head", "critic_representation")
+    )))
+    fusion_params = params["params"]["ReliabilityFusionRNN_0"]
+    assert "GRUCell_0" in fusion_params
+    assert "StableGatedCrossAttention_0" in fusion_params
+    assert "Dense_0" in fusion_params
+    gru_prefix = ("params", "ReliabilityFusionRNN_0", "GRUCell_0")
+    all_paths = set(flatten_tree_with_paths(params))
+    gru_paths = set(matching_parameter_paths(params, "reliability_actor_gru"))
+    expected_gru_paths = {
+        gru_prefix + (gate, leaf)
+        for gate, leaves in (
+            ("hn", ("bias", "kernel")),
+            ("hr", ("kernel",)),
+            ("hz", ("kernel",)),
+            ("in", ("bias", "kernel")),
+            ("ir", ("bias", "kernel")),
+            ("iz", ("bias", "kernel")),
+        )
+        for leaf in leaves
+    }
+    assert gru_paths == expected_gru_paths
+    assert gru_paths == {path for path in all_paths if path[:3] == gru_prefix}
+    d_groups = ("reliability_head", "vision_encoder", "reliability_actor_gru")
+    d_mask = flatten_tree_with_paths(parameter_groups_mask(params, d_groups))
+    d_paths = {path for path, selected in d_mask.items() if selected}
+    assert d_paths == set().union(*(
+        set(matching_parameter_paths(params, group)) for group in d_groups
+    ))
+    assert d_paths.isdisjoint(set(matching_parameter_paths(
+        params, "reliability_actor_fusion_non_gru",
+    )))
+    assert d_paths.isdisjoint(set().union(*(
+        set(matching_parameter_paths(params, group))
+        for group in ("actor_head", "critic_head", "critic_representation")
+    )))
+    active = jnp.ones((4, 2), dtype=jnp.bool_)
+    train_actor, holdout_actor, _, _ = trajectory_train_holdout_masks(
+        active, num_environments=2, train_fraction=0.5, split_seed=3,
+    )
+    labels = jnp.where(train_actor[..., None, None], 1.0, 0.0)
+    labels = jnp.broadcast_to(labels, (4, 2, 10, 2))
+    valid = jnp.ones_like(labels, dtype=jnp.bool_)
+    task_side = jnp.zeros_like(valid).at[..., 0].set(True)
+    before = jax.tree_util.tree_map(lambda x: np.array(x, copy=True), params)
+    real_ppo_state = {"count": jnp.array(7)}
+    real_aux_state = {"count": jnp.array(4)}
+    rng = jax.random.PRNGKey(11)
+
+    def apply_reliability(p, h, o, r):
+        aux = model.apply(p, h, (o, r))[4]
+        return aux["reliability_scores"], aux["reliability_logits"]
+
+    result = jax.jit(lambda p: run_reliability_capacity_probe(
+        apply_reliability, p, hidden, obs, resets, labels, valid, task_side,
+        active, num_environments=2, steps=8, learning_rate=0.01,
+        train_fraction=0.5, split_seed=3, curve_steps=(0, 1, 2, 4, 8),
+    ))(params)
+    empty = empty_reliability_capacity_probe_diagnostics(
+        enabled=True, steps=8, learning_rate=0.01,
+        train_fraction=0.5, split_seed=3, curve_steps=(0, 1, 2, 4, 8),
+    )
+    assert jax.tree_util.tree_structure(result) == jax.tree_util.tree_structure(empty)
+    assert bool(result["active"])
+    assert bool(result["probes_start_identical"])
+    assert int(result["train_environment_count"]) == 1
+    assert int(result["holdout_environment_count"]) == 1
+    np.testing.assert_array_equal(result["curve_steps"], [0, 1, 2, 4, 8])
+    for probe in ("probe_a", "probe_b", "probe_c", "probe_d"):
+        train_stats = result["probes"][probe]["splits"]["train"]
+        holdout_stats = result["probes"][probe]["splits"]["holdout"]
+        assert float(train_stats["final"]["ALL_VALID"]["bce"]) < float(
+            train_stats["initial"]["ALL_VALID"]["bce"]
+        )
+        assert float(train_stats["initial"]["ALL_VALID"]["target_mean"]) == 1
+        assert float(holdout_stats["initial"]["ALL_VALID"]["target_mean"]) == 0
+        assert float(holdout_stats["initial"]["ALL_VALID"]["sample_count"]) == 80
+        assert float(holdout_stats["initial"]["TOP3_TASK_SIDE"]["sample_count"]) == 12
+        change = result["probes"][probe]["relative_param_change"]
+        assert float(change["reliability_head"]) > 0
+        for group in ("actor_head", "critic_representation", "critic_head"):
+            assert float(change[group]) == 0
+        if probe == "probe_a":
+            assert float(change["vision_encoder"]) == 0
+            assert float(change["fusion_shared_trunk"]) == 0
+            assert float(change["reliability_actor_gru"]) == 0
+            assert float(change["reliability_actor_fusion_non_gru"]) == 0
+        elif probe == "probe_b":
+            assert float(change["vision_encoder"]) > 0
+            assert float(change["fusion_shared_trunk"]) == 0
+            assert float(change["reliability_actor_gru"]) == 0
+            assert float(change["reliability_actor_fusion_non_gru"]) == 0
+        elif probe == "probe_c":
+            assert float(change["vision_encoder"]) > 0
+            assert float(change["fusion_shared_trunk"]) > 0
+            assert float(change["reliability_actor_fusion_non_gru"]) > 0
+        else:
+            assert float(change["vision_encoder"]) > 0
+            assert float(change["reliability_actor_gru"]) > 0
+            assert float(change["fusion_shared_trunk"]) > 0
+            assert float(change["reliability_actor_fusion_non_gru"]) == 0
+        for split in ("train", "holdout"):
+            for scope in ("ALL_VALID", "TOP3_TASK_SIDE"):
+                curve = result["probes"][probe]["curve"][split][scope]
+                for name in curve:
+                    np.testing.assert_array_equal(
+                        curve[name][0], result["probes"][probe]["splits"][split]["initial"][scope][name],
+                    )
+                    np.testing.assert_array_equal(
+                        curve[name][-1], result["probes"][probe]["splits"][split]["final"][scope][name],
+                    )
+                for name in ("sample_count", "target_mean", "target_std"):
+                    np.testing.assert_array_equal(
+                        curve[name], np.full(curve[name].shape, np.asarray(curve[name][0])),
+                    )
+                for name in curve:
+                    assert np.isfinite(np.asarray(curve[name])).all()
+    for split in ("train", "holdout"):
+        for scope in ("ALL_VALID", "TOP3_TASK_SIDE"):
+            initial = result["probes"]["probe_a"]["splits"][split]["initial"][scope]
+            for probe in ("probe_b", "probe_c", "probe_d"):
+                for name, value in initial.items():
+                    np.testing.assert_array_equal(
+                        value,
+                        result["probes"][probe]["splits"][split]["initial"][scope][name],
+                    )
+    b_final = result["probes"]["probe_b"]["splits"]["holdout"]["final"]["TOP3_TASK_SIDE"]
+    c_final = result["probes"]["probe_c"]["splits"]["holdout"]["final"]["TOP3_TASK_SIDE"]
+    d_final = result["probes"]["probe_d"]["splits"]["holdout"]["final"]["TOP3_TASK_SIDE"]
+    for suffix, field in (
+        ("mae", "mae"),
+        ("correlation", "pearson_correlation"),
+        ("separation", "high_minus_low_score_separation"),
+    ):
+        np.testing.assert_allclose(
+            result["comparison"][f"c_minus_b_final_top3_holdout_{suffix}"],
+            c_final[field] - b_final[field], rtol=0, atol=0,
+        )
+        np.testing.assert_allclose(
+            result["comparison"][f"d_minus_b_final_top3_holdout_{suffix}"],
+            d_final[field] - b_final[field], rtol=0, atol=0,
+        )
+    np.testing.assert_allclose(
+        result["comparison"]["d_minus_c_final_top3_holdout_correlation"],
+        d_final["pearson_correlation"] - c_final["pearson_correlation"],
+        rtol=0, atol=0,
+    )
+    _assert_tree_allclose(before, params, atol=0, rtol=0)
+    assert int(real_ppo_state["count"]) == 7
+    assert int(real_aux_state["count"]) == 4
+    np.testing.assert_array_equal(rng, jax.random.PRNGKey(11))
+    lines, values = format_reliability_capacity_probe_diagnostics(result, update=5)
+    assert any(line.startswith("RELIABILITY_CAPACITY_PROBE_DISCRIMINATION") for line in lines)
+    assert any(line.startswith("RELIABILITY_CAPACITY_PROBE_COMPARISON") for line in lines)
+    assert any("RELIABILITY_CAPACITY_PROBE_CURVE update=5" in line and "step=4" in line for line in lines)
+    assert any(line.startswith("RELIABILITY_CAPACITY_PROBE_CURVE_DISCRIMINATION") for line in lines)
+    assert any(line.startswith("RELIABILITY_CAPACITY_PROBE_BEST") for line in lines)
+    assert "probe_a/holdout/final/TOP3_TASK_SIDE/mae" in values
+    assert "probe_a/curve/step_4/holdout/TOP3_TASK_SIDE/pearson_correlation" in values
+    assert "probe_c/curve/step_4/holdout/TOP3_TASK_SIDE/pearson_correlation" in values
+    assert "probe_c/best_holdout/TOP3_TASK_SIDE/best_mae_step" in values
+    assert "probe_d/best_holdout/TOP3_TASK_SIDE/best_mae_step" in values
+    assert "probe_d/relative_param_change/reliability_actor_gru" in values
+    assert "probe_d/relative_param_change/reliability_actor_fusion_non_gru" in values
+    assert "comparison/c_minus_b_final_top3_holdout_correlation" in values
+    assert "comparison/d_minus_b_final_top3_holdout_correlation" in values
+    assert any("probe=probe_c step=4 split=holdout" in line for line in lines)
+    assert any("probe=probe_d step=4 split=holdout" in line for line in lines)
+
+
+def test_reliability_capacity_best_holdout_uses_independent_earliest_optima():
+    steps = jnp.array([0, 5, 10], dtype=jnp.int32)
+    statistics = {
+        "bce": jnp.array([0.5, 0.2, 0.2]),
+        "mae": jnp.array([0.3, 0.25, 0.1]),
+        "pearson_correlation": jnp.array([0.1, 0.4, 0.4]),
+        "high_minus_low_score_separation": jnp.array([0.1, 0.2, 0.2]),
+        "pearson_valid": jnp.array([True, True, True]),
+        "discrimination_valid": jnp.array([True, True, True]),
+    }
+    best = jax.jit(reliability_capacity_best_holdout)(steps, statistics)
+    assert int(best["best_bce_step"]) == 5
+    assert int(best["best_mae_step"]) == 10
+    assert int(best["best_correlation_step"]) == 5
+    assert int(best["best_separation_step"]) == 5
+    partly_valid = {
+        **statistics,
+        "pearson_correlation": jnp.array([0.0, -0.2, -0.4]),
+        "pearson_valid": jnp.array([False, True, True]),
+    }
+    assert int(reliability_capacity_best_holdout(
+        steps, partly_valid,
+    )["best_correlation_step"]) == 5
+    degenerate = {
+        **statistics,
+        "pearson_correlation": jnp.zeros(3),
+        "high_minus_low_score_separation": jnp.zeros(3),
+        "pearson_valid": jnp.zeros(3, dtype=jnp.bool_),
+        "discrimination_valid": jnp.zeros(3, dtype=jnp.bool_),
+    }
+    empty_best = reliability_capacity_best_holdout(steps, degenerate)
+    assert int(empty_best["best_correlation_step"]) == 0
+    assert int(empty_best["best_separation_step"]) == 0
+    assert not bool(empty_best["best_correlation_valid"])
+    assert not bool(empty_best["best_separation_valid"])
+    for value in empty_best.values():
+        assert np.isfinite(np.asarray(value)).all()
+
+
+@pytest.mark.parametrize("probe,groups", (
+    ("probe_a", ("reliability_head",)),
+    ("probe_c", ("reliability_head", "vision_encoder", "fusion_shared_trunk")),
+    ("probe_d", ("reliability_head", "vision_encoder", "reliability_actor_gru")),
+))
+def test_reliability_capacity_curve_keeps_adam_state_between_checkpoints(probe, groups):
+    params = {"params": {
+        "ReliabilityFusionRNN_0": {"LevelWiseReliabilityHead_0": {
+            "kernel": jnp.array(0.25),
+        }, "Dense_0": {"kernel": jnp.array(1.0)},
+        "GRUCell_0": {"kernel": jnp.array(1.0)}},
+        "VisionAgent_0": {"kernel": jnp.array(1.5)},
+    }}
+    obs = jnp.linspace(-0.7, 1.3, 24).reshape(2, 2, 3, 2)
+    labels = jax.nn.sigmoid(0.3 * 1.5 * obs)
+    valid = jnp.ones_like(labels, dtype=jnp.bool_)
+    active = jnp.ones((2, 2), dtype=jnp.bool_)
+
+    def apply_reliability(p, _hidden, sequence, _reset):
+        head = p["params"]["ReliabilityFusionRNN_0"]["LevelWiseReliabilityHead_0"]["kernel"]
+        vision = p["params"]["VisionAgent_0"]["kernel"]
+        trunk = p["params"]["ReliabilityFusionRNN_0"]["Dense_0"]["kernel"]
+        gru = p["params"]["ReliabilityFusionRNN_0"]["GRUCell_0"]["kernel"]
+        logits = head * vision * trunk * gru * sequence
+        return jax.nn.sigmoid(logits), logits
+
+    result = run_reliability_capacity_probe(
+        apply_reliability, params, None, obs, None, labels, valid, valid,
+        active, num_environments=2, steps=4, learning_rate=0.1,
+        train_fraction=0.5, split_seed=0, curve_steps=(0, 2, 4),
+    )
+    curve = result["probes"][probe]["curve"]["train"]["ALL_VALID"]
+    train_actor, _, _, _ = trajectory_train_holdout_masks(
+        active, num_environments=2, train_fraction=0.5, split_seed=0,
+    )
+    train_valid = valid & train_actor[..., None, None]
+    optimizer = optax.masked(
+        optax.adam(0.1, eps=1e-5), parameter_groups_mask(params, groups),
+    )
+
+    def loss(p):
+        scores, logits = apply_reliability(p, None, obs, None)
+        return masked_reliability_loss(
+            scores, labels, train_valid, loss_type="bce", reliability_logits=logits,
+        )
+
+    def advance(p, state, count):
+        for _ in range(count):
+            grad = mask_tree_to_groups(jax.grad(loss)(p), groups)
+            updates, state = optimizer.update(grad, state, p)
+            p = optax.apply_updates(p, mask_tree_to_groups(updates, groups))
+        return p, state
+
+    after_two, state_two = advance(params, optimizer.init(params), 2)
+    after_four, _ = advance(after_two, state_two, 2)
+    restarted_four, _ = advance(after_two, optimizer.init(after_two), 2)
+    np.testing.assert_allclose(curve["bce"][1], loss(after_two), rtol=1e-6)
+    np.testing.assert_allclose(curve["bce"][2], loss(after_four), rtol=1e-6)
+    head_path = ("params", "ReliabilityFusionRNN_0", "LevelWiseReliabilityHead_0", "kernel")
+    def head_value(tree):
+        return tree[head_path[0]][head_path[1]][head_path[2]][head_path[3]]
+
+    assert abs(float(head_value(after_four) - head_value(restarted_four))) > 1e-5
+    restarted_scores, restarted_logits = apply_reliability(
+        restarted_four, None, obs, None,
+    )
+    restarted_stats = reliability_capacity_statistics(
+        restarted_scores, restarted_logits, labels, train_valid,
+    )
+    assert abs(float(curve["prediction_mean"][2] - restarted_stats["prediction_mean"])) > 1e-7
+    if probe == "probe_a":
+        assert float(result["probes"][probe]["relative_param_change"]["vision_encoder"]) == 0
+        assert float(result["probes"][probe]["relative_param_change"]["fusion_shared_trunk"]) == 0
+    elif probe == "probe_c":
+        assert float(result["probes"][probe]["relative_param_change"]["vision_encoder"]) > 0
+        assert float(result["probes"][probe]["relative_param_change"]["fusion_shared_trunk"]) > 0
+    else:
+        movement = result["probes"][probe]["relative_param_change"]
+        assert float(movement["vision_encoder"]) > 0
+        assert float(movement["reliability_actor_gru"]) > 0
+        assert float(movement["reliability_actor_fusion_non_gru"]) == 0
+    np.testing.assert_array_equal(params["params"]["VisionAgent_0"]["kernel"], 1.5)
+
+
+def test_reliability_ppo_ablation_defaults_and_requires_phasic():
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "gymnax_exchange/jaxrl/MARL/config/ippo_rnn_JAXMARL_2player.yaml"
+    )
+    config = OmegaConf.load(config_path)
+    assert config.detach_reliability_from_policy_gradient is False
+    assert not validate_reliability_ppo_gradient_ablation(config, phasic_mode=False)
+    with pytest.raises(ValueError, match="reliability_optimization_mode=phasic"):
+        validate_reliability_ppo_gradient_ablation(
+            {"detach_reliability_from_policy_gradient": True}, phasic_mode=False,
+        )
+    assert validate_reliability_ppo_gradient_ablation(
+        {"detach_reliability_from_policy_gradient": True}, phasic_mode=True,
+    )
+
+
+def test_reliability_ppo_ablation_routes_only_applied_gradient(separate_critic_fixture):
+    model, params, hidden, obs, resets = separate_critic_fixture
+
+    def forward(p):
+        return model.apply(p, hidden, (obs, resets))
+
+    def actor_loss(p):
+        return jnp.mean(jnp.square(forward(p)[4]["policy_loc"] - 0.3))
+
+    def value_loss(p):
+        return 0.5 * jnp.mean(jnp.square(forward(p)[2] - 2.0))
+
+    def survival_loss(p):
+        aux = forward(p)[4]
+        return masked_reliability_loss(
+            aux["reliability_scores"], jnp.ones((4, 2, 10, 2)),
+            jnp.ones((4, 2, 10, 2)), loss_type="bce",
+            reliability_logits=aux["reliability_logits"],
+        )
+
+    raw_policy = jax.grad(actor_loss)(params)
+    raw_value = jax.grad(value_loss)(params)
+    raw_ppo = add_gradient_trees(raw_policy, raw_value)
+    off = maybe_mask_reliability_ppo_grads(
+        raw_ppo, agent_is_execution=True, use_reliability_head=True,
+        detach_reliability_from_policy_gradient=False,
+    )
+    _assert_tree_allclose(off, raw_ppo, atol=0, rtol=0)
+    for is_execution, has_head in ((False, True), (True, False)):
+        unchanged = maybe_mask_reliability_ppo_grads(
+            raw_ppo, agent_is_execution=is_execution, use_reliability_head=has_head,
+            detach_reliability_from_policy_gradient=True,
+        )
+        _assert_tree_allclose(unchanged, raw_ppo, atol=0, rtol=0)
+
+    applied = jax.jit(lambda g: maybe_mask_reliability_ppo_grads(
+        g, agent_is_execution=True, use_reliability_head=True,
+        detach_reliability_from_policy_gradient=True,
+    ))(raw_ppo)
+    assert float(gradient_l2_norm(raw_policy, "reliability_head")) > 0
+    assert float(gradient_l2_norm(applied, "reliability_head")) == 0
+    assert float(gradient_l2_norm(raw_value, "reliability_head")) == 0
+    assert float(gradient_l2_norm(raw_value, "critic_representation")) > 0
+    for group in ("vision_encoder", "fusion_shared_trunk", "actor_head"):
+        assert float(gradient_l2_norm(raw_policy, group)) > 0
+        _assert_tree_allclose(
+            mask_tree_to_groups(applied, (group,)),
+            mask_tree_to_groups(raw_ppo, (group,)), atol=0, rtol=0,
+        )
+    tx = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(0.0004, eps=1e-5))
+    updates, _ = tx.update(applied, tx.init(params), params)
+    next_params = optax.apply_updates(params, updates)
+    _assert_tree_allclose(
+        mask_tree_to_groups(next_params, ("reliability_head",)),
+        mask_tree_to_groups(params, ("reliability_head",)), atol=0, rtol=0,
+    )
+    assert float(gradient_l2_norm(
+        subtract_gradient_trees(next_params, params), "actor_head",
+    )) > 0
+    applied_policy = maybe_mask_reliability_ppo_grads(
+        raw_policy, agent_is_execution=True, use_reliability_head=True,
+        detach_reliability_from_policy_gradient=True,
+    )
+    actor_critic_diag = summarize_actor_critic_gradient_interaction(
+        params, applied, applied, applied_policy, raw_value, 1.0, 0.5,
+    )
+    assert float(actor_critic_diag["groups"]["reliability_head"]["policy_grad_norm"]) == 0
+    assert float(actor_critic_diag["groups"]["reliability_head"]["value_grad_norm_raw"]) == 0
+    survival = jax.grad(survival_loss)(params)
+    assert float(gradient_l2_norm(survival, "reliability_head")) > 0
+    phasic_diag = summarize_phasic_gradient_interaction(
+        params, applied, survival, survival_loss(params),
+    )
+    assert float(phasic_diag["groups"]["reliability_head"]["ppo_grad_norm"]) == 0
+    assert float(phasic_diag["groups"]["reliability_head"]["survival_grad_norm_raw"]) > 0
+
+    # The flag is not an input to the model, so the same parameters must produce
+    # the same policy, value, and reliability outputs.
+    enabled_model = ActorCriticRNN(
+        model.action_space,
+        config={**model.config, "detach_reliability_from_policy_gradient": True},
+        is_execution=True,
+    )
+    baseline = forward(params)
+    enabled = enabled_model.apply(params, hidden, (obs, resets))
+    for index in (0, 2):
+        _assert_tree_allclose(baseline[index], enabled[index], atol=0, rtol=0)
+    for key in ("reliability_logits", "reliability_scores", "filtered_tokens_norm",
+                "policy_loc", "policy_log_std"):
+        _assert_tree_allclose(baseline[4][key], enabled[4][key], atol=0, rtol=0)
+
+    reference = build_rollout_outputs(
+        enabled_model.apply, params, hidden, obs, resets, is_discrete=False,
+    ).policy
+    perturbed = {"params": dict(params["params"])}
+    fusion = dict(perturbed["params"]["ReliabilityFusionRNN_0"])
+    fusion["LevelWiseReliabilityHead_0"] = jax.tree_util.tree_map(
+        lambda x: x + 0.25, fusion["LevelWiseReliabilityHead_0"],
+    )
+    perturbed["params"]["ReliabilityFusionRNN_0"] = fusion
+    current = build_rollout_outputs(
+        enabled_model.apply, perturbed, hidden, obs, resets, is_discrete=False,
+    ).policy
+    assert float(jnp.mean(policy_kl(reference, current, is_discrete=False))) > 0
+    def kl_from_perturbed(p):
+        candidate = build_rollout_outputs(
+            enabled_model.apply, p, hidden, obs, resets, is_discrete=False,
+        ).policy
+        return jnp.mean(policy_kl(reference, candidate, is_discrete=False))
+
+    assert float(gradient_l2_norm(
+        jax.grad(kl_from_perturbed)(perturbed), "reliability_head",
+    )) > 0
 
 
 def test_separate_critic_probe_masks_and_fitting(separate_critic_fixture):
